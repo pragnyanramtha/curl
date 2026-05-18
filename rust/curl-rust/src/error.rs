@@ -18,6 +18,8 @@ pub enum CurlError {
     Transfer(String),
     #[error("weird server reply")]
     WeirdServerReply,
+    #[error("remote access denied")]
+    RemoteAccessDenied,
     #[error("IPFS automatic gateway detection failed")]
     IpfsGatewayDetection,
     #[error("{0}")]
@@ -30,6 +32,8 @@ pub enum CurlError {
     FileSizeExceeded,
     #[error("Login denied")]
     LoginDenied,
+    #[error("failed sending data to the peer")]
+    SendError,
     #[error("Operation timed out")]
     Timeout,
 }
@@ -41,10 +45,12 @@ impl CurlError {
             Self::Url(_) => 3,
             Self::Transfer(_) => 7,
             Self::WeirdServerReply => 8,
+            Self::RemoteAccessDenied => 9,
             Self::TooManyRedirects { .. } => 47,
             Self::HttpStatus { .. } => 22,
             Self::FileSizeExceeded => 63,
             Self::LoginDenied => 67,
+            Self::SendError => 55,
             Self::Io(_) => 23,
             Self::ReadError(_) => 26,
             Self::Timeout => 28,

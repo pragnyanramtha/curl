@@ -59,6 +59,7 @@ struct RenderTransfer<'a> {
     body: Option<PreparedBody>,
     headers: Vec<String>,
     slist: Option<String>,
+    mail_rcpt_slist: Option<String>,
 }
 
 fn prepare_transfers(config: &Config) -> Result<Vec<RenderTransfer<'_>>> {
@@ -77,6 +78,13 @@ fn prepare_transfers(config: &Config) -> Result<Vec<RenderTransfer<'_>>> {
             slist_index += 1;
             Some(name)
         };
+        let mail_rcpt_slist = if transfer.mail_rcpt.is_empty() {
+            None
+        } else {
+            let name = format!("slist{slist_index}");
+            slist_index += 1;
+            Some(name)
+        };
 
         transfers.push(RenderTransfer {
             transfer,
@@ -84,6 +92,7 @@ fn prepare_transfers(config: &Config) -> Result<Vec<RenderTransfer<'_>>> {
             body,
             headers,
             slist,
+            mail_rcpt_slist,
         });
     }
 
@@ -109,6 +118,9 @@ fn write_declarations(out: &mut String, transfers: &[RenderTransfer<'_>]) {
         if let Some(slist) = &transfer.slist {
             writeln!(out, "  struct curl_slist *{slist};").unwrap();
         }
+        if let Some(slist) = &transfer.mail_rcpt_slist {
+            writeln!(out, "  struct curl_slist *{slist};").unwrap();
+        }
     }
     out.push('\n');
 }
@@ -116,6 +128,13 @@ fn write_declarations(out: &mut String, transfers: &[RenderTransfer<'_>]) {
 fn write_slist_initializers(out: &mut String, transfers: &[RenderTransfer<'_>]) {
     for transfer in transfers {
         let Some(slist) = &transfer.slist else {
+            if let Some(slist) = &transfer.mail_rcpt_slist {
+                writeln!(out, "  {slist} = NULL;").unwrap();
+                for recipient in &transfer.transfer.mail_rcpt {
+                    emit_slist_append(out, slist, recipient);
+                }
+                out.push('\n');
+            }
             continue;
         };
         writeln!(out, "  {slist} = NULL;").unwrap();
@@ -123,6 +142,13 @@ fn write_slist_initializers(out: &mut String, transfers: &[RenderTransfer<'_>]) 
             emit_slist_append(out, slist, header);
         }
         out.push('\n');
+        if let Some(slist) = &transfer.mail_rcpt_slist {
+            writeln!(out, "  {slist} = NULL;").unwrap();
+            for recipient in &transfer.transfer.mail_rcpt {
+                emit_slist_append(out, slist, recipient);
+            }
+            out.push('\n');
+        }
     }
 }
 
@@ -149,6 +175,15 @@ fn write_request(out: &mut String, render: &RenderTransfer<'_>, url: &str) -> Re
     }
     if let Some(slist) = &render.slist {
         emit_raw_setopt(out, "CURLOPT_HTTPHEADER", slist);
+    }
+    if let Some(mail_from) = &transfer.mail_from {
+        emit_string_setopt(out, "CURLOPT_MAIL_FROM", mail_from);
+    }
+    if let Some(slist) = &render.mail_rcpt_slist {
+        emit_raw_setopt(out, "CURLOPT_MAIL_RCPT", slist);
+    }
+    if transfer.mail_rcpt_allowfails {
+        emit_long_setopt(out, "CURLOPT_MAIL_RCPT_ALLOWFAILS", 1);
     }
     if let Some(body) = &render.body
         && !transfer.get
@@ -305,6 +340,10 @@ fn write_cleanup(out: &mut String, transfers: &[RenderTransfer<'_>]) {
             writeln!(out, "  curl_slist_free_all({slist});").unwrap();
             writeln!(out, "  {slist} = NULL;").unwrap();
         }
+        if let Some(slist) = &transfer.mail_rcpt_slist {
+            writeln!(out, "  curl_slist_free_all({slist});").unwrap();
+            writeln!(out, "  {slist} = NULL;").unwrap();
+        }
     }
 }
 
@@ -321,7 +360,9 @@ fn effective_urls(
                     .unwrap_or(expanded.url);
             let mut url =
                 Url::parse(&effective_url).map_err(|error| CurlError::Url(error.to_string()))?;
-            data::append_upload_filename_to_url(&mut url, transfer.upload_file.as_deref());
+            if matches!(url.scheme(), "http" | "https") {
+                data::append_upload_filename_to_url(&mut url, transfer.upload_file.as_deref());
+            }
             if let Some(query) = query.filter(|query| !query.is_empty()) {
                 append_query_body(&mut url, &query.bytes);
             }

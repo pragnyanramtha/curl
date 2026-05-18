@@ -35,6 +35,9 @@ pub struct TransferConfig {
     pub url_query: Vec<DataSpec>,
     pub forms: Vec<FormSpec>,
     pub upload_file: Option<String>,
+    pub mail_from: Option<String>,
+    pub mail_rcpt: Vec<String>,
+    pub mail_rcpt_allowfails: bool,
     pub telnet_options: Vec<String>,
     pub ipfs_gateway: Option<String>,
     pub output: Option<String>,
@@ -126,6 +129,9 @@ impl Default for TransferConfig {
             url_query: Vec::new(),
             forms: Vec::new(),
             upload_file: None,
+            mail_from: None,
+            mail_rcpt: Vec::new(),
+            mail_rcpt_allowfails: false,
             telnet_options: Vec::new(),
             ipfs_gateway: None,
             output: None,
@@ -386,6 +392,15 @@ impl Parser {
                 let value = self.value_for(name, inline_value)?;
                 self.current().upload_file = Some(value);
             }
+            "mail-from" => {
+                let value = self.value_for(name, inline_value)?;
+                self.current().mail_from = Some(value);
+            }
+            "mail-rcpt" => {
+                let value = self.value_for(name, inline_value)?;
+                self.current().mail_rcpt.push(value);
+            }
+            "mail-rcpt-allowfails" => self.current().mail_rcpt_allowfails = true,
             "telnet-option" => {
                 let value = self.value_for(name, inline_value)?;
                 self.current().telnet_options.push(value);
@@ -537,6 +552,7 @@ impl Parser {
             }
             "insecure" => self.current().insecure = false,
             "junk-session-cookies" => self.current().junk_session_cookies = false,
+            "mail-rcpt-allowfails" => self.current().mail_rcpt_allowfails = false,
             "compressed" => self.current().compressed = false,
             "verbose" => self.current().verbose = false,
             "silent" => self.current().silent = false,
@@ -817,6 +833,9 @@ impl TransferConfig {
             || !self.url_query.is_empty()
             || !self.forms.is_empty()
             || self.upload_file.is_some()
+            || self.mail_from.is_some()
+            || !self.mail_rcpt.is_empty()
+            || self.mail_rcpt_allowfails
             || !self.telnet_options.is_empty()
             || self.ipfs_gateway.is_some()
             || self.output.is_some()
@@ -1032,6 +1051,8 @@ pub fn print_help() {
                --data-urlencode <data> Percent-encode POST data\n\
            -F, --form <name=content>   Specify multipart form data\n\
            -T, --upload-file <file>    Transfer local file to remote URL\n\
+               --mail-from <address>   Mail from this address\n\
+               --mail-rcpt <address>   Mail to this address\n\
            -t, --telnet-option <opt>   Set telnet option\n\
                --ipfs-gateway <URL>    Gateway for IPFS/IPNS URLs\n\
                --url-query <data>      Add URL query data\n\
@@ -1073,7 +1094,7 @@ pub fn print_help() {
 
 pub fn print_version() {
     println!(
-        "curl-rust {} (Rust rewrite) DICT HTTP HTTPS FILE GOPHER IPFS IPNS POP3 TELNET",
+        "curl-rust {} (Rust rewrite) DICT HTTP HTTPS FILE GOPHER IPFS IPNS POP3 SMTP TELNET",
         env!("CARGO_PKG_VERSION")
     );
 }
@@ -1276,6 +1297,35 @@ mod tests {
         ])
         .unwrap();
         assert!(!config.transfers[0].list_only);
+    }
+
+    #[test]
+    fn parses_mail_options() {
+        let config = parse_args([
+            "-q",
+            "--mail-from",
+            "sender@example.com",
+            "--mail-rcpt",
+            "one@example.com",
+            "--mail-rcpt=two@example.com",
+            "--mail-rcpt-allowfails",
+            "smtp://example.com",
+        ])
+        .unwrap();
+
+        let transfer = &config.transfers[0];
+        assert_eq!(transfer.mail_from.as_deref(), Some("sender@example.com"));
+        assert_eq!(transfer.mail_rcpt, ["one@example.com", "two@example.com"]);
+        assert!(transfer.mail_rcpt_allowfails);
+
+        let config = parse_args([
+            "-q",
+            "--mail-rcpt-allowfails",
+            "--no-mail-rcpt-allowfails",
+            "smtp://example.com",
+        ])
+        .unwrap();
+        assert!(!config.transfers[0].mail_rcpt_allowfails);
     }
 
     #[test]

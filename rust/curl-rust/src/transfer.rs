@@ -283,6 +283,12 @@ async fn run_expanded_url(
         Err(CurlError::Unsupported(
             "pop3s:// URLs are not implemented in the Rust sidecar".to_string(),
         ))
+    } else if expanded.url.starts_with("smtp://") {
+        run_smtp_transfer(transfer, &expanded, &method_label, &mut metrics).await
+    } else if expanded.url.starts_with("smtps://") {
+        Err(CurlError::Unsupported(
+            "smtps:// URLs are not implemented in the Rust sidecar".to_string(),
+        ))
     } else {
         let mut method = effective_http_method(transfer)?;
         if method_label == Method::PUT.as_str() && transfer.method.is_none() {
@@ -533,6 +539,120 @@ async fn run_pop3_exchange(
     }
     let (body_bytes, max_filesize_exceeded) = if transfer.head || method == "HEAD" {
         (&body[..], false)
+    } else {
+        limit_body_for_max_filesize(transfer, &body)
+    };
+    metrics.size_download = body_bytes.len() as u64;
+
+    if let Some(path) = &transfer.dump_header {
+        output::dump_headers(path, &[], transfer.create_dirs)?;
+    }
+
+    let filename = output::write_response(
+        transfer,
+        &url,
+        &reqwest::header::HeaderMap::new(),
+        &expanded.variables,
+        body_bytes,
+        false,
+    )?;
+    metrics.filename_effective = filename.map(|path| path.display().to_string());
+    if max_filesize_exceeded {
+        return Err(CurlError::FileSizeExceeded);
+    }
+    Ok(())
+}
+
+async fn run_smtp_transfer(
+    transfer: &TransferConfig,
+    expanded: &glob::ExpandedUrl,
+    method: &str,
+    metrics: &mut writeout::Metrics,
+) -> Result<()> {
+    if transfer.method.is_none() && method != "GET" && method != "HEAD" {
+        return Err(CurlError::Unsupported(format!(
+            "{method} requests for smtp:// URLs"
+        )));
+    }
+    if !transfer.data.is_empty() || !transfer.url_query.is_empty() || !transfer.forms.is_empty() {
+        return Err(CurlError::Unsupported(
+            "data/form request bodies for smtp:// URLs".to_string(),
+        ));
+    }
+    if transfer.user.is_some() || transfer.oauth2_bearer.is_some() {
+        return Err(CurlError::Unsupported(
+            "SMTP authentication in the Rust sidecar".to_string(),
+        ));
+    }
+
+    if let Some(timeout) = transfer.max_time {
+        tokio::time::timeout(
+            timeout,
+            run_smtp_exchange(transfer, expanded, method, metrics),
+        )
+        .await
+        .map_err(|_| CurlError::Timeout)?
+    } else {
+        run_smtp_exchange(transfer, expanded, method, metrics).await
+    }
+}
+
+async fn run_smtp_exchange(
+    transfer: &TransferConfig,
+    expanded: &glob::ExpandedUrl,
+    method: &str,
+    metrics: &mut writeout::Metrics,
+) -> Result<()> {
+    let url = Url::parse(&expanded.url).map_err(|error| CurlError::Url(error.to_string()))?;
+    output::validate_output_target(transfer, &url)?;
+    let host = url
+        .host_str()
+        .ok_or_else(|| CurlError::Url("SMTP URL is missing a host".to_string()))?;
+    let port = url.port().unwrap_or(25);
+    let ehlo_domain = smtp_ehlo_domain(&url)?;
+    let upload = transfer
+        .upload_file
+        .as_deref()
+        .map(data::read_upload_body)
+        .transpose()?;
+
+    if upload.is_some() && transfer.mail_rcpt.is_empty() {
+        return Err(CurlError::Usage(
+            "--mail-rcpt is required for smtp:// uploads".to_string(),
+        ));
+    }
+
+    let mut stream = connect_tcp(host, port, transfer).await?;
+    let greeting = smtp_read_response(&mut stream).await?;
+    metrics.response_code = Some(greeting.code);
+    smtp_require_code(&greeting, &[220], CurlError::WeirdServerReply)?;
+
+    let capabilities = smtp_greet(&mut stream, &ehlo_domain, metrics).await?;
+
+    let body = if let Some(upload) = upload {
+        smtp_send_mail(transfer, &mut stream, &capabilities, &upload, metrics).await?;
+        Vec::new()
+    } else {
+        let command = smtp_command(transfer)?;
+        smtp_send_line(&mut stream, &command).await?;
+        let response = smtp_read_response(&mut stream).await?;
+        metrics.response_code = Some(response.code);
+        if !smtp_success(response.code) {
+            return Err(CurlError::WeirdServerReply);
+        }
+        if transfer.head || method == "HEAD" {
+            Vec::new()
+        } else {
+            response.lines.concat()
+        }
+    };
+
+    let _ = smtp_send_line(&mut stream, b"QUIT").await;
+    let _ = smtp_read_response(&mut stream).await;
+
+    metrics.url_effective = url.to_string();
+    let (body_bytes, max_filesize_exceeded) = if transfer.head || method == "HEAD" {
+        (&body[..0], false)
     } else {
         limit_body_for_max_filesize(transfer, &body)
     };
@@ -887,6 +1007,260 @@ fn pop3_expect_ok(line: Vec<u8>, login: bool) -> Result<()> {
     } else {
         Err(CurlError::WeirdServerReply)
     }
+}
+
+struct SmtpResponse {
+    code: u16,
+    lines: Vec<Vec<u8>>,
+}
+
+async fn smtp_greet(
+    stream: &mut TcpStream,
+    ehlo_domain: &[u8],
+    metrics: &mut writeout::Metrics,
+) -> Result<SmtpResponse> {
+    let mut ehlo = Vec::from(&b"EHLO "[..]);
+    ehlo.extend_from_slice(ehlo_domain);
+    smtp_send_line(stream, &ehlo).await?;
+    let response = smtp_read_response(stream).await?;
+    metrics.response_code = Some(response.code);
+    if response.code == 250 {
+        return Ok(response);
+    }
+
+    let mut helo = Vec::from(&b"HELO "[..]);
+    helo.extend_from_slice(ehlo_domain);
+    smtp_send_line(stream, &helo).await?;
+    let response = smtp_read_response(stream).await?;
+    metrics.response_code = Some(response.code);
+    smtp_require_code(&response, &[250], CurlError::RemoteAccessDenied)?;
+    Ok(response)
+}
+
+async fn smtp_send_mail(
+    transfer: &TransferConfig,
+    stream: &mut TcpStream,
+    capabilities: &SmtpResponse,
+    upload: &[u8],
+    metrics: &mut writeout::Metrics,
+) -> Result<()> {
+    let mail_from = smtp_path_address(transfer.mail_from.as_deref())?;
+    let mut command = Vec::from(&b"MAIL FROM:"[..]);
+    command.extend_from_slice(&mail_from);
+    if smtp_response_has_keyword(capabilities, b"SIZE") {
+        command.extend_from_slice(format!(" SIZE={}", upload.len()).as_bytes());
+    }
+    smtp_send_line(stream, &command).await?;
+    let response = smtp_read_response(stream).await?;
+    metrics.response_code = Some(response.code);
+    smtp_require_success(&response, CurlError::SendError)?;
+
+    let mut accepted_recipients = 0_usize;
+    for recipient in &transfer.mail_rcpt {
+        let recipient = smtp_path_address(Some(recipient.as_str()))?;
+        let mut command = Vec::from(&b"RCPT TO:"[..]);
+        command.extend_from_slice(&recipient);
+        smtp_send_line(stream, &command).await?;
+        let response = smtp_read_response(stream).await?;
+        metrics.response_code = Some(response.code);
+        if smtp_success(response.code) {
+            accepted_recipients += 1;
+        } else if !transfer.mail_rcpt_allowfails {
+            return Err(CurlError::SendError);
+        }
+    }
+
+    if accepted_recipients == 0 {
+        return Err(CurlError::SendError);
+    }
+
+    smtp_send_line(stream, b"DATA").await?;
+    let response = smtp_read_response(stream).await?;
+    metrics.response_code = Some(response.code);
+    smtp_require_code(&response, &[354], CurlError::SendError)?;
+
+    let upload = smtp_dot_stuffed_body(upload);
+    stream.write_all(&upload).await.map_err(tcp_io_error)?;
+    let response = smtp_read_response(stream).await?;
+    metrics.response_code = Some(response.code);
+    smtp_require_code(&response, &[250], CurlError::WeirdServerReply)
+}
+
+fn smtp_command(transfer: &TransferConfig) -> Result<Vec<u8>> {
+    let mut command = if let Some(custom) = &transfer.method {
+        smtp_argument_bytes("--request", custom)?
+    } else if transfer.mail_rcpt.is_empty() {
+        Vec::from(&b"HELP"[..])
+    } else {
+        Vec::from(&b"VRFY"[..])
+    };
+
+    if let Some(recipient) = transfer.mail_rcpt.first() {
+        command.push(b' ');
+        command.extend_from_slice(&smtp_argument_bytes("--mail-rcpt", recipient)?);
+    }
+    Ok(command)
+}
+
+fn smtp_path_address(value: Option<&str>) -> Result<Vec<u8>> {
+    let value = value.unwrap_or("");
+    smtp_argument_bytes("SMTP address", &format_smtp_path_address(value))
+}
+
+fn format_smtp_path_address(value: &str) -> String {
+    if value.starts_with('<') {
+        return value.to_string();
+    }
+    if value.is_empty() {
+        return "<>".to_string();
+    }
+    if let Some((address, suffix)) = value.split_once(' ') {
+        return format!("<{}> {}", address, suffix.trim_start());
+    }
+    format!("<{value}>")
+}
+
+fn smtp_argument_bytes(name: &str, value: &str) -> Result<Vec<u8>> {
+    let bytes = value.as_bytes().to_vec();
+    if has_control_byte(&bytes) {
+        return Err(CurlError::Url(format!(
+            "{name} contains a decoded control byte"
+        )));
+    }
+    Ok(bytes)
+}
+
+fn smtp_ehlo_domain(url: &Url) -> Result<Vec<u8>> {
+    let path = url.path().strip_prefix('/').unwrap_or(url.path());
+    let decoded = percent_decode(path.as_bytes()).collect::<Vec<_>>();
+    if has_control_byte(&decoded) {
+        return Err(CurlError::Url(
+            "SMTP URL path contains a decoded control byte".to_string(),
+        ));
+    }
+    if decoded.is_empty() {
+        Ok(Vec::from(&b"localhost"[..]))
+    } else {
+        Ok(decoded)
+    }
+}
+
+async fn smtp_send_line(stream: &mut TcpStream, line: &[u8]) -> Result<()> {
+    stream.write_all(line).await.map_err(tcp_io_error)?;
+    stream.write_all(b"\r\n").await.map_err(tcp_io_error)
+}
+
+async fn smtp_read_response(stream: &mut TcpStream) -> Result<SmtpResponse> {
+    let mut lines = Vec::new();
+    let mut response_code = None;
+    loop {
+        let line = smtp_read_line(stream).await?;
+        let code = smtp_response_code(&line)?;
+        if let Some(expected) = response_code {
+            if expected != code {
+                return Err(CurlError::WeirdServerReply);
+            }
+        } else {
+            response_code = Some(code);
+        }
+        let continued = line.get(3) == Some(&b'-');
+        lines.push(line);
+        if !continued {
+            break;
+        }
+    }
+
+    Ok(SmtpResponse {
+        code: response_code.ok_or(CurlError::WeirdServerReply)?,
+        lines,
+    })
+}
+
+async fn smtp_read_line(stream: &mut TcpStream) -> Result<Vec<u8>> {
+    let mut line = Vec::new();
+    let mut byte = [0; 1];
+    loop {
+        let read = stream.read(&mut byte).await.map_err(tcp_io_error)?;
+        if read == 0 {
+            if line.is_empty() {
+                return Err(CurlError::WeirdServerReply);
+            }
+            break;
+        }
+        line.push(byte[0]);
+        if byte[0] == b'\n' {
+            break;
+        }
+    }
+    Ok(line)
+}
+
+fn smtp_response_code(line: &[u8]) -> Result<u16> {
+    if line.len() < 3 || !line[..3].iter().all(u8::is_ascii_digit) {
+        return Err(CurlError::WeirdServerReply);
+    }
+    Ok(
+        u16::from(line[0] - b'0') * 100
+            + u16::from(line[1] - b'0') * 10
+            + u16::from(line[2] - b'0'),
+    )
+}
+
+fn smtp_require_success(response: &SmtpResponse, error: CurlError) -> Result<()> {
+    if smtp_success(response.code) {
+        Ok(())
+    } else {
+        Err(error)
+    }
+}
+
+fn smtp_require_code(response: &SmtpResponse, accepted: &[u16], error: CurlError) -> Result<()> {
+    if accepted.contains(&response.code) {
+        Ok(())
+    } else {
+        Err(error)
+    }
+}
+
+fn smtp_success(code: u16) -> bool {
+    (200..300).contains(&code)
+}
+
+fn smtp_response_has_keyword(response: &SmtpResponse, keyword: &[u8]) -> bool {
+    response.lines.iter().any(|line| {
+        smtp_response_payload(line)
+            .split(|byte| byte.is_ascii_whitespace())
+            .next()
+            .is_some_and(|word| word.eq_ignore_ascii_case(keyword))
+    })
+}
+
+fn smtp_response_payload(line: &[u8]) -> &[u8] {
+    let mut payload = if line.len() > 4 { &line[4..] } else { &[] };
+    while payload
+        .last()
+        .is_some_and(|byte| matches!(*byte, b'\r' | b'\n'))
+    {
+        payload = &payload[..payload.len() - 1];
+    }
+    payload
+}
+
+fn smtp_dot_stuffed_body(input: &[u8]) -> Vec<u8> {
+    let mut output = Vec::with_capacity(input.len() + 8);
+    let mut at_line_start = true;
+    for byte in input {
+        if at_line_start && *byte == b'.' {
+            output.push(b'.');
+        }
+        output.push(*byte);
+        at_line_start = *byte == b'\n';
+    }
+    if !input.ends_with(b"\r\n") {
+        output.extend_from_slice(b"\r\n");
+    }
+    output.extend_from_slice(b".\r\n");
+    output
 }
 
 fn max_filesize_limit(transfer: &TransferConfig) -> Option<u64> {

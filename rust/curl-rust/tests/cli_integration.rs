@@ -41,6 +41,12 @@ struct RequestRecord {
     body: Vec<u8>,
 }
 
+#[derive(Debug)]
+struct SmtpRecord {
+    commands: Vec<u8>,
+    upload: Vec<u8>,
+}
+
 fn spawn_server(response: &'static [u8]) -> (String, Receiver<RequestRecord>) {
     spawn_sequence_server(vec![response])
 }
@@ -179,6 +185,92 @@ fn read_pop3_client_line(stream: &mut impl Read) -> Option<Vec<u8>> {
                 }
             }
             Err(error) => panic!("failed to read POP3 client bytes: {error}"),
+        }
+    }
+}
+
+fn spawn_smtp_server(
+    path: &str,
+    ehlo_response: &'static [u8],
+    command_response: &'static [u8],
+) -> (String, Receiver<SmtpRecord>) {
+    spawn_smtp_server_with_rcpt_responses(path, ehlo_response, command_response, Vec::new())
+}
+
+fn spawn_smtp_server_with_rcpt_responses(
+    path: &str,
+    ehlo_response: &'static [u8],
+    command_response: &'static [u8],
+    rcpt_responses: Vec<&'static [u8]>,
+) -> (String, Receiver<SmtpRecord>) {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = listener.local_addr().unwrap();
+    let (tx, rx) = mpsc::channel();
+    let path = path.to_string();
+
+    thread::spawn(move || {
+        let (mut stream, _) = listener.accept().unwrap();
+        stream.write_all(b"220 curl SMTP test server\r\n").unwrap();
+        let mut commands = Vec::new();
+        let mut upload = Vec::new();
+        let mut rcpt_responses = rcpt_responses.into_iter();
+        let mut reading_upload = false;
+
+        while let Some(line) = read_smtp_client_line(&mut stream) {
+            if reading_upload {
+                upload.extend_from_slice(&line);
+                if line == b".\r\n" {
+                    stream.write_all(b"250 message accepted\r\n").unwrap();
+                    reading_upload = false;
+                }
+                continue;
+            }
+
+            commands.extend_from_slice(&line);
+            let command = String::from_utf8_lossy(&line);
+            let command = command.trim_end_matches(['\r', '\n']);
+            let response = if command.starts_with("EHLO ") {
+                ehlo_response
+            } else if command.starts_with("HELO ") {
+                b"250 helo ok\r\n".as_slice()
+            } else if command.starts_with("MAIL FROM:") {
+                b"250 sender ok\r\n".as_slice()
+            } else if command.starts_with("RCPT TO:") {
+                rcpt_responses
+                    .next()
+                    .unwrap_or(b"250 recipient ok\r\n".as_slice())
+            } else if command == "DATA" {
+                reading_upload = true;
+                b"354 upload mail data\r\n".as_slice()
+            } else if command == "QUIT" {
+                let _ = stream.write_all(b"221 bye\r\n");
+                break;
+            } else {
+                command_response
+            };
+            stream.write_all(response).unwrap();
+        }
+
+        tx.send(SmtpRecord { commands, upload }).unwrap();
+    });
+
+    (format!("smtp://{addr}{path}"), rx)
+}
+
+fn read_smtp_client_line(stream: &mut impl Read) -> Option<Vec<u8>> {
+    let mut line = Vec::new();
+    let mut byte = [0; 1];
+    loop {
+        match stream.read(&mut byte) {
+            Ok(0) if line.is_empty() => return None,
+            Ok(0) => return Some(line),
+            Ok(_) => {
+                line.push(byte[0]);
+                if byte[0] == b'\n' {
+                    return Some(line);
+                }
+            }
+            Err(error) => panic!("failed to read SMTP client bytes: {error}"),
         }
     }
 }
@@ -1099,6 +1191,200 @@ fn version_lists_pop3_protocol() {
 
     assert!(output.status.success());
     assert!(String::from_utf8(output.stdout).unwrap().contains("POP3"));
+}
+
+#[test]
+fn smtp_upload_sends_mail_transaction_and_dot_stuffs_body() {
+    let (url, rx) = spawn_smtp_server("/mail.example", b"250 mail.example\r\n", b"250 ok\r\n");
+    let upload = b"From: sender\r\n\r\n.body\r\n";
+
+    let mut command = Command::cargo_bin("curl").unwrap();
+    command
+        .args([
+            "-q",
+            "-sS",
+            "--mail-from",
+            "sender@example.com",
+            "--mail-rcpt",
+            "recipient@example.com",
+            "-T",
+            "-",
+            &url,
+        ])
+        .write_stdin(upload.as_slice());
+    command.assert().success().stdout("");
+
+    let record = rx.recv().unwrap();
+    assert_eq!(
+        record.commands,
+        b"EHLO mail.example\r\nMAIL FROM:<sender@example.com>\r\nRCPT TO:<recipient@example.com>\r\nDATA\r\nQUIT\r\n"
+    );
+    assert_eq!(record.upload, b"From: sender\r\n\r\n..body\r\n.\r\n");
+}
+
+#[test]
+fn smtp_upload_file_adds_size_when_server_advertises_size() {
+    let temp = tempdir().unwrap();
+    let upload = temp.path().join("mail.txt");
+    std::fs::write(&upload, b"Subject: hi\r\n\r\nbody\r\n").unwrap();
+    let (url, rx) = spawn_smtp_server(
+        "/size.example",
+        b"250-size.example\r\n250 SIZE\r\n",
+        b"250 ok\r\n",
+    );
+
+    let mut command = Command::cargo_bin("curl").unwrap();
+    command.args([
+        "-q",
+        "-sS",
+        "--mail-from",
+        "<sender@example.com> RET=HDRS",
+        "--mail-rcpt",
+        "<recipient@example.com> NOTIFY=SUCCESS,FAILURE",
+        "-T",
+        upload.to_str().unwrap(),
+        &url,
+    ]);
+    command.assert().success().stdout("");
+
+    let record = rx.recv().unwrap();
+    assert_eq!(
+        record.commands,
+        b"EHLO size.example\r\nMAIL FROM:<sender@example.com> RET=HDRS SIZE=21\r\nRCPT TO:<recipient@example.com> NOTIFY=SUCCESS,FAILURE\r\nDATA\r\nQUIT\r\n"
+    );
+    assert_eq!(record.upload, b"Subject: hi\r\n\r\nbody\r\n.\r\n");
+}
+
+#[test]
+fn smtp_default_vrfy_outputs_response_and_code() {
+    let (url, rx) = spawn_smtp_server("/vrfy.example", b"250 vrfy.example\r\n", b"252 maybe\r\n");
+
+    let mut command = Command::cargo_bin("curl").unwrap();
+    command.args([
+        "-q",
+        "-sS",
+        "--mail-rcpt",
+        "user@example.com",
+        "-w",
+        " %{http_code} %{size_download}",
+        &url,
+    ]);
+    command.assert().success().stdout("252 maybe\r\n 252 11");
+
+    let record = rx.recv().unwrap();
+    assert_eq!(
+        record.commands,
+        b"EHLO vrfy.example\r\nVRFY user@example.com\r\nQUIT\r\n"
+    );
+    assert!(record.upload.is_empty());
+}
+
+#[test]
+fn smtp_custom_expn_uses_mail_recipient() {
+    let (url, rx) = spawn_smtp_server(
+        "/expn.example",
+        b"250 expn.example\r\n",
+        b"250 Friend <friend@example.com>\r\n",
+    );
+
+    let mut command = Command::cargo_bin("curl").unwrap();
+    command.args(["-q", "-sS", "--mail-rcpt", "Friends", "-X", "EXPN", &url]);
+    command
+        .assert()
+        .success()
+        .stdout("250 Friend <friend@example.com>\r\n");
+
+    let record = rx.recv().unwrap();
+    assert_eq!(
+        record.commands,
+        b"EHLO expn.example\r\nEXPN Friends\r\nQUIT\r\n"
+    );
+    assert!(record.upload.is_empty());
+}
+
+#[test]
+fn smtp_recipient_failure_returns_send_error() {
+    let (url, rx) = spawn_smtp_server_with_rcpt_responses(
+        "/send.example",
+        b"250 send.example\r\n",
+        b"250 ok\r\n",
+        vec![b"550 rejected\r\n"],
+    );
+
+    let mut command = Command::cargo_bin("curl").unwrap();
+    command
+        .args([
+            "-q",
+            "-sS",
+            "--mail-from",
+            "sender@example.com",
+            "--mail-rcpt",
+            "bad@example.com",
+            "-T",
+            "-",
+            &url,
+        ])
+        .write_stdin("body\r\n");
+    command.assert().failure().code(55).stdout("");
+
+    let record = rx.recv().unwrap();
+    assert_eq!(
+        record.commands,
+        b"EHLO send.example\r\nMAIL FROM:<sender@example.com>\r\nRCPT TO:<bad@example.com>\r\n"
+    );
+    assert!(record.upload.is_empty());
+}
+
+#[test]
+fn smtp_rcpt_allowfails_continues_when_one_recipient_succeeds() {
+    let (url, rx) = spawn_smtp_server_with_rcpt_responses(
+        "/allow.example",
+        b"250 allow.example\r\n",
+        b"250 ok\r\n",
+        vec![b"550 rejected\r\n", b"250 accepted\r\n"],
+    );
+
+    let mut command = Command::cargo_bin("curl").unwrap();
+    command
+        .args([
+            "-q",
+            "-sS",
+            "--mail-rcpt-allowfails",
+            "--mail-from",
+            "sender@example.com",
+            "--mail-rcpt",
+            "bad@example.com",
+            "--mail-rcpt",
+            "good@example.com",
+            "-T",
+            "-",
+            &url,
+        ])
+        .write_stdin("body\r\n");
+    command.assert().success().stdout("");
+
+    let record = rx.recv().unwrap();
+    assert_eq!(
+        record.commands,
+        b"EHLO allow.example\r\nMAIL FROM:<sender@example.com>\r\nRCPT TO:<bad@example.com>\r\nRCPT TO:<good@example.com>\r\nDATA\r\nQUIT\r\n"
+    );
+    assert_eq!(record.upload, b"body\r\n.\r\n");
+}
+
+#[test]
+fn smtp_rejects_decoded_control_path() {
+    let mut command = Command::cargo_bin("curl").unwrap();
+    command.args(["-q", "-sS", "smtp://example.invalid/%0d%0a/name"]);
+    command.assert().failure().code(3).stdout("");
+}
+
+#[test]
+fn version_lists_smtp_protocol() {
+    let mut command = Command::cargo_bin("curl").unwrap();
+    let output = command.args(["-q", "-V"]).output().unwrap();
+
+    assert!(output.status.success());
+    assert!(String::from_utf8(output.stdout).unwrap().contains("SMTP"));
 }
 
 #[test]
@@ -2084,6 +2370,51 @@ fn libcurl_writes_source_file_for_supported_options() {
     )));
     assert!(text.contains("CURLOPT_COOKIESESSION, 1"));
     assert!(text.contains("curl_easy_perform(curl);"));
+}
+
+#[test]
+fn libcurl_writes_smtp_mail_options() {
+    let (url, rx) = spawn_smtp_server(
+        "/libcurl.example",
+        b"250 libcurl.example\r\n",
+        b"250 ok\r\n",
+    );
+    let temp = tempdir().unwrap();
+    let source = temp.path().join("smtp-client.c");
+
+    let mut command = Command::cargo_bin("curl").unwrap();
+    command
+        .args([
+            "-q",
+            "-sS",
+            "--libcurl",
+            source.to_str().unwrap(),
+            "--mail-from",
+            "sender@example.com",
+            "--mail-rcpt",
+            "one@example.com",
+            "--mail-rcpt",
+            "two@example.com",
+            "--mail-rcpt-allowfails",
+            "-T",
+            "-",
+            &url,
+        ])
+        .write_stdin("body\r\n");
+    command.assert().success().stdout("");
+
+    let record = rx.recv().unwrap();
+    assert_eq!(
+        record.commands,
+        b"EHLO libcurl.example\r\nMAIL FROM:<sender@example.com>\r\nRCPT TO:<one@example.com>\r\nRCPT TO:<two@example.com>\r\nDATA\r\nQUIT\r\n"
+    );
+
+    let text = std::fs::read_to_string(source).unwrap();
+    assert!(text.contains("CURLOPT_MAIL_FROM, \"sender@example.com\""));
+    assert!(text.contains("curl_slist_append(slist1, \"one@example.com\");"));
+    assert!(text.contains("curl_slist_append(slist1, \"two@example.com\");"));
+    assert!(text.contains("CURLOPT_MAIL_RCPT, slist1"));
+    assert!(text.contains("CURLOPT_MAIL_RCPT_ALLOWFAILS, 1"));
 }
 
 #[test]
