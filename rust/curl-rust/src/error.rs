@@ -48,6 +48,8 @@ pub enum CurlError {
     TftpFileExists,
     #[error("TFTP no such user")]
     TftpNoSuchUser,
+    #[error("RTSP CSeq mismatch or invalid CSeq")]
+    RtspCseqError,
     #[error("Operation timed out")]
     Timeout,
 }
@@ -72,6 +74,7 @@ impl CurlError {
             Self::TftpUnknownId => 72,
             Self::TftpFileExists => 73,
             Self::TftpNoSuchUser => 74,
+            Self::RtspCseqError => 85,
             Self::Io(_) => 23,
             Self::ReadError(_) => 26,
             Self::Timeout => 28,

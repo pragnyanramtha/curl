@@ -500,6 +500,20 @@ fn spawn_mqtt_connack_server(code: u8) -> (String, Receiver<MqttRecord>) {
     (format!("mqtt://{addr}/sensor"), rx)
 }
 
+fn spawn_rtsp_server(response: &'static [u8]) -> (String, Receiver<RequestRecord>) {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = listener.local_addr().unwrap();
+    let (tx, rx) = mpsc::channel();
+
+    thread::spawn(move || {
+        let (mut stream, _) = listener.accept().unwrap();
+        tx.send(read_request(&mut stream)).unwrap();
+        stream.write_all(response).unwrap();
+    });
+
+    (format!("rtsp://{addr}/media"), rx)
+}
+
 fn spawn_tftp_upload_server(
     first_response: Vec<u8>,
     block_size: usize,
@@ -2050,12 +2064,132 @@ fn mqtt_max_filesize_rejects_large_publish_before_output() {
 }
 
 #[test]
+fn rtsp_default_options_sends_star_uri_and_cseq() {
+    let (url, rx) = spawn_rtsp_server(
+        b"RTSP/1.0 200 OK\r\nServer: RTSPD/libcurl-test\r\nCSeq: 1\r\nPublic: DESCRIBE, OPTIONS\r\n\r\n",
+    );
+
+    let mut command = Command::cargo_bin("curl").unwrap();
+    command.args(["-q", "-sS", &url]);
+    command.assert().success().stdout("");
+
+    let request = rx.recv().unwrap();
+    assert_eq!(request.start_line, "OPTIONS * RTSP/1.0");
+    assert_eq!(header(&request, "cseq"), Some("1"));
+    assert!(
+        header(&request, "user-agent")
+            .unwrap()
+            .starts_with("curl-rust/")
+    );
+    assert_eq!(header(&request, "session"), None);
+    assert_eq!(header(&request, "transport"), None);
+    assert!(request.body.is_empty());
+}
+
+#[test]
+fn rtsp_include_and_head_output_response_headers() {
+    const RESPONSE: &[u8] =
+        b"RTSP/1.0 200 OK\r\nCSeq: 1\r\nContent-Length: 5\r\nContent-Type: text/plain\r\n\r\nhello";
+    for flag in ["-i", "-I"] {
+        let (url, rx) = spawn_rtsp_server(RESPONSE);
+        let mut command = Command::cargo_bin("curl").unwrap();
+        let output = command.args(["-q", "-sS", flag, &url]).output().unwrap();
+
+        assert!(output.status.success());
+        assert_eq!(
+            output.stdout,
+            b"RTSP/1.0 200 OK\r\nCSeq: 1\r\nContent-Length: 5\r\nContent-Type: text/plain\r\n\r\n"
+        );
+        assert_eq!(rx.recv().unwrap().start_line, "OPTIONS * RTSP/1.0");
+    }
+}
+
+#[test]
+fn rtsp_writeout_reports_response_code_and_zero_download_size() {
+    let (url, _rx) =
+        spawn_rtsp_server(b"RTSP/1.0 404 Not Found\r\nCSeq: 1\r\nContent-Length: 5\r\n\r\nhello");
+
+    let mut command = Command::cargo_bin("curl").unwrap();
+    let output = command
+        .args([
+            "-q",
+            "-sS",
+            "-w",
+            "code=%{response_code} size=%{size_download}",
+            &url,
+        ])
+        .output()
+        .unwrap();
+
+    assert!(output.status.success());
+    assert_eq!(output.stdout, b"code=404 size=0");
+}
+
+#[test]
+fn rtsp_custom_request_is_ignored_for_default_cli() {
+    let (url, rx) = spawn_rtsp_server(b"RTSP/1.0 200 OK\r\nCSeq: 1\r\n\r\n");
+
+    let mut command = Command::cargo_bin("curl").unwrap();
+    command.args(["-q", "-sS", "-X", "DESCRIBE", &url]);
+    command.assert().success().stdout("");
+
+    assert_eq!(rx.recv().unwrap().start_line, "OPTIONS * RTSP/1.0");
+}
+
+#[test]
+fn rtsp_bad_status_line_exits_weird_server_reply() {
+    let (url, _rx) = spawn_rtsp_server(
+        b"RTSP/1.1234567 200 OK\r\nServer: RTSPD/libcurl-test\r\nCSeq: 1\r\n\r\n",
+    );
+
+    let mut command = Command::cargo_bin("curl").unwrap();
+    command.args(["-q", "-sS", &url]);
+    command.assert().failure().code(8).stdout("");
+}
+
+#[test]
+fn rtsp_missing_cseq_exits_85_after_parsing_response_code() {
+    let (url, _rx) = spawn_rtsp_server(b"RTSP/1.0 786          \n \nRTSP/          \n");
+
+    let mut command = Command::cargo_bin("curl").unwrap();
+    let output = command
+        .args([
+            "-q",
+            "-sS",
+            "-w",
+            "code=%{response_code} exit=%{exitcode}",
+            &url,
+        ])
+        .output()
+        .unwrap();
+
+    assert_eq!(output.status.code(), Some(85));
+    assert_eq!(output.stdout, b"code=786 exit=85");
+}
+
+#[test]
+fn rtsp_rejects_custom_cseq_header() {
+    let mut command = Command::cargo_bin("curl").unwrap();
+    command.args(["-q", "-sS", "-H", "CSeq: 2", "rtsp://127.0.0.1:9/media"]);
+    command.assert().failure().code(85).stdout("");
+}
+
+#[test]
 fn version_lists_mqtt_protocol() {
     let mut command = Command::cargo_bin("curl").unwrap();
     let output = command.args(["-q", "-V"]).output().unwrap();
 
     assert!(output.status.success());
     assert!(String::from_utf8(output.stdout).unwrap().contains("MQTT"));
+}
+
+#[test]
+fn version_lists_rtsp_protocol() {
+    let mut command = Command::cargo_bin("curl").unwrap();
+    let output = command.args(["-q", "-V"]).output().unwrap();
+
+    assert!(output.status.success());
+    assert!(String::from_utf8(output.stdout).unwrap().contains("RTSP"));
 }
 
 #[test]

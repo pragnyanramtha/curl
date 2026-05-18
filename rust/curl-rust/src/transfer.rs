@@ -31,6 +31,7 @@ const TELNET_SE: u8 = 240;
 const TFTP_DEFAULT_BLKSIZE: u16 = 512;
 const TFTP_MAX_PACKET_SIZE: usize = 65_468;
 const MQTT_DEFAULT_PORT: u16 = 1883;
+const RTSP_DEFAULT_PORT: u16 = 554;
 const MQTT_CLIENT_ID: &[u8; 12] = b"curlrust0000";
 const MQTT_CONNECT: u8 = 0x10;
 const MQTT_CONNACK: u8 = 0x20;
@@ -308,6 +309,8 @@ async fn run_expanded_url(
         Err(CurlError::Unsupported(
             "mqtts:// URLs are not implemented in the Rust sidecar".to_string(),
         ))
+    } else if expanded.url.starts_with("rtsp://") {
+        run_rtsp_transfer(transfer, &expanded, &mut metrics).await
     } else {
         let mut method = effective_http_method(transfer)?;
         if method_label == Method::PUT.as_str() && transfer.method.is_none() {
@@ -1084,6 +1087,232 @@ async fn mqtt_read_subscribe_body(
         return Err(CurlError::WeirdServerReply);
     }
     Ok(body)
+}
+
+async fn run_rtsp_transfer(
+    transfer: &TransferConfig,
+    expanded: &glob::ExpandedUrl,
+    metrics: &mut writeout::Metrics,
+) -> Result<()> {
+    if !transfer.data.is_empty() || !transfer.forms.is_empty() {
+        return Err(CurlError::Unsupported(
+            "request bodies for rtsp:// URLs".to_string(),
+        ));
+    }
+    reject_upload_file_for_scheme(transfer, "rtsp://")?;
+    if !transfer.url_query.is_empty() {
+        return Err(CurlError::Unsupported(
+            "--url-query for rtsp:// URLs".to_string(),
+        ));
+    }
+
+    let url = Url::parse(&expanded.url).map_err(|error| CurlError::Url(error.to_string()))?;
+    output::validate_output_target(transfer, &url)?;
+    let host = url
+        .host_str()
+        .ok_or_else(|| CurlError::Url("RTSP URL is missing a host".to_string()))?;
+    let port = url.port().unwrap_or(RTSP_DEFAULT_PORT);
+
+    let request = rtsp_options_request(transfer)?;
+    let mut stream = connect_tcp(host, port, transfer).await?;
+    stream.write_all(&request).await.map_err(tcp_io_error)?;
+
+    let response = rtsp_read_response(&mut stream).await?;
+    metrics.url_effective = url.to_string();
+    metrics.method = "OPTIONS".to_string();
+    metrics.response_code = Some(response.status);
+    metrics.size_download = 0;
+    metrics.content_type = response
+        .headers
+        .get(CONTENT_TYPE)
+        .and_then(|value| value.to_str().ok())
+        .map(ToString::to_string);
+    metrics.headers = response.headers.clone();
+
+    if response.cseq != Some(1) {
+        return Err(CurlError::RtspCseqError);
+    }
+
+    if let Some(path) = &transfer.dump_header {
+        output::dump_headers(path, &response.header_bytes, transfer.create_dirs)?;
+    }
+
+    let mut output_bytes = Vec::new();
+    if transfer.include_headers || transfer.head {
+        output_bytes.extend_from_slice(&response.header_bytes);
+    }
+    let filename = output::write_response(
+        transfer,
+        &url,
+        &response.headers,
+        &expanded.variables,
+        &output_bytes,
+        false,
+    )?;
+    metrics.filename_effective = filename.map(|path| path.display().to_string());
+    Ok(())
+}
+
+struct RtspResponse {
+    status: u16,
+    cseq: Option<u32>,
+    headers: reqwest::header::HeaderMap,
+    header_bytes: Vec<u8>,
+}
+
+fn rtsp_options_request(transfer: &TransferConfig) -> Result<Vec<u8>> {
+    let parsed_headers = parse_headers(&transfer.headers)?;
+    for (name, _) in &parsed_headers {
+        if name.as_str().eq_ignore_ascii_case("cseq") {
+            return Err(CurlError::RtspCseqError);
+        }
+        if name.as_str().eq_ignore_ascii_case("session") {
+            return Err(CurlError::BadFunctionArgument(
+                "Session ID cannot be set as a custom header".to_string(),
+            ));
+        }
+    }
+
+    let has_user_agent = parsed_headers
+        .iter()
+        .any(|(name, _)| name.as_str().eq_ignore_ascii_case("user-agent"));
+    let has_referer = parsed_headers
+        .iter()
+        .any(|(name, _)| name.as_str().eq_ignore_ascii_case("referer"));
+
+    let mut request = Vec::new();
+    request.extend_from_slice(b"OPTIONS * RTSP/1.0\r\nCSeq: 1\r\n");
+    if !has_user_agent {
+        request.extend_from_slice(
+            format!(
+                "User-Agent: {}\r\n",
+                transfer
+                    .user_agent
+                    .as_deref()
+                    .unwrap_or(concat!("curl-rust/", env!("CARGO_PKG_VERSION")))
+            )
+            .as_bytes(),
+        );
+    }
+    if let Some(referer) = &transfer.referer
+        && !has_referer
+    {
+        request.extend_from_slice(format!("Referer: {referer}\r\n").as_bytes());
+    }
+    for (name, value) in parsed_headers {
+        request.extend_from_slice(name.as_str().as_bytes());
+        request.extend_from_slice(b": ");
+        request.extend_from_slice(value.as_bytes());
+        request.extend_from_slice(b"\r\n");
+    }
+    request.extend_from_slice(b"\r\n");
+    Ok(request)
+}
+
+async fn rtsp_read_response(stream: &mut TcpStream) -> Result<RtspResponse> {
+    let mut bytes = Vec::new();
+    let mut buffer = [0; 1024];
+    let mut header_end = None;
+    loop {
+        let read = stream.read(&mut buffer).await.map_err(tcp_io_error)?;
+        if read == 0 {
+            break;
+        }
+        bytes.extend_from_slice(&buffer[..read]);
+        if let Some(end) = rtsp_header_end(&bytes) {
+            header_end = Some(end);
+            break;
+        }
+        if bytes.len() > 64 * 1024 {
+            return Err(CurlError::WeirdServerReply);
+        }
+    }
+
+    if bytes.is_empty() {
+        return Err(CurlError::Transfer("empty RTSP reply".to_string()));
+    }
+
+    let header_end = header_end.unwrap_or(bytes.len());
+    let header_bytes = bytes[..header_end].to_vec();
+    let mut body = bytes[header_end..].to_vec();
+    let (status, headers, cseq, content_length) = rtsp_parse_headers(&header_bytes)?;
+    while body.len() < content_length {
+        let read = stream.read(&mut buffer).await.map_err(tcp_io_error)?;
+        if read == 0 {
+            break;
+        }
+        body.extend_from_slice(&buffer[..read]);
+    }
+
+    Ok(RtspResponse {
+        status,
+        cseq,
+        headers,
+        header_bytes,
+    })
+}
+
+fn rtsp_header_end(bytes: &[u8]) -> Option<usize> {
+    bytes
+        .windows(4)
+        .position(|window| window == b"\r\n\r\n")
+        .map(|index| index + 4)
+        .or_else(|| {
+            bytes
+                .windows(2)
+                .position(|window| window == b"\n\n")
+                .map(|index| index + 2)
+        })
+}
+
+fn rtsp_parse_headers(
+    bytes: &[u8],
+) -> Result<(u16, reqwest::header::HeaderMap, Option<u32>, usize)> {
+    let text = String::from_utf8_lossy(bytes);
+    let mut lines = text.lines();
+    let status_line = lines.next().ok_or(CurlError::WeirdServerReply)?;
+    let status = rtsp_parse_status(status_line)?;
+    let mut headers = reqwest::header::HeaderMap::new();
+    let mut cseq = None;
+    let mut content_length = 0_usize;
+
+    for line in lines {
+        let line = line.trim_end_matches('\r');
+        if line.trim().is_empty() {
+            break;
+        }
+        let Some((name, value)) = line.split_once(':') else {
+            continue;
+        };
+        let trimmed = value.trim();
+        if name.eq_ignore_ascii_case("cseq") {
+            cseq = trimmed.parse::<u32>().ok();
+        }
+        if name.eq_ignore_ascii_case("content-length") {
+            content_length = trimmed.parse::<usize>().unwrap_or(0);
+        }
+        if let (Ok(name), Ok(value)) = (
+            HeaderName::from_bytes(name.trim().as_bytes()),
+            HeaderValue::from_bytes(trimmed.as_bytes()),
+        ) {
+            headers.append(name, value);
+        }
+    }
+
+    Ok((status, headers, cseq, content_length))
+}
+
+fn rtsp_parse_status(line: &str) -> Result<u16> {
+    let mut parts = line.split_whitespace();
+    let version = parts.next().ok_or(CurlError::WeirdServerReply)?;
+    if version != "RTSP/1.0" {
+        return Err(CurlError::WeirdServerReply);
+    }
+    let code = parts.next().ok_or(CurlError::WeirdServerReply)?;
+    if code.len() != 3 || !code.bytes().all(|byte| byte.is_ascii_digit()) {
+        return Err(CurlError::WeirdServerReply);
+    }
+    code.parse::<u16>().map_err(|_| CurlError::WeirdServerReply)
 }
 
 async fn run_telnet_transfer(
