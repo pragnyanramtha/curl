@@ -5069,6 +5069,26 @@ AC_SUBST(BLANK_AT_MAKETIME)
 
 AM_CONDITIONAL(CROSSCOMPILING, test "$cross_compiling" = "yes")
 
+AC_ARG_ENABLE(rust-curl,
+AS_HELP_STRING([--enable-rust-curl],[Build experimental Rust curl sidecar executable])
+AS_HELP_STRING([--disable-rust-curl],[Do not build experimental Rust curl sidecar executable]),
+  [case "$enableval" in
+  yes|no)
+    ;;
+  *)
+    AC_MSG_ERROR([--enable-rust-curl only accepts yes or no])
+    ;;
+  esac],
+  [enable_rust_curl=no])
+
+if test "x$enable_rust_curl" = "xyes"; then
+  AC_CHECK_PROG([CARGO], [cargo], [cargo], [no])
+  if test "$CARGO" = "no"; then
+    AC_MSG_ERROR([cargo is required for --enable-rust-curl])
+  fi
+fi
+AM_CONDITIONAL([BUILD_RUST_CURL], [test "x$enable_rust_curl" = "xyes"])
+
 dnl yes or no
 ENABLE_SHARED="$enable_shared"
 AC_SUBST(ENABLE_SHARED)
@@ -5414,6 +5434,7 @@ AC_CONFIG_FILES([\
   include/curl/Makefile \
   src/Makefile \
   lib/Makefile \
+  rust/Makefile \
   scripts/Makefile \
   lib/libcurl.vers \
   tests/Makefile \

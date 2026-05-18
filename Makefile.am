@@ -64,14 +64,18 @@ CMAKE_DIST =                                     \
   tests/cmake/test.cpp                           \
   tests/cmake/test.sh
 
-EXTRA_DIST = CHANGES.md COPYING RELEASE-NOTES Dockerfile .clang-tidy.yml .editorconfig $(CMAKE_DIST)
+EXTRA_DIST = CHANGES.md COPYING RELEASE-NOTES Dockerfile .clang-tidy.yml .editorconfig Cargo.toml Cargo.lock $(CMAKE_DIST)
 
 DISTCLEANFILES = buildinfo.txt
 
 bin_SCRIPTS = curl-config
 
-SUBDIRS = lib docs src scripts
-DIST_SUBDIRS = $(SUBDIRS) tests projects include docs
+if BUILD_RUST_CURL
+RUST_SUBDIR = rust
+endif
+
+SUBDIRS = lib docs src scripts $(RUST_SUBDIR)
+DIST_SUBDIRS = lib docs src scripts rust tests projects include docs
 
 pkgconfigdir = $(libdir)/pkgconfig
 pkgconfig_DATA = libcurl.pc

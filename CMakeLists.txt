@@ -176,6 +176,7 @@ endif()
 option(CURL_WERROR "Turn compiler warnings into errors" OFF)
 option(PICKY_COMPILER "Enable picky compiler options" ON)
 option(BUILD_CURL_EXE "Build curl executable" ON)
+option(BUILD_RUST_CURL_EXE "Build experimental Rust curl sidecar executable" OFF)
 get_property(_has_shared GLOBAL PROPERTY TARGET_SUPPORTS_SHARED_LIBS)
 option(BUILD_SHARED_LIBS "Build shared libraries" ${_has_shared})
 option(BUILD_STATIC_LIBS "Build static libraries" OFF)
@@ -1943,6 +1944,10 @@ add_subdirectory(lib)
 
 if(BUILD_CURL_EXE)
   add_subdirectory(src)
+endif()
+
+if(BUILD_RUST_CURL_EXE)
+  add_subdirectory(rust)
 endif()
 
 option(BUILD_EXAMPLES "Build libcurl examples" ON)
