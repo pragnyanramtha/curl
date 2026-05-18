@@ -4104,6 +4104,13 @@ fn smbs_is_explicitly_unsupported() {
 }
 
 #[test]
+fn unknown_url_scheme_exits_unsupported_protocol() {
+    let mut command = Command::cargo_bin("curl").unwrap();
+    command.args(["-q", "-sS", "htfp://127.0.0.1:9/none.htfml"]);
+    command.assert().failure().code(1).stdout("");
+}
+
+#[test]
 fn version_lists_smb_protocol() {
     let mut command = Command::cargo_bin("curl").unwrap();
     let output = command.args(["-q", "-V"]).output().unwrap();

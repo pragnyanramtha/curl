@@ -8,6 +8,8 @@ pub enum CurlError {
     Usage(String),
     #[error("unsupported option or feature: {0}")]
     Unsupported(String),
+    #[error("Protocol \"{0}\" not supported")]
+    UnsupportedProtocol(String),
     #[error("URL using bad/illegal format or missing URL: {0}")]
     Url(String),
     #[error("failed to read or write local data: {0}")]
@@ -77,6 +79,7 @@ pub enum CurlError {
 impl CurlError {
     pub fn exit_code(&self) -> i32 {
         match self {
+            Self::UnsupportedProtocol(_) => 1,
             Self::Usage(_) | Self::Unsupported(_) => 2,
             Self::Url(_) => 3,
             Self::Transfer(_) => 7,

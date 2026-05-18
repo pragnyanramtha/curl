@@ -379,6 +379,14 @@ async fn run_expanded_url(
         Err(CurlError::Unsupported(
             "wss:// URLs are not implemented in the Rust sidecar".to_string(),
         ))
+    } else if is_http_url(&expanded.url) {
+        let mut method = effective_http_method(transfer)?;
+        if method_label == Method::PUT.as_str() && transfer.method.is_none() {
+            method = Method::PUT;
+        }
+        run_http_with_retries(transfer, client, &expanded, method, &mut metrics, started).await
+    } else if let Some((scheme, _)) = expanded.url.split_once("://") {
+        Err(CurlError::UnsupportedProtocol(scheme.to_string()))
     } else {
         let mut method = effective_http_method(transfer)?;
         if method_label == Method::PUT.as_str() && transfer.method.is_none() {

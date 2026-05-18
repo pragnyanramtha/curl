@@ -88,6 +88,7 @@ companion data before this rewrite can be called complete.
 | `--parallel`, `--parallel-max`, `--parallel-immediate`, `--parallel-max-host` | partial | `Config::parallel*`, `transfer.rs::run_parallel` | `parses_parallel_options_as_global_state`, `parallel_runs_transfers_concurrently_to_files` | Basic bounded async scheduling for expanded URL jobs; `--parallel-immediate` and `--parallel-max-host` are parsed/stored but no-op, stdout/write-out/cookie timing/order, retry queue behavior, fail-early, multiplexing, and full corpus parity remain incomplete |
 | `--libcurl` | partial | `Config::libcurl`, `libcurl.rs` | `parses_libcurl_options_as_global_state`, `libcurl_writes_source_file_for_supported_options` | Emits C source for supported HTTP/file URL expansion and common scalar/string/slist options; exact C curl formatting, callbacks, multipart MIME source, protocol-specific options, multi-transfer ordering, and full fixture parity remain incomplete |
 | `--trace`, `--trace-ascii`, `--trace-time` | partial | parser compatibility only | `accepts_trace_options_for_corpus_runner`, curl corpus smoke tests | Accepted so `tests/runtests.pl` can wrap Rust-sidecar transfers; trace file generation and trace-time output are not implemented |
+| Unsupported URL schemes | partial | transfer dispatch | `unknown_url_scheme_exits_unsupported_protocol`, curl corpus 23 | Unknown `scheme://` URLs now fail before HTTP transfer dispatch with curl's unsupported-protocol exit code; exact stderr wording and all URL parser edge cases still need broader corpus coverage |
 
 ## Build and test parity
 
@@ -98,7 +99,7 @@ companion data before this rewrite can be called complete.
 | CMake sidecar build | partial | `BUILD_RUST_CURL_EXE=ON`, `curl-rust-test`, `curl-rust-corpus-test` |
 | Autotools sidecar build | partial | `--enable-rust-curl`, `make -C rust rust-test`, `make -C rust rust-corpus-test` |
 | Existing curl Perl suite with C binary | verified for C path | Does not prove Rust parity |
-| Existing curl Perl suite with Rust binary | partial | `curl-rust-corpus-test` maps 37 smoke cases across FILE, FTP, DICT, GOPHER, MQTT, SMTP, TFTP, TELNET, and HTTP preflight/error cases; broader protocol corpus remains required before full parity |
+| Existing curl Perl suite with Rust binary | partial | `curl-rust-corpus-test` maps 38 smoke cases across FILE, FTP, DICT, GOPHER, MQTT, SMTP, TFTP, TELNET, and URL/HTTP preflight/error cases; broader protocol corpus remains required before full parity |
 | Pytest HTTP suite with Rust binary | missing | Required before full parity |
 
 Current `curl-rust-corpus-test` selection:
@@ -107,7 +108,7 @@ Current `curl-rust-corpus-test` selection:
 - FTP: 100, 102, 104, 1224
 - DICT: 1450
 - GOPHER: 1200, 1201, 1202
-- HTTP preflight/error paths: 426, 1673
+- URL/HTTP preflight/error paths: 23, 426, 1673
 - MQTT: 1190, 1191, 1198, 1199
 - SMTP: 900, 909, 912, 923, 927, 928, 929, 930
 - TFTP: 271, 283, 1242
