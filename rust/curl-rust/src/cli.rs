@@ -38,6 +38,8 @@ pub struct TransferConfig {
     pub mail_from: Option<String>,
     pub mail_rcpt: Vec<String>,
     pub mail_rcpt_allowfails: bool,
+    pub tftp_blksize: Option<u16>,
+    pub tftp_no_options: bool,
     pub telnet_options: Vec<String>,
     pub ipfs_gateway: Option<String>,
     pub output: Option<String>,
@@ -132,6 +134,8 @@ impl Default for TransferConfig {
             mail_from: None,
             mail_rcpt: Vec::new(),
             mail_rcpt_allowfails: false,
+            tftp_blksize: None,
+            tftp_no_options: false,
             telnet_options: Vec::new(),
             ipfs_gateway: None,
             output: None,
@@ -401,6 +405,11 @@ impl Parser {
                 self.current().mail_rcpt.push(value);
             }
             "mail-rcpt-allowfails" => self.current().mail_rcpt_allowfails = true,
+            "tftp-blksize" => {
+                let value = self.value_for(name, inline_value)?;
+                self.current().tftp_blksize = Some(parse_tftp_blksize(name, &value)?);
+            }
+            "tftp-no-options" => self.current().tftp_no_options = true,
             "telnet-option" => {
                 let value = self.value_for(name, inline_value)?;
                 self.current().telnet_options.push(value);
@@ -553,6 +562,7 @@ impl Parser {
             "insecure" => self.current().insecure = false,
             "junk-session-cookies" => self.current().junk_session_cookies = false,
             "mail-rcpt-allowfails" => self.current().mail_rcpt_allowfails = false,
+            "tftp-no-options" => self.current().tftp_no_options = false,
             "compressed" => self.current().compressed = false,
             "verbose" => self.current().verbose = false,
             "silent" => self.current().silent = false,
@@ -836,6 +846,8 @@ impl TransferConfig {
             || self.mail_from.is_some()
             || !self.mail_rcpt.is_empty()
             || self.mail_rcpt_allowfails
+            || self.tftp_blksize.is_some()
+            || self.tftp_no_options
             || !self.telnet_options.is_empty()
             || self.ipfs_gateway.is_some()
             || self.output.is_some()
@@ -988,6 +1000,18 @@ fn parse_continue_at(name: &str, value: &str) -> Result<ContinueAt> {
     }
 }
 
+fn parse_tftp_blksize(name: &str, value: &str) -> Result<u16> {
+    const MIN_BLKSIZE: u64 = 8;
+    const MAX_BLKSIZE: u64 = 65_464;
+    let value = parse_u64(name, value)?;
+    if !(MIN_BLKSIZE..=MAX_BLKSIZE).contains(&value) {
+        return Err(CurlError::Usage(format!(
+            "option --{name} expects a value from {MIN_BLKSIZE} to {MAX_BLKSIZE}"
+        )));
+    }
+    Ok(value as u16)
+}
+
 fn parse_nonempty_path(name: &str, value: &str) -> Result<PathBuf> {
     if value.is_empty() {
         Err(CurlError::Usage(format!(
@@ -1053,6 +1077,8 @@ pub fn print_help() {
            -T, --upload-file <file>    Transfer local file to remote URL\n\
                --mail-from <address>   Mail from this address\n\
                --mail-rcpt <address>   Mail to this address\n\
+               --tftp-blksize <value>  Set TFTP BLKSIZE option\n\
+               --tftp-no-options       Do not send TFTP options\n\
            -t, --telnet-option <opt>   Set telnet option\n\
                --ipfs-gateway <URL>    Gateway for IPFS/IPNS URLs\n\
                --url-query <data>      Add URL query data\n\
@@ -1094,7 +1120,7 @@ pub fn print_help() {
 
 pub fn print_version() {
     println!(
-        "curl-rust {} (Rust rewrite) DICT HTTP HTTPS FILE GOPHER IPFS IPNS POP3 SMTP TELNET",
+        "curl-rust {} (Rust rewrite) DICT HTTP HTTPS FILE GOPHER IPFS IPNS POP3 SMTP TELNET TFTP",
         env!("CARGO_PKG_VERSION")
     );
 }
@@ -1326,6 +1352,37 @@ mod tests {
         ])
         .unwrap();
         assert!(!config.transfers[0].mail_rcpt_allowfails);
+    }
+
+    #[test]
+    fn parses_tftp_options() {
+        let config = parse_args([
+            "-q",
+            "--tftp-blksize",
+            "1024",
+            "--tftp-no-options",
+            "tftp://example.com/file",
+        ])
+        .unwrap();
+
+        let transfer = &config.transfers[0];
+        assert_eq!(transfer.tftp_blksize, Some(1024));
+        assert!(transfer.tftp_no_options);
+
+        let config = parse_args([
+            "-q",
+            "--tftp-no-options",
+            "--no-tftp-no-options",
+            "tftp://example.com/file",
+        ])
+        .unwrap();
+        assert!(!config.transfers[0].tftp_no_options);
+    }
+
+    #[test]
+    fn rejects_bad_tftp_blksize_values() {
+        assert!(parse_args(["-q", "--tftp-blksize", "7", "tftp://example.com"]).is_err());
+        assert!(parse_args(["-q", "--tftp-blksize", "65465", "tftp://example.com"]).is_err());
     }
 
     #[test]

@@ -5,7 +5,7 @@ use std::time::{Duration, Instant};
 
 use percent_encoding::percent_decode;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::net::TcpStream;
+use tokio::net::{TcpStream, UdpSocket};
 use tokio::task::JoinSet;
 
 use reqwest::header::{
@@ -28,6 +28,8 @@ const TELNET_WONT: u8 = 252;
 const TELNET_WILL: u8 = 251;
 const TELNET_SB: u8 = 250;
 const TELNET_SE: u8 = 240;
+const TFTP_DEFAULT_BLKSIZE: u16 = 512;
+const TFTP_MAX_PACKET_SIZE: usize = 65_468;
 
 struct HttpAttempt {
     status: StatusCode,
@@ -289,6 +291,8 @@ async fn run_expanded_url(
         Err(CurlError::Unsupported(
             "smtps:// URLs are not implemented in the Rust sidecar".to_string(),
         ))
+    } else if expanded.url.starts_with("tftp://") {
+        run_tftp_transfer(transfer, &expanded, &method_label, &mut metrics).await
     } else {
         let mut method = effective_http_method(transfer)?;
         if method_label == Method::PUT.as_str() && transfer.method.is_none() {
@@ -653,6 +657,140 @@ async fn run_smtp_exchange(
     metrics.url_effective = url.to_string();
     let (body_bytes, max_filesize_exceeded) = if transfer.head || method == "HEAD" {
         (&body[..0], false)
+    } else {
+        limit_body_for_max_filesize(transfer, &body)
+    };
+    metrics.size_download = body_bytes.len() as u64;
+
+    if let Some(path) = &transfer.dump_header {
+        output::dump_headers(path, &[], transfer.create_dirs)?;
+    }
+
+    let filename = output::write_response(
+        transfer,
+        &url,
+        &reqwest::header::HeaderMap::new(),
+        &expanded.variables,
+        body_bytes,
+        false,
+    )?;
+    metrics.filename_effective = filename.map(|path| path.display().to_string());
+    if max_filesize_exceeded {
+        return Err(CurlError::FileSizeExceeded);
+    }
+    Ok(())
+}
+
+async fn run_tftp_transfer(
+    transfer: &TransferConfig,
+    expanded: &glob::ExpandedUrl,
+    method: &str,
+    metrics: &mut writeout::Metrics,
+) -> Result<()> {
+    if method != "GET" && method != "HEAD" {
+        return Err(CurlError::Unsupported(format!(
+            "{method} requests for tftp:// URLs"
+        )));
+    }
+    reject_upload_file_for_scheme(transfer, "tftp://")?;
+
+    if let Some(timeout) = transfer.max_time {
+        tokio::time::timeout(
+            timeout,
+            run_tftp_exchange(transfer, expanded, method, metrics),
+        )
+        .await
+        .map_err(|_| CurlError::Timeout)?
+    } else {
+        run_tftp_exchange(transfer, expanded, method, metrics).await
+    }
+}
+
+async fn run_tftp_exchange(
+    transfer: &TransferConfig,
+    expanded: &glob::ExpandedUrl,
+    method: &str,
+    metrics: &mut writeout::Metrics,
+) -> Result<()> {
+    let url = Url::parse(&expanded.url).map_err(|error| CurlError::Url(error.to_string()))?;
+    output::validate_output_target(transfer, &url)?;
+    let host = url
+        .host_str()
+        .ok_or_else(|| CurlError::Url("TFTP URL is missing a host".to_string()))?;
+    let port = url.port().unwrap_or(69);
+    let (filename, mode) = tftp_filename_and_mode(&url)?;
+    let requested_blksize = transfer.tftp_blksize.unwrap_or(TFTP_DEFAULT_BLKSIZE);
+    let request = tftp_rrq_packet(&filename, mode, requested_blksize, transfer.tftp_no_options);
+
+    let bind_addr = if url.has_host()
+        && url
+            .host()
+            .is_some_and(|host| matches!(host, url::Host::Ipv6(_)))
+    {
+        "[::]:0"
+    } else {
+        "0.0.0.0:0"
+    };
+    let socket = UdpSocket::bind(bind_addr).await.map_err(tcp_io_error)?;
+    socket
+        .send_to(&request, (host, port))
+        .await
+        .map_err(tcp_io_error)?;
+
+    let mut body = Vec::new();
+    let mut expected_block = 1_u16;
+    let mut block_size = usize::from(requested_blksize);
+    let mut peer = None;
+    let mut packet = vec![0; TFTP_MAX_PACKET_SIZE];
+
+    loop {
+        let (read, addr) = socket.recv_from(&mut packet).await.map_err(tcp_io_error)?;
+        if let Some(peer) = peer {
+            if addr != peer {
+                let error = tftp_error_packet(5, b"Unknown transfer ID");
+                let _ = socket.send_to(&error, addr).await;
+                continue;
+            }
+        } else {
+            peer = Some(addr);
+        }
+
+        let received = &packet[..read];
+        match tftp_opcode(received)? {
+            3 => {
+                let block = tftp_block_number(received)?;
+                if block == expected_block {
+                    let data = &received[4..];
+                    body.extend_from_slice(data);
+                    let ack = tftp_ack_packet(block);
+                    socket.send_to(&ack, addr).await.map_err(tcp_io_error)?;
+                    if data.len() < block_size {
+                        break;
+                    }
+                    expected_block = expected_block.wrapping_add(1);
+                } else if block == expected_block.wrapping_sub(1) {
+                    let ack = tftp_ack_packet(block);
+                    socket.send_to(&ack, addr).await.map_err(tcp_io_error)?;
+                } else {
+                    return Err(CurlError::TftpIllegal);
+                }
+            }
+            5 => return Err(tftp_error_response(received)),
+            6 => {
+                block_size = tftp_oack_blksize(received).unwrap_or(block_size);
+                let ack = tftp_ack_packet(0);
+                socket.send_to(&ack, addr).await.map_err(tcp_io_error)?;
+            }
+            _ => return Err(CurlError::TftpIllegal),
+        }
+    }
+
+    metrics.url_effective = url.to_string();
+    if method == "HEAD" {
+        body.clear();
+    }
+    let (body_bytes, max_filesize_exceeded) = if method == "HEAD" {
+        (&body[..], false)
     } else {
         limit_body_for_max_filesize(transfer, &body)
     };
@@ -1261,6 +1399,122 @@ fn smtp_dot_stuffed_body(input: &[u8]) -> Vec<u8> {
     }
     output.extend_from_slice(b".\r\n");
     output
+}
+
+fn tftp_filename_and_mode(url: &Url) -> Result<(Vec<u8>, &'static str)> {
+    let path = url.path().strip_prefix('/').unwrap_or(url.path());
+    let mut decoded = percent_decode(path.as_bytes()).collect::<Vec<_>>();
+    if decoded.contains(&0) {
+        return Err(CurlError::Url(
+            "TFTP filename contains a decoded NUL byte".to_string(),
+        ));
+    }
+
+    let mode = if strip_tftp_mode_suffix(&mut decoded, b";mode=netascii") {
+        "netascii"
+    } else {
+        strip_tftp_mode_suffix(&mut decoded, b";mode=octet");
+        "octet"
+    };
+
+    if decoded.is_empty() {
+        return Err(CurlError::TftpIllegal);
+    }
+    Ok((decoded, mode))
+}
+
+fn strip_tftp_mode_suffix(value: &mut Vec<u8>, suffix: &[u8]) -> bool {
+    if value.len() < suffix.len() {
+        return false;
+    }
+    let start = value.len() - suffix.len();
+    if value[start..].eq_ignore_ascii_case(suffix) {
+        value.truncate(start);
+        true
+    } else {
+        false
+    }
+}
+
+fn tftp_rrq_packet(filename: &[u8], mode: &str, blksize: u16, no_options: bool) -> Vec<u8> {
+    let mut packet = Vec::new();
+    packet.extend_from_slice(&1_u16.to_be_bytes());
+    packet.extend_from_slice(filename);
+    packet.push(0);
+    packet.extend_from_slice(mode.as_bytes());
+    packet.push(0);
+    if !no_options {
+        packet.extend_from_slice(b"tsize\0");
+        packet.extend_from_slice(b"0\0");
+        packet.extend_from_slice(b"blksize\0");
+        packet.extend_from_slice(blksize.to_string().as_bytes());
+        packet.push(0);
+        packet.extend_from_slice(b"timeout\0");
+        packet.extend_from_slice(b"5\0");
+    }
+    packet
+}
+
+fn tftp_ack_packet(block: u16) -> [u8; 4] {
+    let mut packet = [0, 4, 0, 0];
+    packet[2..].copy_from_slice(&block.to_be_bytes());
+    packet
+}
+
+fn tftp_error_packet(code: u16, message: &[u8]) -> Vec<u8> {
+    let mut packet = Vec::new();
+    packet.extend_from_slice(&5_u16.to_be_bytes());
+    packet.extend_from_slice(&code.to_be_bytes());
+    packet.extend_from_slice(message);
+    packet.push(0);
+    packet
+}
+
+fn tftp_opcode(packet: &[u8]) -> Result<u16> {
+    if packet.len() < 2 {
+        return Err(CurlError::TftpIllegal);
+    }
+    Ok(u16::from_be_bytes([packet[0], packet[1]]))
+}
+
+fn tftp_block_number(packet: &[u8]) -> Result<u16> {
+    if packet.len() < 4 {
+        return Err(CurlError::TftpIllegal);
+    }
+    Ok(u16::from_be_bytes([packet[2], packet[3]]))
+}
+
+fn tftp_oack_blksize(packet: &[u8]) -> Option<usize> {
+    let mut parts = packet.get(2..)?.split(|byte| *byte == 0);
+    while let Some(option) = parts.next() {
+        if option.is_empty() {
+            break;
+        }
+        let value = parts.next()?;
+        if option.eq_ignore_ascii_case(b"blksize")
+            && let Ok(text) = std::str::from_utf8(value)
+            && let Ok(blksize) = text.parse::<usize>()
+        {
+            return Some(blksize);
+        }
+    }
+    None
+}
+
+fn tftp_error_response(packet: &[u8]) -> CurlError {
+    let code = packet
+        .get(2..4)
+        .map(|bytes| u16::from_be_bytes([bytes[0], bytes[1]]))
+        .unwrap_or(0);
+    match code {
+        1 => CurlError::TftpNotFound,
+        2 => CurlError::TftpPermission,
+        3 => CurlError::TftpDiskFull,
+        5 => CurlError::TftpUnknownId,
+        6 => CurlError::TftpFileExists,
+        7 => CurlError::TftpNoSuchUser,
+        _ => CurlError::TftpIllegal,
+    }
 }
 
 fn max_filesize_limit(transfer: &TransferConfig) -> Option<u64> {

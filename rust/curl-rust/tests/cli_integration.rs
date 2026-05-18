@@ -1,6 +1,6 @@
 use std::io::ErrorKind;
 use std::io::{Read, Write};
-use std::net::{Shutdown, TcpListener};
+use std::net::{Shutdown, TcpListener, UdpSocket};
 use std::sync::mpsc::{self, Receiver};
 use std::thread;
 use std::time::{Duration, Instant};
@@ -45,6 +45,12 @@ struct RequestRecord {
 struct SmtpRecord {
     commands: Vec<u8>,
     upload: Vec<u8>,
+}
+
+#[derive(Debug)]
+struct TftpRecord {
+    request: Vec<u8>,
+    acknowledgements: Vec<Vec<u8>>,
 }
 
 fn spawn_server(response: &'static [u8]) -> (String, Receiver<RequestRecord>) {
@@ -273,6 +279,65 @@ fn read_smtp_client_line(stream: &mut impl Read) -> Option<Vec<u8>> {
             Err(error) => panic!("failed to read SMTP client bytes: {error}"),
         }
     }
+}
+
+fn spawn_tftp_server(blocks: Vec<Vec<u8>>) -> (String, Receiver<TftpRecord>) {
+    spawn_tftp_server_with_oack(blocks, None)
+}
+
+fn spawn_tftp_server_with_oack(
+    blocks: Vec<Vec<u8>>,
+    oack: Option<Vec<u8>>,
+) -> (String, Receiver<TftpRecord>) {
+    let socket = UdpSocket::bind("127.0.0.1:0").unwrap();
+    let addr = socket.local_addr().unwrap();
+    let (tx, rx) = mpsc::channel();
+
+    thread::spawn(move || {
+        let mut buffer = vec![0; 70_000];
+        let (read, peer) = socket.recv_from(&mut buffer).unwrap();
+        let request = buffer[..read].to_vec();
+        let mut acknowledgements = Vec::new();
+
+        if let Some(oack) = oack {
+            socket.send_to(&oack, peer).unwrap();
+            let (read, ack_peer) = socket.recv_from(&mut buffer).unwrap();
+            assert_eq!(ack_peer, peer);
+            acknowledgements.push(buffer[..read].to_vec());
+        }
+
+        for (index, block) in blocks.iter().enumerate() {
+            let block_number = u16::try_from(index + 1).unwrap();
+            let mut packet = Vec::with_capacity(block.len() + 4);
+            packet.extend_from_slice(&3_u16.to_be_bytes());
+            packet.extend_from_slice(&block_number.to_be_bytes());
+            packet.extend_from_slice(block);
+            socket.send_to(&packet, peer).unwrap();
+
+            let (read, ack_peer) = socket.recv_from(&mut buffer).unwrap();
+            assert_eq!(ack_peer, peer);
+            acknowledgements.push(buffer[..read].to_vec());
+        }
+
+        tx.send(TftpRecord {
+            request,
+            acknowledgements,
+        })
+        .unwrap();
+    });
+
+    (format!("tftp://{addr}/file.txt"), rx)
+}
+
+fn tftp_oack(options: &[(&str, &str)]) -> Vec<u8> {
+    let mut packet = Vec::from(&6_u16.to_be_bytes()[..]);
+    for (name, value) in options {
+        packet.extend_from_slice(name.as_bytes());
+        packet.push(0);
+        packet.extend_from_slice(value.as_bytes());
+        packet.push(0);
+    }
+    packet
 }
 
 fn spawn_telnet_server(
@@ -1388,6 +1453,154 @@ fn version_lists_smtp_protocol() {
 }
 
 #[test]
+fn tftp_get_downloads_file_and_sends_default_options() {
+    let (url, rx) = spawn_tftp_server(vec![b"hello from tftp".to_vec()]);
+
+    let mut command = Command::cargo_bin("curl").unwrap();
+    command.args(["-q", "-sS", &url]);
+    command.assert().success().stdout("hello from tftp");
+
+    let record = rx.recv().unwrap();
+    assert_eq!(
+        record.request,
+        b"\x00\x01file.txt\x00octet\x00tsize\x000\x00blksize\x00512\x00timeout\x005\x00"
+    );
+    assert_eq!(record.acknowledgements, [b"\0\x04\0\x01".to_vec()]);
+}
+
+#[test]
+fn tftp_get_acks_oack_and_each_data_block() {
+    let first = vec![b'a'; 8];
+    let second = b"tail".to_vec();
+    let (url, rx) = spawn_tftp_server_with_oack(
+        vec![first.clone(), second.clone()],
+        Some(tftp_oack(&[("blksize", "8"), ("tsize", "12")])),
+    );
+
+    let mut command = Command::cargo_bin("curl").unwrap();
+    command.args(["-q", "-sS", "--tftp-blksize", "8", &url]);
+    command.assert().success().stdout("aaaaaaaatail");
+
+    let record = rx.recv().unwrap();
+    assert_eq!(
+        record.request,
+        b"\x00\x01file.txt\x00octet\x00tsize\x000\x00blksize\x008\x00timeout\x005\x00"
+    );
+    assert_eq!(
+        record.acknowledgements,
+        [
+            b"\0\x04\0\0".to_vec(),
+            b"\0\x04\0\x01".to_vec(),
+            b"\0\x04\0\x02".to_vec()
+        ]
+    );
+}
+
+#[test]
+fn tftp_exact_block_requires_final_empty_block() {
+    let (url, rx) = spawn_tftp_server_with_oack(
+        vec![vec![b'x'; 8], Vec::new()],
+        Some(tftp_oack(&[("blksize", "8")])),
+    );
+
+    let mut command = Command::cargo_bin("curl").unwrap();
+    command.args(["-q", "-sS", "--tftp-blksize", "8", &url]);
+    command.assert().success().stdout("xxxxxxxx");
+
+    let record = rx.recv().unwrap();
+    assert_eq!(
+        record.acknowledgements,
+        [
+            b"\0\x04\0\0".to_vec(),
+            b"\0\x04\0\x01".to_vec(),
+            b"\0\x04\0\x02".to_vec()
+        ]
+    );
+}
+
+#[test]
+fn tftp_no_options_sends_plain_rrq() {
+    let (url, rx) = spawn_tftp_server(vec![b"plain".to_vec()]);
+
+    let mut command = Command::cargo_bin("curl").unwrap();
+    command.args(["-q", "-sS", "--tftp-no-options", &url]);
+    command.assert().success().stdout("plain");
+
+    let record = rx.recv().unwrap();
+    assert_eq!(record.request, b"\0\x01file.txt\0octet\0");
+}
+
+#[test]
+fn tftp_url_double_slash_preserves_leading_filename_slash() {
+    let (url, rx) = spawn_tftp_server(vec![b"path".to_vec()]);
+    let url = url.replace("/file.txt", "//dir/file.txt");
+
+    let mut command = Command::cargo_bin("curl").unwrap();
+    command.args(["-q", "-sS", "--tftp-no-options", &url]);
+    command.assert().success().stdout("path");
+
+    let record = rx.recv().unwrap();
+    assert_eq!(record.request, b"\0\x01/dir/file.txt\0octet\0");
+}
+
+#[test]
+fn tftp_writeout_reports_zero_http_code_and_download_size() {
+    let (url, rx) = spawn_tftp_server(vec![b"abcdef".to_vec()]);
+
+    let mut command = Command::cargo_bin("curl").unwrap();
+    command.args(["-q", "-sS", "-w", " %{http_code} %{size_download}", &url]);
+    command.assert().success().stdout("abcdef 000 6");
+
+    assert_eq!(
+        rx.recv().unwrap().acknowledgements,
+        [b"\0\x04\0\x01".to_vec()]
+    );
+}
+
+#[test]
+fn tftp_error_packet_maps_not_found() {
+    let socket = UdpSocket::bind("127.0.0.1:0").unwrap();
+    let addr = socket.local_addr().unwrap();
+    let (tx, rx) = mpsc::channel();
+    thread::spawn(move || {
+        let mut buffer = vec![0; 2048];
+        let (read, peer) = socket.recv_from(&mut buffer).unwrap();
+        tx.send(buffer[..read].to_vec()).unwrap();
+        let mut packet = Vec::from(&5_u16.to_be_bytes()[..]);
+        packet.extend_from_slice(&1_u16.to_be_bytes());
+        packet.extend_from_slice(b"missing");
+        packet.push(0);
+        socket.send_to(&packet, peer).unwrap();
+    });
+
+    let mut command = Command::cargo_bin("curl").unwrap();
+    command.args(["-q", "-sS", &format!("tftp://{addr}/missing.txt")]);
+    command.assert().failure().code(68).stdout("");
+
+    assert!(
+        rx.recv()
+            .unwrap()
+            .starts_with(b"\0\x01missing.txt\0octet\0")
+    );
+}
+
+#[test]
+fn tftp_rejects_decoded_nul_path() {
+    let mut command = Command::cargo_bin("curl").unwrap();
+    command.args(["-q", "-sS", "tftp://example.invalid/%00"]);
+    command.assert().failure().code(3).stdout("");
+}
+
+#[test]
+fn version_lists_tftp_protocol() {
+    let mut command = Command::cargo_bin("curl").unwrap();
+    let output = command.args(["-q", "-V"]).output().unwrap();
+
+    assert!(output.status.success());
+    assert!(String::from_utf8(output.stdout).unwrap().contains("TFTP"));
+}
+
+#[test]
 fn telnet_upload_file_sends_file_and_outputs_response() {
     const REQUEST: &[u8] = b"GET /from-file HTTP/1.0\r\n\r\n";
 
@@ -2415,6 +2628,31 @@ fn libcurl_writes_smtp_mail_options() {
     assert!(text.contains("curl_slist_append(slist1, \"two@example.com\");"));
     assert!(text.contains("CURLOPT_MAIL_RCPT, slist1"));
     assert!(text.contains("CURLOPT_MAIL_RCPT_ALLOWFAILS, 1"));
+}
+
+#[test]
+fn libcurl_writes_tftp_options() {
+    let (url, rx) = spawn_tftp_server(vec![b"ok".to_vec()]);
+    let temp = tempdir().unwrap();
+    let source = temp.path().join("tftp-client.c");
+
+    let mut command = Command::cargo_bin("curl").unwrap();
+    command.args([
+        "-q",
+        "-sS",
+        "--libcurl",
+        source.to_str().unwrap(),
+        "--tftp-blksize",
+        "1024",
+        "--tftp-no-options",
+        &url,
+    ]);
+    command.assert().success().stdout("ok");
+
+    assert_eq!(rx.recv().unwrap().request, b"\0\x01file.txt\0octet\0");
+    let text = std::fs::read_to_string(source).unwrap();
+    assert!(text.contains("CURLOPT_TFTP_BLKSIZE, 1024"));
+    assert!(text.contains("CURLOPT_TFTP_NO_OPTIONS, 1"));
 }
 
 #[test]

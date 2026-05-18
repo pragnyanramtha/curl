@@ -34,6 +34,20 @@ pub enum CurlError {
     LoginDenied,
     #[error("failed sending data to the peer")]
     SendError,
+    #[error("TFTP file not found")]
+    TftpNotFound,
+    #[error("TFTP permission problem")]
+    TftpPermission,
+    #[error("TFTP disk full")]
+    TftpDiskFull,
+    #[error("TFTP illegal operation")]
+    TftpIllegal,
+    #[error("TFTP unknown transfer ID")]
+    TftpUnknownId,
+    #[error("TFTP file already exists")]
+    TftpFileExists,
+    #[error("TFTP no such user")]
+    TftpNoSuchUser,
     #[error("Operation timed out")]
     Timeout,
 }
@@ -51,6 +65,13 @@ impl CurlError {
             Self::FileSizeExceeded => 63,
             Self::LoginDenied => 67,
             Self::SendError => 55,
+            Self::TftpNotFound => 68,
+            Self::TftpPermission => 69,
+            Self::TftpDiskFull => 70,
+            Self::TftpIllegal => 71,
+            Self::TftpUnknownId => 72,
+            Self::TftpFileExists => 73,
+            Self::TftpNoSuchUser => 74,
             Self::Io(_) => 23,
             Self::ReadError(_) => 26,
             Self::Timeout => 28,

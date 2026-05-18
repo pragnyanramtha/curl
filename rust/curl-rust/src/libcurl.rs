@@ -185,6 +185,12 @@ fn write_request(out: &mut String, render: &RenderTransfer<'_>, url: &str) -> Re
     if transfer.mail_rcpt_allowfails {
         emit_long_setopt(out, "CURLOPT_MAIL_RCPT_ALLOWFAILS", 1);
     }
+    if let Some(blksize) = transfer.tftp_blksize {
+        emit_long_setopt(out, "CURLOPT_TFTP_BLKSIZE", i64::from(blksize));
+    }
+    if transfer.tftp_no_options {
+        emit_long_setopt(out, "CURLOPT_TFTP_NO_OPTIONS", 1);
+    }
     if let Some(body) = &render.body
         && !transfer.get
     {
