@@ -35,6 +35,7 @@ add_custom_command(
 add_custom_target(curl-rust ALL DEPENDS "${_curl_rust_sidecar}")
 
 set(_curl_rust_corpus_tests
+  21
   23
   100
   102
@@ -67,6 +68,9 @@ set(_curl_rust_corpus_tests
   333
   419
   426
+  452
+  454
+  460
   462
   467
   496
@@ -79,13 +83,16 @@ set(_curl_rust_corpus_tests
   617
   640
   641
+  697
   723
   725
   726
   738
   739
   741
+  759
   774
+  787
   800
   801
   802
@@ -144,6 +151,9 @@ set(_curl_rust_corpus_tests
   1018
   1019
   1020
+  1022
+  1023
+  1027
   1062
   1094
   1153

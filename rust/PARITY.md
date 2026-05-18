@@ -101,7 +101,7 @@ companion data before this rewrite can be called complete.
 | CMake sidecar build | partial | `BUILD_RUST_CURL_EXE=ON`, `curl-rust-test`, `curl-rust-corpus-test` |
 | Autotools sidecar build | partial | `--enable-rust-curl`, `make -C rust rust-test`, `make -C rust rust-corpus-test` |
 | Existing curl Perl suite with C binary | verified for C path | Does not prove Rust parity |
-| Existing curl Perl suite with Rust binary | partial | `curl-rust-corpus-test` maps 164 smoke cases across FILE, FTP, DICT, GOPHER, HTTP, IPFS/IPNS, IMAP, MQTT, POP3, SCP/SFTP, SMB, SMTP, TFTP, TELNET, CLI help/config/options, and URL/HTTP preflight/error cases; broader protocol corpus remains required before full parity |
+| Existing curl Perl suite with Rust binary | partial | `curl-rust-corpus-test` maps 174 smoke cases across FILE, FTP, DICT, GOPHER, HTTP, IPFS/IPNS, IMAP, MQTT, POP3, SCP/SFTP, SMB, SMTP, TFTP, TELNET, CLI help/config/options, and URL/HTTP preflight/error cases; broader protocol corpus remains required before full parity |
 | Pytest HTTP suite with Rust binary | missing | Required before full parity |
 
 Current `curl-rust-corpus-test` selection:
@@ -112,8 +112,8 @@ Current `curl-rust-corpus-test` selection:
 - IMAP: 800, 801, 802, 803, 806, 807, 808, 809, 810, 811, 812, 813, 814, 817, 818, 829, 846, 847, 1847, 1848, 3206
 - DICT: 1450
 - GOPHER: 1200, 1201, 1202, 1203
-- CLI/help/config/options: 333, 462, 467, 774, 1269, 1409, 1410, 1462, 1474, 2080
-- URL/HTTP preflight/error paths: 23, 219, 419, 426, 496, 1234, 1236, 1264, 1281, 1289, 1673, 2092
+- CLI/help/config/options: 333, 452, 454, 460, 462, 467, 697, 759, 774, 787, 1022, 1023, 1027, 1269, 1409, 1410, 1462, 1474, 2080
+- URL/HTTP preflight/error paths: 21, 23, 219, 419, 426, 496, 1234, 1236, 1264, 1281, 1289, 1673, 2092
 - IPFS/IPNS: 723, 725, 726, 738, 739, 741
 - MQTT: 1190, 1191, 1192, 1193, 1194, 1196, 1198, 1199, 2200, 2201, 2202, 2203, 2204, 2206, 2207, 3017, 3018
 - POP3: 850, 851, 852, 853, 854, 855, 856, 857, 858, 859, 860, 861, 862, 863, 875, 894, 993, 997
