@@ -1,5 +1,6 @@
+use std::io::ErrorKind;
 use std::io::{Read, Write};
-use std::net::TcpListener;
+use std::net::{Shutdown, TcpListener};
 use std::sync::mpsc::{self, Receiver};
 use std::thread;
 use std::time::{Duration, Instant};
@@ -9,6 +10,27 @@ use tempfile::tempdir;
 use url::Url;
 
 const DICT_GREETING: &[u8] = b"220 dictserver <xnooptions> <msgid@msgid>\n";
+const TELNET_IAC: u8 = 255;
+const TELNET_DONT: u8 = 254;
+const TELNET_DO: u8 = 253;
+const TELNET_WONT: u8 = 252;
+const TELNET_WILL: u8 = 251;
+const TELNET_NEW_ENVIRON: u8 = 39;
+const TELNET_NAWS: u8 = 31;
+const TELNET_NEGOTIATION_GREETING: &[u8] = &[
+    TELNET_IAC,
+    TELNET_DO,
+    TELNET_NEW_ENVIRON,
+    TELNET_IAC,
+    TELNET_WILL,
+    TELNET_NEW_ENVIRON,
+    TELNET_IAC,
+    TELNET_DONT,
+    TELNET_NAWS,
+    TELNET_IAC,
+    TELNET_WONT,
+    TELNET_NAWS,
+];
 
 #[derive(Debug)]
 struct RequestRecord {
@@ -65,6 +87,104 @@ fn spawn_dict_server(response: &'static [u8]) -> (String, Receiver<Vec<u8>>) {
     });
 
     (format!("dict://{addr}/d:basic"), rx)
+}
+
+fn spawn_telnet_server(
+    response: &'static [u8],
+    greeting: &'static [u8],
+    stop_suffix: &'static [u8],
+) -> (String, Receiver<Vec<u8>>) {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = listener.local_addr().unwrap();
+    let (tx, rx) = mpsc::channel();
+
+    thread::spawn(move || {
+        let (mut stream, _) = listener.accept().unwrap();
+        if !greeting.is_empty() {
+            stream.write_all(greeting).unwrap();
+        }
+        stream
+            .set_read_timeout(Some(Duration::from_millis(200)))
+            .unwrap();
+
+        let mut bytes = read_telnet_client_bytes(&mut stream, stop_suffix);
+        let _ = stream.write_all(response);
+        bytes.extend(read_telnet_client_bytes(&mut stream, b""));
+        tx.send(bytes).unwrap();
+        let _ = stream.shutdown(Shutdown::Both);
+    });
+
+    (format!("telnet://{addr}/"), rx)
+}
+
+fn spawn_telnet_echo_server(
+    greeting: &'static [u8],
+    stop_suffix: &'static [u8],
+) -> (String, Receiver<Vec<u8>>) {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = listener.local_addr().unwrap();
+    let (tx, rx) = mpsc::channel();
+
+    thread::spawn(move || {
+        let (mut stream, _) = listener.accept().unwrap();
+        if !greeting.is_empty() {
+            stream.write_all(greeting).unwrap();
+        }
+        stream
+            .set_read_timeout(Some(Duration::from_millis(200)))
+            .unwrap();
+
+        let mut bytes = read_telnet_client_bytes(&mut stream, stop_suffix);
+        let plain = strip_telnet_client_negotiation(&bytes);
+        let _ = stream.write_all(&plain);
+        bytes.extend(read_telnet_client_bytes(&mut stream, b""));
+        tx.send(bytes).unwrap();
+        let _ = stream.shutdown(Shutdown::Both);
+    });
+
+    (format!("telnet://{addr}/"), rx)
+}
+
+fn read_telnet_client_bytes(stream: &mut impl Read, stop_suffix: &[u8]) -> Vec<u8> {
+    let mut bytes = Vec::new();
+    let mut buffer = [0; 1024];
+
+    loop {
+        match stream.read(&mut buffer) {
+            Ok(0) => break,
+            Ok(read) => {
+                bytes.extend_from_slice(&buffer[..read]);
+                if !stop_suffix.is_empty() && bytes.ends_with(stop_suffix) {
+                    break;
+                }
+            }
+            Err(error) if matches!(error.kind(), ErrorKind::WouldBlock | ErrorKind::TimedOut) => {
+                break;
+            }
+            Err(error) => panic!("failed to read telnet client bytes: {error}"),
+        }
+    }
+
+    bytes
+}
+
+fn strip_telnet_client_negotiation(bytes: &[u8]) -> Vec<u8> {
+    let mut output = Vec::new();
+    let mut index = 0;
+    while index < bytes.len() {
+        if bytes[index] == TELNET_IAC {
+            if bytes.get(index + 1) == Some(&TELNET_IAC) {
+                output.push(TELNET_IAC);
+                index += 2;
+            } else {
+                index += 3.min(bytes.len() - index);
+            }
+        } else {
+            output.push(bytes[index]);
+            index += 1;
+        }
+    }
+    output
 }
 
 fn spawn_timed_server(
@@ -530,6 +650,134 @@ fn version_lists_dict_protocol() {
 
     assert!(output.status.success());
     assert!(String::from_utf8(output.stdout).unwrap().contains("DICT"));
+}
+
+#[test]
+fn telnet_upload_file_sends_file_and_outputs_response() {
+    const REQUEST: &[u8] = b"GET /from-file HTTP/1.0\r\n\r\n";
+
+    let temp = tempdir().unwrap();
+    let upload = temp.path().join("request.txt");
+    std::fs::write(&upload, REQUEST).unwrap();
+    let (url, rx) = spawn_telnet_server(b"server response", b"", b"\r\n\r\n");
+
+    let mut command = Command::cargo_bin("curl").unwrap();
+    command.args(["-q", "-sS", "-T", upload.to_str().unwrap(), &url]);
+    command.assert().success().stdout("server response");
+
+    assert_eq!(rx.recv().unwrap(), REQUEST);
+}
+
+#[test]
+fn telnet_sends_stdin_without_upload_file() {
+    let (url, rx) = spawn_telnet_server(b"pong", b"", b"ping");
+
+    let mut command = Command::cargo_bin("curl").unwrap();
+    command.args(["-q", "-sS", &url]).write_stdin("ping");
+    command.assert().success().stdout("pong");
+
+    assert_eq!(rx.recv().unwrap(), b"ping");
+}
+
+#[test]
+fn telnet_upload_dash_reads_stdin_and_escapes_iac() {
+    let (url, rx) = spawn_telnet_server(b"ok", b"", b"tail");
+
+    let mut command = Command::cargo_bin("curl").unwrap();
+    command
+        .args(["-q", "-sS", "-T", "-", &url])
+        .write_stdin(b"head\xfftail".as_slice());
+    command.assert().success().stdout("ok");
+
+    assert_eq!(rx.recv().unwrap(), b"head\xff\xfftail");
+}
+
+#[test]
+fn telnet_filters_negotiation_and_replies_to_peer() {
+    let (url, rx) = spawn_telnet_echo_server(TELNET_NEGOTIATION_GREETING, b"test1452");
+
+    let mut command = Command::cargo_bin("curl").unwrap();
+    command
+        .args(["-q", "-sS", "-T", "-", &url])
+        .write_stdin("test1452");
+    command.assert().success().stdout("test1452");
+
+    let received = rx.recv().unwrap();
+    assert_eq!(strip_telnet_client_negotiation(&received), b"test1452");
+    assert!(
+        received
+            .windows(3)
+            .any(|window| window == [TELNET_IAC, TELNET_WONT, TELNET_NEW_ENVIRON])
+    );
+    assert!(
+        received
+            .windows(3)
+            .any(|window| window == [TELNET_IAC, TELNET_DONT, TELNET_NEW_ENVIRON])
+    );
+}
+
+#[test]
+fn telnet_writeout_reports_zero_http_code_and_download_size() {
+    let (url, rx) = spawn_telnet_server(b"abcdef", b"", b"");
+
+    let mut command = Command::cargo_bin("curl").unwrap();
+    command.args([
+        "-q",
+        "-sS",
+        "-w",
+        " %{http_code} %{size_download} %{header_json}",
+        &url,
+    ]);
+    command.assert().success().stdout("abcdef 000 6 {}");
+
+    assert_eq!(rx.recv().unwrap(), b"");
+}
+
+#[test]
+fn telnet_dump_header_creates_empty_file_and_include_adds_nothing() {
+    let temp = tempdir().unwrap();
+    let dump = temp.path().join("telnet.headers");
+    let (url, rx) = spawn_telnet_server(b"body", b"", b"");
+
+    let mut command = Command::cargo_bin("curl").unwrap();
+    command.args(["-q", "-sS", "-i", "-D", dump.to_str().unwrap(), &url]);
+    command.assert().success().stdout("body");
+
+    assert_eq!(rx.recv().unwrap(), b"");
+    assert_eq!(std::fs::read(dump).unwrap(), b"");
+}
+
+#[test]
+fn telnet_options_fail_explicitly_until_negotiation_options_are_supported() {
+    let mut command = Command::cargo_bin("curl").unwrap();
+    command.args(["-q", "-sS", "-tTTYPE=vt100", "telnet://example.invalid"]);
+    command.assert().failure().code(2).stdout("");
+}
+
+#[test]
+fn upload_file_for_http_fails_explicitly_until_http_upload_is_supported() {
+    let temp = tempdir().unwrap();
+    let upload = temp.path().join("upload.txt");
+    std::fs::write(&upload, "body").unwrap();
+
+    let mut command = Command::cargo_bin("curl").unwrap();
+    command.args([
+        "-q",
+        "-sS",
+        "-T",
+        upload.to_str().unwrap(),
+        "http://example.invalid/",
+    ]);
+    command.assert().failure().code(2).stdout("");
+}
+
+#[test]
+fn version_lists_telnet_protocol() {
+    let mut command = Command::cargo_bin("curl").unwrap();
+    let output = command.args(["-q", "-V"]).output().unwrap();
+
+    assert!(output.status.success());
+    assert!(String::from_utf8(output.stdout).unwrap().contains("TELNET"));
 }
 
 #[test]

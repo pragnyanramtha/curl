@@ -1,4 +1,4 @@
-use std::io;
+use std::io::{self, Read};
 use std::path::Path;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -20,6 +20,14 @@ use crate::cookie::CookieJar;
 use crate::data::{self, PreparedBody};
 use crate::error::{CurlError, Result, ResultExt};
 use crate::{glob, output, writeout};
+
+const TELNET_IAC: u8 = 255;
+const TELNET_DONT: u8 = 254;
+const TELNET_DO: u8 = 253;
+const TELNET_WONT: u8 = 252;
+const TELNET_WILL: u8 = 251;
+const TELNET_SB: u8 = 250;
+const TELNET_SE: u8 = 240;
 
 struct HttpAttempt {
     status: StatusCode,
@@ -244,6 +252,8 @@ async fn run_expanded_url(
         Err(CurlError::Unsupported(
             "gophers:// URLs are not implemented in the Rust sidecar".to_string(),
         ))
+    } else if expanded.url.starts_with("telnet://") {
+        run_telnet_transfer(transfer, &expanded, method.as_str(), &mut metrics).await
     } else {
         run_http_with_retries(transfer, client, &expanded, method, &mut metrics, started).await
     };
@@ -275,6 +285,7 @@ async fn run_file_transfer(
             "{method} requests for file:// URLs"
         )));
     }
+    reject_upload_file_for_scheme(transfer, "file://")?;
 
     let url = Url::parse(&expanded.url).map_err(|error| CurlError::Url(error.to_string()))?;
     let path = url
@@ -351,6 +362,7 @@ async fn run_dict_transfer(
             "{method} requests for dict:// URLs"
         )));
     }
+    reject_upload_file_for_scheme(transfer, "dict://")?;
 
     let url = Url::parse(&expanded.url).map_err(|error| CurlError::Url(error.to_string()))?;
     output::validate_output_target(transfer, &url)?;
@@ -391,6 +403,95 @@ async fn run_dict_transfer(
     Ok(())
 }
 
+async fn run_telnet_transfer(
+    transfer: &TransferConfig,
+    expanded: &glob::ExpandedUrl,
+    method: &str,
+    metrics: &mut writeout::Metrics,
+) -> Result<()> {
+    if method != "GET" && method != "HEAD" {
+        return Err(CurlError::Unsupported(format!(
+            "{method} requests for telnet:// URLs"
+        )));
+    }
+    if !transfer.telnet_options.is_empty() {
+        return Err(CurlError::Unsupported(
+            "--telnet-option for telnet:// URLs".to_string(),
+        ));
+    }
+
+    if let Some(timeout) = transfer.max_time {
+        tokio::time::timeout(
+            timeout,
+            run_telnet_exchange(transfer, expanded, method, metrics),
+        )
+        .await
+        .map_err(|_| CurlError::Timeout)?
+    } else {
+        run_telnet_exchange(transfer, expanded, method, metrics).await
+    }
+}
+
+async fn run_telnet_exchange(
+    transfer: &TransferConfig,
+    expanded: &glob::ExpandedUrl,
+    method: &str,
+    metrics: &mut writeout::Metrics,
+) -> Result<()> {
+    let url = Url::parse(&expanded.url).map_err(|error| CurlError::Url(error.to_string()))?;
+    output::validate_output_target(transfer, &url)?;
+    let host = url
+        .host_str()
+        .ok_or_else(|| CurlError::Url("telnet URL is missing a host".to_string()))?;
+    let port = url.port().unwrap_or(23);
+    let input = telnet_input(transfer)?;
+
+    let mut stream = connect_tcp(host, port, transfer).await?;
+    if !input.is_empty() {
+        stream
+            .write_all(&telnet_escape_outgoing(&input))
+            .await
+            .map_err(tcp_io_error)?;
+    }
+
+    let mut state = TelnetRecvState::Data;
+    let mut body = Vec::new();
+    let mut buffer = [0; 4096];
+    loop {
+        let read = stream.read(&mut buffer).await.map_err(tcp_io_error)?;
+        if read == 0 {
+            break;
+        }
+
+        let replies = telnet_process_incoming(&buffer[..read], &mut state, &mut body);
+        if !replies.is_empty() {
+            stream.write_all(&replies).await.map_err(tcp_io_error)?;
+        }
+    }
+
+    metrics.url_effective = url.to_string();
+    if method == "HEAD" {
+        body.clear();
+    }
+    metrics.size_download = body.len() as u64;
+
+    if let Some(path) = &transfer.dump_header {
+        output::dump_headers(path, &[], transfer.create_dirs)?;
+    }
+
+    let bytes = if method == "HEAD" { &[][..] } else { &body };
+    let filename = output::write_response(
+        transfer,
+        &url,
+        &reqwest::header::HeaderMap::new(),
+        &expanded.variables,
+        bytes,
+        false,
+    )?;
+    metrics.filename_effective = filename.map(|path| path.display().to_string());
+    Ok(())
+}
+
 async fn run_gopher_transfer(
     transfer: &TransferConfig,
     expanded: &glob::ExpandedUrl,
@@ -402,6 +503,7 @@ async fn run_gopher_transfer(
             "{method} requests for gopher:// URLs"
         )));
     }
+    reject_upload_file_for_scheme(transfer, "gopher://")?;
 
     let url = Url::parse(&expanded.url).map_err(|error| CurlError::Url(error.to_string()))?;
     output::validate_output_target(transfer, &url)?;
@@ -463,6 +565,125 @@ async fn connect_tcp(host: &str, port: u16, transfer: &TransferConfig) -> Result
 
 fn tcp_io_error(error: io::Error) -> CurlError {
     CurlError::Transfer(error.to_string())
+}
+
+fn reject_upload_file_for_scheme(transfer: &TransferConfig, scheme: &str) -> Result<()> {
+    if transfer.upload_file.is_some() {
+        return Err(CurlError::Unsupported(format!(
+            "--upload-file for {scheme}"
+        )));
+    }
+    Ok(())
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TelnetRecvState {
+    Data,
+    Cr,
+    Iac,
+    Will,
+    Wont,
+    Do,
+    Dont,
+    Subnegotiation,
+    SubnegotiationIac,
+}
+
+fn telnet_input(transfer: &TransferConfig) -> Result<Vec<u8>> {
+    match transfer.upload_file.as_deref() {
+        Some("-") | None => {
+            let mut bytes = Vec::new();
+            io::stdin().read_to_end(&mut bytes)?;
+            Ok(bytes)
+        }
+        Some(path) => Ok(std::fs::read(path)?),
+    }
+}
+
+fn telnet_escape_outgoing(input: &[u8]) -> Vec<u8> {
+    let mut output = Vec::with_capacity(input.len());
+    for byte in input {
+        output.push(*byte);
+        if *byte == TELNET_IAC {
+            output.push(TELNET_IAC);
+        }
+    }
+    output
+}
+
+fn telnet_process_incoming(
+    input: &[u8],
+    state: &mut TelnetRecvState,
+    body: &mut Vec<u8>,
+) -> Vec<u8> {
+    let mut replies = Vec::new();
+
+    for byte in input {
+        match *state {
+            TelnetRecvState::Data => match *byte {
+                TELNET_IAC => *state = TelnetRecvState::Iac,
+                b'\r' => {
+                    body.push(*byte);
+                    *state = TelnetRecvState::Cr;
+                }
+                _ => body.push(*byte),
+            },
+            TelnetRecvState::Cr => {
+                *state = TelnetRecvState::Data;
+                if *byte != 0 {
+                    if *byte == TELNET_IAC {
+                        *state = TelnetRecvState::Iac;
+                    } else {
+                        body.push(*byte);
+                    }
+                }
+            }
+            TelnetRecvState::Iac => match *byte {
+                TELNET_WILL => *state = TelnetRecvState::Will,
+                TELNET_WONT => *state = TelnetRecvState::Wont,
+                TELNET_DO => *state = TelnetRecvState::Do,
+                TELNET_DONT => *state = TelnetRecvState::Dont,
+                TELNET_SB => *state = TelnetRecvState::Subnegotiation,
+                TELNET_IAC => {
+                    body.push(TELNET_IAC);
+                    *state = TelnetRecvState::Data;
+                }
+                _ => *state = TelnetRecvState::Data,
+            },
+            TelnetRecvState::Will => {
+                telnet_reply(&mut replies, TELNET_DONT, *byte);
+                *state = TelnetRecvState::Data;
+            }
+            TelnetRecvState::Wont => {
+                *state = TelnetRecvState::Data;
+            }
+            TelnetRecvState::Do => {
+                telnet_reply(&mut replies, TELNET_WONT, *byte);
+                *state = TelnetRecvState::Data;
+            }
+            TelnetRecvState::Dont => {
+                *state = TelnetRecvState::Data;
+            }
+            TelnetRecvState::Subnegotiation => {
+                if *byte == TELNET_IAC {
+                    *state = TelnetRecvState::SubnegotiationIac;
+                }
+            }
+            TelnetRecvState::SubnegotiationIac => {
+                *state = if *byte == TELNET_SE {
+                    TelnetRecvState::Data
+                } else {
+                    TelnetRecvState::Subnegotiation
+                };
+            }
+        }
+    }
+
+    replies
+}
+
+fn telnet_reply(output: &mut Vec<u8>, command: u8, option: u8) {
+    output.extend_from_slice(&[TELNET_IAC, command, option]);
 }
 
 fn dict_request(url: &Url) -> Result<Vec<u8>> {
@@ -587,6 +808,7 @@ async fn run_http_transfer(
     method: Method,
     metrics: &mut writeout::Metrics,
 ) -> Result<HttpAttempt> {
+    reject_upload_file_for_scheme(transfer, "HTTP URLs")?;
     let prepared_query = data::prepare_body(&transfer.url_query)?;
     let prepared_body = data::prepare_body(&transfer.data)?;
     let has_multipart = !transfer.forms.is_empty();

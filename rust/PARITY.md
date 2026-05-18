@@ -37,7 +37,7 @@ behavior, and test mapping is `verified` or explicitly accepted as out of scope.
 | SCP/SFTP | missing | none | protocol tests | |
 | SMB/SMBS | missing | none | protocol tests | |
 | SMTP/SMTPS | missing | none | protocol tests | |
-| TELNET | missing | none | protocol tests | |
+| TELNET | partial | `transfer.rs::run_telnet_transfer` | `telnet_upload_file_sends_file_and_outputs_response`, `telnet_sends_stdin_without_upload_file`, `telnet_upload_dash_reads_stdin_and_escapes_iac`, `telnet_filters_negotiation_and_replies_to_peer`, `telnet_writeout_reports_zero_http_code_and_download_size`, `telnet_dump_header_creates_empty_file_and_include_adds_nothing`, `telnet_options_fail_explicitly_until_negotiation_options_are_supported`, `version_lists_telnet_protocol` | Plain `telnet://` TCP stream support only; stdin/`--upload-file` bytes are sent, outbound IAC bytes are escaped, basic peer-started WILL/DO negotiation is filtered/rejected, and TELNET output remains body-only; `--telnet-option`, proactive C curl negotiation preferences, NAWS/TTYPE/XDISPLOC/NEW_ENV suboptions, `--max-filesize`, interactive polling parity, TLS/proxying, and full corpus mapping remain incomplete |
 | TFTP | missing | none | protocol tests | |
 | WS/WSS | missing | none | websocket tests | |
 
@@ -55,6 +55,8 @@ companion data before this rewrite can be called complete.
 | `--json` | partial | `TransferConfig::data` | `sends_json_body_and_default_json_headers` | Basic defaults only |
 | `--url-query` | partial | `TransferConfig::url_query` | `sends_referer_range_and_url_query` | Basic encoding and `+` passthrough only |
 | `--form`, `--form-string` | partial | `TransferConfig::forms` | `sends_multipart_form_body` | Basic fields/files only |
+| `--upload-file` | partial | `TransferConfig::upload_file` | `telnet_upload_file_sends_file_and_outputs_response`, `telnet_upload_dash_reads_stdin_and_escapes_iac`, `upload_file_for_http_fails_explicitly_until_http_upload_is_supported`, `parses_upload_file_and_telnet_options` | TELNET upload source only; HTTP PUT/upload is explicitly rejected instead of silently ignored, and FTP/SFTP uploads, globbed upload paths, resume/upload flags, and full corpus mapping are missing |
+| `--telnet-option` | partial | `TransferConfig::telnet_options` | `telnet_options_fail_explicitly_until_negotiation_options_are_supported`, `parses_upload_file_and_telnet_options` | Parsed and rejected explicitly for TELNET until TTYPE/XDISPLOC/NEW_ENV/NAWS negotiation support is implemented |
 | `--output`, `--remote-name`, `--remote-header-name` | partial | output module | output and `-OJ` tests | Needs full Content-Disposition parity |
 | `--dump-header` | partial | `TransferConfig::dump_header` | `dump_header_dash_writes_headers_to_stdout` | Redirect header history incomplete |
 | `--write-out` | partial | `writeout.rs` | `renders_common_variables` | Many variables missing |

@@ -33,6 +33,8 @@ pub struct TransferConfig {
     pub data: Vec<DataSpec>,
     pub url_query: Vec<DataSpec>,
     pub forms: Vec<FormSpec>,
+    pub upload_file: Option<String>,
+    pub telnet_options: Vec<String>,
     pub output: Option<String>,
     pub output_dir: Option<PathBuf>,
     pub remote_name: bool,
@@ -119,6 +121,8 @@ impl Default for TransferConfig {
             data: Vec::new(),
             url_query: Vec::new(),
             forms: Vec::new(),
+            upload_file: None,
+            telnet_options: Vec::new(),
             output: None,
             output_dir: None,
             remote_name: false,
@@ -371,6 +375,14 @@ impl Parser {
                     .forms
                     .push(FormSpec::new(FormKind::FormString, value));
             }
+            "upload-file" => {
+                let value = self.value_for(name, inline_value)?;
+                self.current().upload_file = Some(value);
+            }
+            "telnet-option" => {
+                let value = self.value_for(name, inline_value)?;
+                self.current().telnet_options.push(value);
+            }
             "output" => {
                 let value = self.value_for(name, inline_value)?;
                 self.current().output = Some(value);
@@ -595,6 +607,16 @@ impl Parser {
                         .push(FormSpec::new(FormKind::Form, value));
                     break;
                 }
+                'T' => {
+                    let value = self.short_value('T', rest)?;
+                    self.current().upload_file = Some(value);
+                    break;
+                }
+                't' => {
+                    let value = self.short_value('t', rest)?;
+                    self.current().telnet_options.push(value);
+                    break;
+                }
                 'o' => {
                     let value = self.short_value('o', rest)?;
                     self.current().output = Some(value);
@@ -758,6 +780,8 @@ impl TransferConfig {
             || !self.data.is_empty()
             || !self.url_query.is_empty()
             || !self.forms.is_empty()
+            || self.upload_file.is_some()
+            || !self.telnet_options.is_empty()
             || self.output.is_some()
             || self.output_dir.is_some()
             || self.remote_name
@@ -883,6 +907,8 @@ pub fn print_help() {
                --data-binary <data>    HTTP POST binary data\n\
                --data-urlencode <data> Percent-encode POST data\n\
            -F, --form <name=content>   Specify multipart form data\n\
+           -T, --upload-file <file>    Transfer local file to remote URL\n\
+           -t, --telnet-option <opt>   Set telnet option\n\
                --url-query <data>      Add URL query data\n\
                --json <data>           JSON request body\n\
            -e, --referer <url>         Send Referer header\n\
@@ -920,7 +946,7 @@ pub fn print_help() {
 
 pub fn print_version() {
     println!(
-        "curl-rust {} (Rust rewrite) DICT HTTP HTTPS FILE GOPHER",
+        "curl-rust {} (Rust rewrite) DICT HTTP HTTPS FILE GOPHER TELNET",
         env!("CARGO_PKG_VERSION")
     );
 }
@@ -1089,6 +1115,25 @@ mod tests {
         assert_eq!(transfer.data[0].value, "a=b");
         assert_eq!(transfer.output.as_deref(), Some("out.txt"));
         assert_eq!(transfer.urls, ["https://example.com"]);
+    }
+
+    #[test]
+    fn parses_upload_file_and_telnet_options() {
+        let config = parse_args([
+            "-q",
+            "-T",
+            "input.txt",
+            "-tTTYPE=vt100",
+            "--telnet-option",
+            "NEW_ENV=USER,me",
+            "telnet://example.com",
+        ])
+        .unwrap();
+
+        let transfer = &config.transfers[0];
+        assert_eq!(transfer.upload_file.as_deref(), Some("input.txt"));
+        assert_eq!(transfer.telnet_options, ["TTYPE=vt100", "NEW_ENV=USER,me"]);
+        assert_eq!(transfer.urls, ["telnet://example.com"]);
     }
 
     #[test]

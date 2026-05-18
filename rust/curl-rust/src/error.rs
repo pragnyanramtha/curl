@@ -18,6 +18,8 @@ pub enum CurlError {
     TooManyRedirects { max: usize },
     #[error("HTTP response code said error: {status}")]
     HttpStatus { status: u16 },
+    #[error("Operation timed out")]
+    Timeout,
 }
 
 impl CurlError {
@@ -29,6 +31,7 @@ impl CurlError {
             Self::TooManyRedirects { .. } => 47,
             Self::HttpStatus { .. } => 22,
             Self::Io(_) => 23,
+            Self::Timeout => 28,
         }
     }
 }
