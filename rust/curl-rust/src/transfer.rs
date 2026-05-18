@@ -335,6 +335,11 @@ async fn run_file_transfer(
     } else {
         apply_file_range(body, effective_range(transfer, resume_from).as_deref())?
     };
+    let (body_bytes, max_filesize_exceeded) = if method == "HEAD" {
+        (&body[..], false)
+    } else {
+        limit_body_for_max_filesize(transfer, &body)
+    };
     let modified = url
         .to_file_path()
         .ok()
@@ -343,7 +348,7 @@ async fn run_file_transfer(
     let header_size = if method == "HEAD" {
         metadata_size
     } else {
-        body.len() as u64
+        body_bytes.len() as u64
     };
     let headers = output::file_headers(header_size, modified);
     let header_bytes = output::render_file_headers(&headers);
@@ -352,7 +357,7 @@ async fn run_file_transfer(
     }
     metrics.url_effective = expanded.url.clone();
     metrics.response_code = Some(200);
-    metrics.size_download = body.len() as u64;
+    metrics.size_download = body_bytes.len() as u64;
     metrics.headers = headers.clone();
 
     let mut bytes = Vec::new();
@@ -360,7 +365,7 @@ async fn run_file_transfer(
         bytes.extend_from_slice(&header_bytes);
     }
     if method != "HEAD" {
-        bytes.extend_from_slice(&body);
+        bytes.extend_from_slice(body_bytes);
     }
     let filename = output::write_response(
         transfer,
@@ -371,6 +376,9 @@ async fn run_file_transfer(
         resume_from > 0,
     )?;
     metrics.filename_effective = filename.map(|path| path.display().to_string());
+    if max_filesize_exceeded {
+        return Err(CurlError::FileSizeExceeded);
+    }
     Ok(())
 }
 
@@ -402,8 +410,13 @@ async fn run_dict_transfer(
     if method != "HEAD" {
         stream.read_to_end(&mut body).await.map_err(tcp_io_error)?;
     }
+    let (body_bytes, max_filesize_exceeded) = if method == "HEAD" {
+        (&body[..], false)
+    } else {
+        limit_body_for_max_filesize(transfer, &body)
+    };
     metrics.url_effective = url.to_string();
-    metrics.size_download = body.len() as u64;
+    metrics.size_download = body_bytes.len() as u64;
 
     if let Some(path) = &transfer.dump_header {
         output::dump_headers(path, &[], transfer.create_dirs)?;
@@ -411,7 +424,7 @@ async fn run_dict_transfer(
 
     let mut bytes = Vec::new();
     if method != "HEAD" {
-        bytes.extend_from_slice(&body);
+        bytes.extend_from_slice(body_bytes);
     }
 
     let filename = output::write_response(
@@ -423,6 +436,9 @@ async fn run_dict_transfer(
         false,
     )?;
     metrics.filename_effective = filename.map(|path| path.display().to_string());
+    if max_filesize_exceeded {
+        return Err(CurlError::FileSizeExceeded);
+    }
     Ok(())
 }
 
@@ -496,22 +512,29 @@ async fn run_telnet_exchange(
     if method == "HEAD" {
         body.clear();
     }
-    metrics.size_download = body.len() as u64;
+    let (body_bytes, max_filesize_exceeded) = if method == "HEAD" {
+        (&body[..], false)
+    } else {
+        limit_body_for_max_filesize(transfer, &body)
+    };
+    metrics.size_download = body_bytes.len() as u64;
 
     if let Some(path) = &transfer.dump_header {
         output::dump_headers(path, &[], transfer.create_dirs)?;
     }
 
-    let bytes = if method == "HEAD" { &[][..] } else { &body };
     let filename = output::write_response(
         transfer,
         &url,
         &reqwest::header::HeaderMap::new(),
         &expanded.variables,
-        bytes,
+        body_bytes,
         false,
     )?;
     metrics.filename_effective = filename.map(|path| path.display().to_string());
+    if max_filesize_exceeded {
+        return Err(CurlError::FileSizeExceeded);
+    }
     Ok(())
 }
 
@@ -551,7 +574,12 @@ async fn run_gopher_transfer(
     if method == "HEAD" {
         body.clear();
     }
-    metrics.size_download = body.len() as u64;
+    let (body_bytes, max_filesize_exceeded) = if method == "HEAD" {
+        (&body[..], false)
+    } else {
+        limit_body_for_max_filesize(transfer, &body)
+    };
+    metrics.size_download = body_bytes.len() as u64;
 
     if let Some(path) = &transfer.dump_header {
         output::dump_headers(path, &header_bytes, transfer.create_dirs)?;
@@ -559,7 +587,7 @@ async fn run_gopher_transfer(
 
     let mut bytes = Vec::new();
     if method != "HEAD" {
-        bytes.extend_from_slice(&body);
+        bytes.extend_from_slice(body_bytes);
     }
 
     let filename = output::write_response(
@@ -571,6 +599,9 @@ async fn run_gopher_transfer(
         false,
     )?;
     metrics.filename_effective = filename.map(|path| path.display().to_string());
+    if max_filesize_exceeded {
+        return Err(CurlError::FileSizeExceeded);
+    }
     Ok(())
 }
 
@@ -597,6 +628,58 @@ fn reject_upload_file_for_scheme(transfer: &TransferConfig, scheme: &str) -> Res
         )));
     }
     Ok(())
+}
+
+fn max_filesize_limit(transfer: &TransferConfig) -> Option<u64> {
+    transfer.max_filesize.filter(|limit| *limit > 0)
+}
+
+fn limit_body_for_max_filesize<'a>(transfer: &TransferConfig, body: &'a [u8]) -> (&'a [u8], bool) {
+    let Some(limit) = max_filesize_limit(transfer) else {
+        return (body, false);
+    };
+    if body.len() as u64 <= limit {
+        return (body, false);
+    }
+
+    let limit = usize::try_from(limit).unwrap_or(usize::MAX);
+    (&body[..limit.min(body.len())], true)
+}
+
+fn check_http_content_length_max_filesize(
+    transfer: &TransferConfig,
+    headers: &reqwest::header::HeaderMap,
+    ignore_body: bool,
+) -> Result<()> {
+    let Some(limit) = max_filesize_limit(transfer) else {
+        return Ok(());
+    };
+    if ignore_body {
+        return Ok(());
+    }
+
+    let Some(value) = headers.get(CONTENT_LENGTH) else {
+        return Ok(());
+    };
+    let Ok(value) = value.to_str() else {
+        return Ok(());
+    };
+    let Some(length) = parse_http_content_length_for_max_filesize(value) else {
+        return Ok(());
+    };
+    if length > u128::from(limit) {
+        return Err(CurlError::FileSizeExceeded);
+    }
+    Ok(())
+}
+
+fn parse_http_content_length_for_max_filesize(value: &str) -> Option<u128> {
+    let value = value.trim();
+    let value = value.split(',').next().unwrap_or(value).trim();
+    if value.is_empty() || !value.bytes().all(|byte| byte.is_ascii_digit()) {
+        return None;
+    }
+    value.parse().ok()
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -974,6 +1057,8 @@ async fn run_http_transfer(
             .map(ToString::to_string);
         metrics.headers = headers.clone();
 
+        check_http_content_length_max_filesize(transfer, &headers, method == Method::HEAD)?;
+
         let body = if method == Method::HEAD {
             Vec::new()
         } else {
@@ -1012,7 +1097,7 @@ async fn run_http_with_retries(
                         .is_some()
                 {
                     if transfer.fail_with_body && is_http_error_status(attempt.status) {
-                        write_http_attempt_output(
+                        let _ = write_http_attempt_output(
                             transfer, expanded, &method, metrics, &attempt, false,
                         )?;
                     }
@@ -1052,7 +1137,11 @@ fn finish_http_transfer(
     metrics: &mut writeout::Metrics,
     attempt: HttpAttempt,
 ) -> Result<()> {
-    write_http_attempt_output(transfer, expanded, &method, metrics, &attempt, true)?;
+    let max_filesize_exceeded =
+        write_http_attempt_output(transfer, expanded, &method, metrics, &attempt, true)?;
+    if max_filesize_exceeded {
+        return Err(CurlError::FileSizeExceeded);
+    }
 
     if transfer.fail && is_http_error_status(attempt.status) {
         return Err(CurlError::HttpStatus {
@@ -1070,7 +1159,7 @@ fn write_http_attempt_output(
     metrics: &mut writeout::Metrics,
     attempt: &HttpAttempt,
     persist_headers: bool,
-) -> Result<()> {
+) -> Result<bool> {
     let header_bytes = output::render_headers(attempt.version, attempt.status, &attempt.headers);
     if persist_headers && let Some(path) = &transfer.dump_header {
         output::dump_headers(path, &header_bytes, transfer.create_dirs)?;
@@ -1083,11 +1172,12 @@ fn write_http_attempt_output(
     let write_headers = transfer.include_headers || transfer.head;
     let write_body =
         method.as_str() != "HEAD" && (!is_error || !transfer.fail || transfer.fail_with_body);
-    metrics.size_download = if write_body {
-        attempt.body.len() as u64
+    let (body_bytes, max_filesize_exceeded) = if write_body {
+        limit_body_for_max_filesize(transfer, &attempt.body)
     } else {
-        0
+        (&[][..], false)
     };
+    metrics.size_download = body_bytes.len() as u64;
 
     if write_headers || write_body {
         let mut bytes = Vec::new();
@@ -1095,7 +1185,7 @@ fn write_http_attempt_output(
             bytes.extend_from_slice(&header_bytes);
         }
         if write_body {
-            bytes.extend_from_slice(&attempt.body);
+            bytes.extend_from_slice(body_bytes);
         }
         let filename = output::write_response(
             transfer,
@@ -1108,7 +1198,7 @@ fn write_http_attempt_output(
         metrics.filename_effective = filename.map(|path| path.display().to_string());
     }
 
-    Ok(())
+    Ok(max_filesize_exceeded)
 }
 
 async fn schedule_retry(

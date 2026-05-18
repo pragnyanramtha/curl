@@ -216,6 +216,13 @@ fn write_request(out: &mut String, render: &RenderTransfer<'_>, url: &str) -> Re
             &format!("{}L", timeout.as_millis()),
         );
     }
+    if let Some(max_filesize) = transfer.max_filesize {
+        emit_raw_setopt(
+            out,
+            "CURLOPT_MAXFILESIZE_LARGE",
+            &format!("(curl_off_t){max_filesize}"),
+        );
+    }
     if let Some(referer) = &transfer.referer {
         emit_string_setopt(out, "CURLOPT_REFERER", referer);
     }

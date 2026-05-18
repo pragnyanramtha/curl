@@ -336,6 +336,92 @@ fn downloads_http_and_renders_writeout() {
 }
 
 #[test]
+fn max_filesize_allows_http_body_within_limit() {
+    let (url, rx) = spawn_server(b"HTTP/1.1 200 OK\r\nContent-Length: 5\r\n\r\nhello");
+
+    let mut command = Command::cargo_bin("curl").unwrap();
+    command.args(["-q", "-sS", "--max-filesize", "5", &url]);
+    command.assert().success().stdout("hello");
+
+    rx.recv().unwrap();
+}
+
+#[test]
+fn max_filesize_zero_disables_limit() {
+    let (url, rx) = spawn_server(b"HTTP/1.1 200 OK\r\nContent-Length: 7\r\n\r\ntoolong");
+
+    let mut command = Command::cargo_bin("curl").unwrap();
+    command.args(["-q", "-sS", "--max-filesize", "0", &url]);
+    command.assert().success().stdout("toolong");
+
+    rx.recv().unwrap();
+}
+
+#[test]
+fn max_filesize_rejects_http_content_length_before_body_output() {
+    let (url, rx) = spawn_server(b"HTTP/1.1 200 OK\r\nContent-Length: 7\r\n\r\ntoolong");
+
+    let mut command = Command::cargo_bin("curl").unwrap();
+    command.args([
+        "-q",
+        "-sS",
+        "--max-filesize",
+        "2",
+        "-w",
+        " %{exitcode} %{errormsg} %{size_download}",
+        &url,
+    ]);
+    command
+        .assert()
+        .failure()
+        .code(63)
+        .stdout(" 63 Maximum file size exceeded 0");
+
+    rx.recv().unwrap();
+}
+
+#[test]
+fn max_filesize_truncates_unknown_http_body_then_fails() {
+    let (url, rx) = spawn_server(b"HTTP/1.1 200 OK\r\nConnection: close\r\n\r\nabcdef");
+
+    let mut command = Command::cargo_bin("curl").unwrap();
+    command.args(["-q", "-sS", "--max-filesize", "3", &url]);
+    command.assert().failure().code(63).stdout("abc");
+
+    rx.recv().unwrap();
+}
+
+#[test]
+fn max_filesize_does_not_fail_head_with_large_content_length() {
+    let (url, rx) = spawn_server(b"HTTP/1.1 200 OK\r\nContent-Length: 7\r\n\r\n");
+
+    let mut command = Command::cargo_bin("curl").unwrap();
+    let output = command
+        .args(["-q", "-sS", "-I", "--max-filesize", "2", &url])
+        .output()
+        .unwrap();
+
+    assert_eq!(output.status.code(), Some(0));
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    assert!(stdout.starts_with("HTTP/1.1 200 OK\r\n"));
+    assert!(stdout.contains("content-length: 7\r\n"));
+
+    let request = rx.recv().unwrap();
+    assert!(request.start_line.starts_with("HEAD /resource HTTP/1.1"));
+}
+
+#[test]
+fn max_filesize_truncates_telnet_body_then_fails() {
+    let (url, rx) = spawn_telnet_server(b"abcdef", b"", b"");
+
+    let mut command = Command::cargo_bin("curl").unwrap();
+    command.args(["-q", "-sS", "--max-filesize", "3", &url]);
+    command.assert().failure().code(63).stdout("abc");
+
+    rx.recv().unwrap();
+}
+
+#[test]
 fn retries_transient_http_status_then_succeeds() {
     let (url, rx) = spawn_sequence_server(vec![
         b"HTTP/1.1 503 Service Unavailable\r\nContent-Length: 3\r\n\r\nbad",
@@ -1739,6 +1825,8 @@ fn libcurl_writes_source_file_for_supported_options() {
         "alice:secret",
         "-A",
         "MyUA",
+        "--max-filesize",
+        "2M",
         "--http1.1",
         "-e",
         "firstone.html;auto",
@@ -1765,6 +1853,7 @@ fn libcurl_writes_source_file_for_supported_options() {
     assert!(text.contains("CURLOPT_POSTFIELDSIZE_LARGE, (curl_off_t)3"));
     assert!(text.contains("CURLOPT_USERPWD, \"alice:secret\""));
     assert!(text.contains("CURLOPT_USERAGENT, \"MyUA\""));
+    assert!(text.contains("CURLOPT_MAXFILESIZE_LARGE, (curl_off_t)2097152"));
     assert!(text.contains("CURLOPT_REFERER, \"firstone.html\""));
     assert!(text.contains("CURLOPT_AUTOREFERER, 1"));
     assert!(text.contains("CURLOPT_HTTP_VERSION, CURL_HTTP_VERSION_1_1"));

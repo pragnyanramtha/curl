@@ -62,6 +62,7 @@ pub struct TransferConfig {
     pub insecure: bool,
     pub connect_timeout: Option<Duration>,
     pub max_time: Option<Duration>,
+    pub max_filesize: Option<u64>,
     pub user_agent: Option<String>,
     pub referer: Option<String>,
     pub auto_referer: bool,
@@ -151,6 +152,7 @@ impl Default for TransferConfig {
             insecure: false,
             connect_timeout: None,
             max_time: None,
+            max_filesize: None,
             user_agent: None,
             referer: None,
             auto_referer: false,
@@ -468,6 +470,10 @@ impl Parser {
             "max-time" => {
                 let value = self.value_for(name, inline_value)?;
                 self.current().max_time = Some(parse_duration(name, &value)?);
+            }
+            "max-filesize" => {
+                let value = self.value_for(name, inline_value)?;
+                self.current().max_filesize = Some(parse_size_parameter(name, &value)?);
             }
             "user-agent" => {
                 let value = self.value_for(name, inline_value)?;
@@ -832,6 +838,7 @@ impl TransferConfig {
             || self.insecure
             || self.connect_timeout.is_some()
             || self.max_time.is_some()
+            || self.max_filesize.is_some()
             || self.user_agent.is_some()
             || self.referer.is_some()
             || self.auto_referer
@@ -870,6 +877,82 @@ fn parse_u64(name: &str, value: &str) -> Result<u64> {
     value
         .parse()
         .map_err(|_| CurlError::Usage(format!("option --{name} expects an integer")))
+}
+
+fn parse_size_parameter(name: &str, value: &str) -> Result<u64> {
+    const MAX_SIZE: u128 = i64::MAX as u128;
+    let bytes = value.as_bytes();
+    let mut index = 0;
+    while bytes.get(index).is_some_and(u8::is_ascii_digit) {
+        index += 1;
+    }
+    if index == 0 {
+        return Err(CurlError::Usage(format!(
+            "option --{name} expects a non-negative byte count"
+        )));
+    }
+
+    let whole = value[..index]
+        .parse::<u128>()
+        .map_err(|_| CurlError::Usage(format!("option --{name} value is too large")))?;
+
+    let mut fraction = "";
+    if bytes.get(index) == Some(&b'.') {
+        let start = index + 1;
+        let mut end = start;
+        while bytes.get(end).is_some_and(u8::is_ascii_digit) {
+            end += 1;
+        }
+        if end == start {
+            return Err(CurlError::Usage(format!(
+                "option --{name} expects digits after the decimal point"
+            )));
+        }
+        fraction = &value[start..end];
+        index = end;
+    }
+
+    let unit = &bytes[index..];
+    let (multiplier, multiplier_digits) = match unit {
+        b"" | b"b" | b"B" => {
+            if !fraction.is_empty() {
+                return Err(CurlError::Usage(format!(
+                    "option --{name} only supports fractional values with K/M/G/T/P units"
+                )));
+            }
+            (1_u128, 1_usize)
+        }
+        [unit] if unit.eq_ignore_ascii_case(&b'k') => (1024, 4),
+        [unit] if unit.eq_ignore_ascii_case(&b'm') => (1_048_576, 7),
+        [unit] if unit.eq_ignore_ascii_case(&b'g') => (1_073_741_824, 10),
+        [unit] if unit.eq_ignore_ascii_case(&b't') => (1_099_511_627_776, 13),
+        [unit] if unit.eq_ignore_ascii_case(&b'p') => (1_125_899_906_842_624, 16),
+        _ => {
+            return Err(CurlError::Usage(format!(
+                "option --{name} has an unsupported size suffix"
+            )));
+        }
+    };
+
+    let mut add = 0_u128;
+    if !fraction.is_empty() {
+        let keep = fraction.len().min(multiplier_digits.saturating_sub(1));
+        let fraction = &fraction[..keep];
+        if !fraction.is_empty() {
+            let fraction_value = fraction.parse::<u128>().map_err(|_| {
+                CurlError::Usage(format!("option --{name} fractional value is too large"))
+            })?;
+            let divisor = 10_u128.pow(keep as u32);
+            add = fraction_value.saturating_mul(multiplier) / divisor;
+        }
+    }
+
+    let total = whole
+        .checked_mul(multiplier)
+        .and_then(|value| value.checked_add(add))
+        .filter(|value| *value <= MAX_SIZE)
+        .ok_or_else(|| CurlError::Usage(format!("option --{name} value is too large")))?;
+    Ok(total as u64)
 }
 
 fn parse_continue_at(name: &str, value: &str) -> Result<ContinueAt> {
@@ -958,6 +1041,7 @@ pub fn print_help() {
                --retry <num>           Retry transient transfer problems\n\
                --retry-delay <seconds> Wait time between retries\n\
                --retry-max-time <sec>  Retry only within this period\n\
+              --max-filesize <bytes> Maximum file size to download\n\
            -o, --output <file>         Write output to file\n\
            -O, --remote-name           Write output to remote filename\n\
                --etag-compare <file>   Load ETag from file\n\
@@ -1170,6 +1254,33 @@ mod tests {
         assert_eq!(transfer.upload_file.as_deref(), Some("input.txt"));
         assert_eq!(transfer.telnet_options, ["TTYPE=vt100", "NEW_ENV=USER,me"]);
         assert_eq!(transfer.urls, ["telnet://example.com"]);
+    }
+
+    #[test]
+    fn parses_max_filesize_units_and_fractions() {
+        let config = parse_args(["-q", "--max-filesize", "2.5M", "https://example.com"]).unwrap();
+        assert_eq!(config.transfers[0].max_filesize, Some(2_621_440));
+
+        assert_eq!(parse_size_parameter("max-filesize", "1b").unwrap(), 1);
+        assert_eq!(parse_size_parameter("max-filesize", "99B").unwrap(), 99);
+        assert_eq!(
+            parse_size_parameter("max-filesize", "1.001k").unwrap(),
+            1025
+        );
+        assert_eq!(
+            parse_size_parameter("max-filesize", "22.000000001m").unwrap(),
+            23_068_672
+        );
+        assert_eq!(parse_size_parameter("max-filesize", "0").unwrap(), 0);
+    }
+
+    #[test]
+    fn rejects_bad_max_filesize_values() {
+        for value in ["3.4", "3.14b", "a", "-2", "+2", "2,2k", "8192P"] {
+            let error =
+                parse_args(["-q", "--max-filesize", value, "https://example.com"]).unwrap_err();
+            assert!(error.to_string().contains("max-filesize"));
+        }
     }
 
     #[test]

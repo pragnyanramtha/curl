@@ -24,6 +24,8 @@ pub enum CurlError {
     TooManyRedirects { max: usize },
     #[error("HTTP response code said error: {status}")]
     HttpStatus { status: u16 },
+    #[error("Maximum file size exceeded")]
+    FileSizeExceeded,
     #[error("Operation timed out")]
     Timeout,
 }
@@ -36,6 +38,7 @@ impl CurlError {
             Self::Transfer(_) => 7,
             Self::TooManyRedirects { .. } => 47,
             Self::HttpStatus { .. } => 22,
+            Self::FileSizeExceeded => 63,
             Self::Io(_) => 23,
             Self::ReadError(_) => 26,
             Self::Timeout => 28,
