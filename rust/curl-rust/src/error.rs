@@ -18,6 +18,10 @@ pub enum CurlError {
     Transfer(String),
     #[error("weird server reply")]
     WeirdServerReply,
+    #[error("server returned nothing")]
+    GotNothing,
+    #[error("failure when receiving data from the peer")]
+    RecvError,
     #[error("FTP weird PASV reply")]
     FtpWeirdPasvReply,
     #[error("FTP could not set transfer type")]
@@ -71,6 +75,8 @@ impl CurlError {
             Self::Url(_) => 3,
             Self::Transfer(_) => 7,
             Self::WeirdServerReply => 8,
+            Self::GotNothing => 52,
+            Self::RecvError => 56,
             Self::RemoteAccessDenied => 9,
             Self::FtpWeirdPasvReply => 13,
             Self::FtpCouldntSetType => 17,

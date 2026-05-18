@@ -66,6 +66,12 @@ struct FtpRecord {
 }
 
 #[derive(Debug)]
+struct WsRecord {
+    request: RequestRecord,
+    frames: Vec<(u8, Vec<u8>)>,
+}
+
+#[derive(Debug)]
 struct FtpServerOptions {
     data: Vec<u8>,
     epsv_fails: bool,
@@ -664,6 +670,132 @@ fn mqtt_publish(topic: &[u8], payload: &[u8]) -> Vec<u8> {
 
 fn mqtt_disconnect() -> Vec<u8> {
     mqtt_packet(0xe0, &[])
+}
+
+fn ws_server_response() -> Vec<u8> {
+    b"HTTP/1.1 101 Switching Protocols\r\n\
+Server: curl-rust-test\r\n\
+Upgrade: websocket\r\n\
+Connection: Upgrade\r\n\
+Sec-WebSocket-Accept: HkPsVga7+8LuxM4RGQ5p9tZHeYs=\r\n\
+\r\n"
+        .to_vec()
+}
+
+fn ws_server_frame(opcode: u8, payload: &[u8]) -> Vec<u8> {
+    let mut frame = Vec::new();
+    frame.push(0x80 | opcode);
+    if payload.len() <= 125 {
+        frame.push(payload.len() as u8);
+    } else if payload.len() <= u16::MAX as usize {
+        frame.push(126);
+        frame.extend_from_slice(&(payload.len() as u16).to_be_bytes());
+    } else {
+        frame.push(127);
+        frame.extend_from_slice(&(payload.len() as u64).to_be_bytes());
+    }
+    frame.extend_from_slice(payload);
+    frame
+}
+
+fn spawn_ws_server(frames: Vec<Vec<u8>>) -> (String, Receiver<WsRecord>) {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = listener.local_addr().unwrap();
+    let (tx, rx) = mpsc::channel();
+
+    thread::spawn(move || {
+        let (mut stream, _) = listener.accept().unwrap();
+        let request = read_request(&mut stream);
+        stream.write_all(&ws_server_response()).unwrap();
+        for frame in frames {
+            stream.write_all(&frame).unwrap();
+        }
+        stream
+            .set_read_timeout(Some(Duration::from_millis(200)))
+            .unwrap();
+        let frames = read_ws_client_frames(&mut stream);
+        tx.send(WsRecord { request, frames }).unwrap();
+        let _ = stream.shutdown(Shutdown::Both);
+    });
+
+    (format!("ws://{addr}/chat?room=rust"), rx)
+}
+
+fn spawn_ws_upload_server() -> (String, Receiver<WsRecord>) {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = listener.local_addr().unwrap();
+    let (tx, rx) = mpsc::channel();
+
+    thread::spawn(move || {
+        let (mut stream, _) = listener.accept().unwrap();
+        let request = read_request(&mut stream);
+        stream.write_all(&ws_server_response()).unwrap();
+        stream
+            .set_read_timeout(Some(Duration::from_millis(200)))
+            .unwrap();
+        let frames = read_ws_client_frames(&mut stream);
+        stream.write_all(&ws_server_frame(0x8, &[])).unwrap();
+        tx.send(WsRecord { request, frames }).unwrap();
+        let _ = stream.shutdown(Shutdown::Both);
+    });
+
+    (format!("ws://{addr}/upload"), rx)
+}
+
+fn spawn_ws_raw_response(response: &'static [u8]) -> (String, Receiver<RequestRecord>) {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = listener.local_addr().unwrap();
+    let (tx, rx) = mpsc::channel();
+
+    thread::spawn(move || {
+        let (mut stream, _) = listener.accept().unwrap();
+        let request = read_request(&mut stream);
+        tx.send(request).unwrap();
+        stream.write_all(response).unwrap();
+    });
+
+    (format!("ws://{addr}/chat"), rx)
+}
+
+fn read_ws_client_frames(stream: &mut impl Read) -> Vec<(u8, Vec<u8>)> {
+    let mut frames = Vec::new();
+    while let Some(frame) = read_ws_client_frame(stream) {
+        frames.push(frame);
+    }
+    frames
+}
+
+fn read_ws_client_frame(stream: &mut impl Read) -> Option<(u8, Vec<u8>)> {
+    let mut head = [0; 2];
+    match stream.read_exact(&mut head) {
+        Ok(()) => {}
+        Err(error) if matches!(error.kind(), ErrorKind::WouldBlock | ErrorKind::TimedOut) => {
+            return None;
+        }
+        Err(error) if error.kind() == ErrorKind::UnexpectedEof => return None,
+        Err(error) => panic!("failed to read WebSocket frame header: {error}"),
+    }
+    let opcode = head[0] & 0x0f;
+    let masked = head[1] & 0x80 != 0;
+    assert!(masked, "client WebSocket frame must be masked");
+    let mut length = usize::from(head[1] & 0x7f);
+    if length == 126 {
+        let mut bytes = [0; 2];
+        stream.read_exact(&mut bytes).unwrap();
+        length = usize::from(u16::from_be_bytes(bytes));
+    } else if length == 127 {
+        let mut bytes = [0; 8];
+        stream.read_exact(&mut bytes).unwrap();
+        length = usize::try_from(u64::from_be_bytes(bytes)).unwrap();
+    }
+    let mut mask = [0; 4];
+    stream.read_exact(&mut mask).unwrap();
+    let mut payload = vec![0; length];
+    stream.read_exact(&mut payload).unwrap();
+    for (index, byte) in payload.iter_mut().enumerate() {
+        *byte ^= mask[index % 4];
+    }
+    Some((opcode, payload))
 }
 
 fn read_mqtt_frame(stream: &mut impl Read) -> (u8, Vec<u8>) {
@@ -3207,6 +3339,184 @@ fn version_lists_telnet_protocol() {
 
     assert!(output.status.success());
     assert!(String::from_utf8(output.stdout).unwrap().contains("TELNET"));
+}
+
+#[test]
+fn ws_handshake_sends_upgrade_request() {
+    let (url, rx) = spawn_ws_server(vec![ws_server_frame(0x8, &[])]);
+
+    let mut command = Command::cargo_bin("curl").unwrap();
+    command.args(["-q", "-sS", &url]);
+    command.assert().success().stdout("");
+
+    let record = rx.recv().unwrap();
+    assert_eq!(record.request.start_line, "GET /chat?room=rust HTTP/1.1");
+    assert!(header(&record.request, "host").is_some());
+    assert!(
+        header(&record.request, "user-agent")
+            .unwrap()
+            .starts_with("curl-rust/")
+    );
+    assert_eq!(header(&record.request, "accept"), Some("*/*"));
+    assert_eq!(header(&record.request, "upgrade"), Some("websocket"));
+    assert_eq!(header(&record.request, "sec-websocket-version"), Some("13"));
+    assert_eq!(
+        header(&record.request, "sec-websocket-key"),
+        Some("NDMyMTUzMjE2MzIxNzMyMQ==")
+    );
+    assert_eq!(header(&record.request, "connection"), Some("Upgrade"));
+}
+
+#[test]
+fn ws_non_101_response_returns_http_error() {
+    let (url, rx) = spawn_ws_raw_response(b"HTTP/1.1 200 OK\r\nContent-Length: 5\r\n\r\nhello");
+
+    let mut command = Command::cargo_bin("curl").unwrap();
+    command.args(["-q", "-sS", &url]);
+    command.assert().failure().code(22).stdout("");
+
+    assert_eq!(rx.recv().unwrap().start_line, "GET /chat HTTP/1.1");
+}
+
+#[test]
+fn ws_text_frame_outputs_payload() {
+    let (url, rx) = spawn_ws_server(vec![
+        ws_server_frame(0x1, b"hello websocket"),
+        ws_server_frame(0x8, &[]),
+    ]);
+
+    let mut command = Command::cargo_bin("curl").unwrap();
+    command.args(["-q", "-sS", &url]);
+    command.assert().success().stdout("hello websocket");
+
+    let _ = rx.recv().unwrap();
+}
+
+#[test]
+fn ws_binary_frame_preserves_raw_payload() {
+    let payload = b"\0bin\xffpayload".to_vec();
+    let (url, rx) = spawn_ws_server(vec![
+        ws_server_frame(0x2, &payload),
+        ws_server_frame(0x8, &[]),
+    ]);
+
+    let mut command = Command::cargo_bin("curl").unwrap();
+    let output = command.args(["-q", "-sS", &url]).output().unwrap();
+
+    assert!(output.status.success());
+    assert_eq!(output.stdout, payload);
+    let _ = rx.recv().unwrap();
+}
+
+#[test]
+fn ws_ping_is_auto_ponged_without_output() {
+    let (url, rx) = spawn_ws_server(vec![
+        ws_server_frame(0x9, b"ping"),
+        ws_server_frame(0x8, &[]),
+    ]);
+
+    let mut command = Command::cargo_bin("curl").unwrap();
+    command.args(["-q", "-sS", &url]);
+    command.assert().success().stdout("");
+
+    let record = rx.recv().unwrap();
+    assert!(
+        record
+            .frames
+            .iter()
+            .any(|(opcode, payload)| *opcode == 0xA && payload == b"ping")
+    );
+}
+
+#[test]
+fn ws_upload_file_sends_masked_binary_frame_after_get_upgrade() {
+    let temp = tempdir().unwrap();
+    let upload = temp.path().join("upload.bin");
+    std::fs::write(&upload, b"ws upload").unwrap();
+    let (url, rx) = spawn_ws_upload_server();
+
+    let mut command = Command::cargo_bin("curl").unwrap();
+    command.args(["-q", "-sS", "-T", upload.to_str().unwrap(), &url]);
+    command.assert().success().stdout("");
+
+    let record = rx.recv().unwrap();
+    assert_eq!(record.request.start_line, "GET /upload HTTP/1.1");
+    assert!(
+        record
+            .frames
+            .iter()
+            .any(|(opcode, payload)| *opcode == 0x2 && payload == b"ws upload")
+    );
+}
+
+#[test]
+fn ws_upload_stdin_sends_masked_binary_frame() {
+    let (url, rx) = spawn_ws_upload_server();
+
+    let mut command = Command::cargo_bin("curl").unwrap();
+    command.args(["-q", "-sS", "-T", "-", &url]);
+    command.write_stdin("stdin websocket");
+    command.assert().success().stdout("");
+
+    let record = rx.recv().unwrap();
+    assert!(
+        record
+            .frames
+            .iter()
+            .any(|(opcode, payload)| *opcode == 0x2 && payload == b"stdin websocket")
+    );
+}
+
+#[test]
+fn ws_invalid_opcode_returns_recv_error() {
+    let (url, rx) = spawn_ws_server(vec![vec![0x83, 0x00]]);
+
+    let mut command = Command::cargo_bin("curl").unwrap();
+    command.args(["-q", "-sS", &url]);
+    command.assert().failure().code(56).stdout("");
+
+    let _ = rx.recv().unwrap();
+}
+
+#[test]
+fn ws_include_dump_header_and_writeout_use_handshake_headers() {
+    let temp = tempdir().unwrap();
+    let dump = temp.path().join("ws.headers");
+    let (url, rx) = spawn_ws_server(vec![
+        ws_server_frame(0x1, b"payload"),
+        ws_server_frame(0x8, &[]),
+    ]);
+
+    let mut command = Command::cargo_bin("curl").unwrap();
+    command.args([
+        "-q",
+        "-sS",
+        "-i",
+        "-D",
+        dump.to_str().unwrap(),
+        "-w",
+        " %{response_code} %{size_download}",
+        &url,
+    ]);
+    let output = command.output().unwrap();
+
+    assert!(output.status.success());
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    assert!(stdout.starts_with("HTTP/1.1 101 Switching Protocols\r\n"));
+    assert!(stdout.contains("\r\n\r\npayload 101 7"));
+    let headers = std::fs::read_to_string(dump).unwrap();
+    assert!(headers.starts_with("HTTP/1.1 101 Switching Protocols\r\n"));
+    assert!(headers.contains("Sec-WebSocket-Accept: HkPsVga7+8LuxM4RGQ5p9tZHeYs=\r\n"));
+    let _ = rx.recv().unwrap();
+}
+
+#[test]
+fn version_lists_ws_protocol() {
+    let mut command = Command::cargo_bin("curl").unwrap();
+    let output = command.args(["-q", "-V"]).output().unwrap();
+
+    assert!(output.status.success());
+    assert!(String::from_utf8(output.stdout).unwrap().contains("WS"));
 }
 
 #[test]

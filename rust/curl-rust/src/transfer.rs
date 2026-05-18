@@ -34,7 +34,14 @@ const FTP_DEFAULT_PORT: u16 = 21;
 const IMAP_DEFAULT_PORT: u16 = 143;
 const MQTT_DEFAULT_PORT: u16 = 1883;
 const RTSP_DEFAULT_PORT: u16 = 554;
+const WS_DEFAULT_PORT: u16 = 80;
 const MQTT_CLIENT_ID: &[u8; 12] = b"curlrust0000";
+const WS_KEY: &str = "NDMyMTUzMjE2MzIxNzMyMQ==";
+const WS_ACCEPT: &str = "HkPsVga7+8LuxM4RGQ5p9tZHeYs=";
+const WS_BINARY: u8 = 0x2;
+const WS_CLOSE: u8 = 0x8;
+const WS_PING: u8 = 0x9;
+const WS_PONG: u8 = 0xA;
 const MQTT_CONNECT: u8 = 0x10;
 const MQTT_CONNACK: u8 = 0x20;
 const MQTT_PUBLISH: u8 = 0x30;
@@ -325,6 +332,12 @@ async fn run_expanded_url(
         ))
     } else if expanded.url.starts_with("rtsp://") {
         run_rtsp_transfer(transfer, &expanded, &mut metrics).await
+    } else if expanded.url.starts_with("ws://") {
+        run_ws_transfer(transfer, &expanded, &method_label, &mut metrics).await
+    } else if expanded.url.starts_with("wss://") {
+        Err(CurlError::Unsupported(
+            "wss:// URLs are not implemented in the Rust sidecar".to_string(),
+        ))
     } else {
         let mut method = effective_http_method(transfer)?;
         if method_label == Method::PUT.as_str() && transfer.method.is_none() {
@@ -2030,6 +2043,397 @@ async fn run_telnet_exchange(
         return Err(CurlError::FileSizeExceeded);
     }
     Ok(())
+}
+
+struct WsResponse {
+    status: u16,
+    headers: reqwest::header::HeaderMap,
+    header_bytes: Vec<u8>,
+}
+
+struct WsFrame {
+    fin: bool,
+    opcode: u8,
+    payload: Vec<u8>,
+}
+
+async fn run_ws_transfer(
+    transfer: &TransferConfig,
+    expanded: &glob::ExpandedUrl,
+    method: &str,
+    metrics: &mut writeout::Metrics,
+) -> Result<()> {
+    if method != "GET" && method != "HEAD" {
+        return Err(CurlError::Unsupported(format!(
+            "{method} requests for ws:// URLs"
+        )));
+    }
+    if !transfer.data.is_empty() || !transfer.forms.is_empty() {
+        return Err(CurlError::Unsupported(
+            "data/form request bodies for ws:// URLs".to_string(),
+        ));
+    }
+    if !transfer.url_query.is_empty() {
+        return Err(CurlError::Unsupported(
+            "--url-query for ws:// URLs".to_string(),
+        ));
+    }
+    if transfer.oauth2_bearer.is_some() {
+        return Err(CurlError::Unsupported(
+            "--oauth2-bearer for ws:// URLs".to_string(),
+        ));
+    }
+
+    if let Some(timeout) = transfer.max_time {
+        tokio::time::timeout(
+            timeout,
+            run_ws_exchange(transfer, expanded, method, metrics),
+        )
+        .await
+        .map_err(|_| CurlError::Timeout)?
+    } else {
+        run_ws_exchange(transfer, expanded, method, metrics).await
+    }
+}
+
+async fn run_ws_exchange(
+    transfer: &TransferConfig,
+    expanded: &glob::ExpandedUrl,
+    method: &str,
+    metrics: &mut writeout::Metrics,
+) -> Result<()> {
+    let url = Url::parse(&expanded.url).map_err(|error| CurlError::Url(error.to_string()))?;
+    output::validate_output_target(transfer, &url)?;
+    let host = url
+        .host_str()
+        .ok_or_else(|| CurlError::Url("WebSocket URL is missing a host".to_string()))?;
+    let port = url.port().unwrap_or(WS_DEFAULT_PORT);
+    let upload = ws_upload_body(transfer)?;
+
+    let mut stream = connect_tcp(host, port, transfer).await?;
+    let request = ws_handshake_request(transfer, &url)?;
+    stream.write_all(&request).await.map_err(tcp_io_error)?;
+
+    let response = ws_read_response(&mut stream).await?;
+    metrics.url_effective = url.to_string();
+    metrics.response_code = Some(response.status);
+    metrics.headers = response.headers.clone();
+
+    if let Some(path) = &transfer.dump_header {
+        output::dump_headers(path, &response.header_bytes, transfer.create_dirs)?;
+    }
+
+    if response.status != 101 {
+        return Err(CurlError::HttpStatus {
+            status: response.status,
+        });
+    }
+    ws_validate_accept(&response.headers)?;
+
+    if !upload.is_empty() {
+        stream
+            .write_all(&ws_masked_frame(WS_BINARY, &upload))
+            .await
+            .map_err(tcp_io_error)?;
+    }
+
+    let (body, saw_close) = if method == "HEAD" {
+        (Vec::new(), true)
+    } else {
+        ws_read_body(&mut stream).await?
+    };
+    if !saw_close && body.is_empty() {
+        return Err(CurlError::GotNothing);
+    }
+
+    let (body_bytes, max_filesize_exceeded) = if method == "HEAD" {
+        (&[][..], false)
+    } else {
+        limit_body_for_max_filesize(transfer, &body)
+    };
+    metrics.size_download = body_bytes.len() as u64;
+
+    let write_headers = transfer.include_headers || method == "HEAD";
+    let mut output_bytes = Vec::new();
+    if write_headers {
+        output_bytes.extend_from_slice(&response.header_bytes);
+    }
+    if method != "HEAD" {
+        output_bytes.extend_from_slice(body_bytes);
+    }
+
+    if write_headers || method != "HEAD" {
+        let filename = output::write_response(
+            transfer,
+            &url,
+            &response.headers,
+            &expanded.variables,
+            &output_bytes,
+            false,
+        )?;
+        metrics.filename_effective = filename.map(|path| path.display().to_string());
+    }
+    if max_filesize_exceeded {
+        return Err(CurlError::FileSizeExceeded);
+    }
+    Ok(())
+}
+
+fn ws_upload_body(transfer: &TransferConfig) -> Result<Vec<u8>> {
+    match transfer.upload_file.as_deref() {
+        Some(".") | None => Ok(Vec::new()),
+        Some(path) => data::read_upload_body(path),
+    }
+}
+
+fn ws_handshake_request(transfer: &TransferConfig, url: &Url) -> Result<Vec<u8>> {
+    let parsed_headers = parse_headers(&transfer.headers)?;
+    let has_header = |name: &str| {
+        parsed_headers
+            .iter()
+            .any(|(header_name, _)| header_name.as_str().eq_ignore_ascii_case(name))
+    };
+    let mut request = Vec::new();
+    request.extend_from_slice(format!("GET {} HTTP/1.1\r\n", ws_request_target(url)).as_bytes());
+
+    if !has_header("host") {
+        request.extend_from_slice(format!("Host: {}\r\n", ws_host_header(url)).as_bytes());
+    }
+    if !has_header("user-agent") {
+        request.extend_from_slice(
+            format!(
+                "User-Agent: {}\r\n",
+                transfer
+                    .user_agent
+                    .as_deref()
+                    .unwrap_or(concat!("curl-rust/", env!("CARGO_PKG_VERSION")))
+            )
+            .as_bytes(),
+        );
+    }
+    if !has_header("accept") {
+        request.extend_from_slice(b"Accept: */*\r\n");
+    }
+    request.extend_from_slice(b"Upgrade: websocket\r\n");
+    request.extend_from_slice(b"Sec-WebSocket-Version: 13\r\n");
+    request.extend_from_slice(format!("Sec-WebSocket-Key: {WS_KEY}\r\n").as_bytes());
+    request.extend_from_slice(b"Connection: Upgrade\r\n");
+    for (name, value) in parsed_headers {
+        request.extend_from_slice(name.as_str().as_bytes());
+        request.extend_from_slice(b": ");
+        request.extend_from_slice(value.as_bytes());
+        request.extend_from_slice(b"\r\n");
+    }
+    request.extend_from_slice(b"\r\n");
+    Ok(request)
+}
+
+fn ws_request_target(url: &Url) -> String {
+    let path = if url.path().is_empty() {
+        "/"
+    } else {
+        url.path()
+    };
+    if let Some(query) = url.query() {
+        format!("{path}?{query}")
+    } else {
+        path.to_string()
+    }
+}
+
+fn ws_host_header(url: &Url) -> String {
+    let host = url.host_str().unwrap_or("");
+    let host = if host.contains(':') && !host.starts_with('[') {
+        format!("[{host}]")
+    } else {
+        host.to_string()
+    };
+    match url.port() {
+        Some(port) => format!("{host}:{port}"),
+        None => host,
+    }
+}
+
+async fn ws_read_response(stream: &mut TcpStream) -> Result<WsResponse> {
+    let mut header_bytes = Vec::new();
+    let mut byte = [0_u8; 1];
+    loop {
+        let read = stream.read(&mut byte).await.map_err(tcp_io_error)?;
+        if read == 0 {
+            return Err(CurlError::GotNothing);
+        }
+        header_bytes.push(byte[0]);
+        if header_bytes.ends_with(b"\r\n\r\n") || header_bytes.ends_with(b"\n\n") {
+            break;
+        }
+        if header_bytes.len() > 64 * 1024 {
+            return Err(CurlError::WeirdServerReply);
+        }
+    }
+
+    let text = String::from_utf8_lossy(&header_bytes);
+    let mut lines = text.lines();
+    let status_line = lines.next().ok_or(CurlError::WeirdServerReply)?;
+    let status = status_line
+        .split_whitespace()
+        .nth(1)
+        .ok_or(CurlError::WeirdServerReply)?
+        .parse::<u16>()
+        .map_err(|_| CurlError::WeirdServerReply)?;
+    let mut headers = reqwest::header::HeaderMap::new();
+    for line in lines {
+        let line = line.trim_end_matches('\r');
+        if line.is_empty() {
+            break;
+        }
+        let Some((name, value)) = line.split_once(':') else {
+            return Err(CurlError::WeirdServerReply);
+        };
+        let name = HeaderName::from_bytes(name.trim().as_bytes())
+            .map_err(|_| CurlError::WeirdServerReply)?;
+        let value =
+            HeaderValue::from_str(value.trim_start()).map_err(|_| CurlError::WeirdServerReply)?;
+        headers.append(name, value);
+    }
+
+    Ok(WsResponse {
+        status,
+        headers,
+        header_bytes,
+    })
+}
+
+fn ws_validate_accept(headers: &reqwest::header::HeaderMap) -> Result<()> {
+    let accept = headers
+        .get("sec-websocket-accept")
+        .and_then(|value| value.to_str().ok())
+        .ok_or(CurlError::WeirdServerReply)?;
+    if accept.trim() == WS_ACCEPT {
+        Ok(())
+    } else {
+        Err(CurlError::WeirdServerReply)
+    }
+}
+
+async fn ws_read_body(stream: &mut TcpStream) -> Result<(Vec<u8>, bool)> {
+    let mut body = Vec::new();
+    let mut continuation = Vec::new();
+    let mut continuation_opcode = 0_u8;
+
+    loop {
+        let Some(frame) = ws_read_frame(stream).await? else {
+            return Ok((body, false));
+        };
+
+        match frame.opcode {
+            0x0 => {
+                if continuation_opcode == 0 {
+                    return Err(CurlError::RecvError);
+                }
+                continuation.extend_from_slice(&frame.payload);
+                if frame.fin {
+                    body.extend_from_slice(&continuation);
+                    continuation.clear();
+                    continuation_opcode = 0;
+                }
+            }
+            0x1 | WS_BINARY => {
+                if continuation_opcode != 0 {
+                    return Err(CurlError::RecvError);
+                }
+                if frame.fin {
+                    body.extend_from_slice(&frame.payload);
+                } else {
+                    continuation = frame.payload;
+                    continuation_opcode = frame.opcode;
+                }
+            }
+            WS_CLOSE => {
+                stream
+                    .write_all(&ws_masked_frame(WS_CLOSE, &frame.payload))
+                    .await
+                    .map_err(tcp_io_error)?;
+                return Ok((body, true));
+            }
+            WS_PING => {
+                stream
+                    .write_all(&ws_masked_frame(WS_PONG, &frame.payload))
+                    .await
+                    .map_err(tcp_io_error)?;
+            }
+            WS_PONG => {}
+            _ => return Err(CurlError::RecvError),
+        }
+    }
+}
+
+async fn ws_read_frame(stream: &mut TcpStream) -> Result<Option<WsFrame>> {
+    let mut head = [0_u8; 2];
+    match stream.read_exact(&mut head).await {
+        Ok(_) => {}
+        Err(error) if error.kind() == io::ErrorKind::UnexpectedEof => return Ok(None),
+        Err(error) => return Err(tcp_io_error(error)),
+    }
+
+    let fin = head[0] & 0x80 != 0;
+    let rsv = head[0] & 0x70;
+    let opcode = head[0] & 0x0f;
+    if rsv != 0 {
+        return Err(CurlError::RecvError);
+    }
+
+    let masked = head[1] & 0x80 != 0;
+    if masked {
+        return Err(CurlError::RecvError);
+    }
+    let mut length = u64::from(head[1] & 0x7f);
+    if length == 126 {
+        let mut bytes = [0_u8; 2];
+        stream.read_exact(&mut bytes).await.map_err(tcp_io_error)?;
+        length = u64::from(u16::from_be_bytes(bytes));
+    } else if length == 127 {
+        let mut bytes = [0_u8; 8];
+        stream.read_exact(&mut bytes).await.map_err(tcp_io_error)?;
+        length = u64::from_be_bytes(bytes);
+        if length > usize::MAX as u64 {
+            return Err(CurlError::RecvError);
+        }
+    }
+
+    if matches!(opcode, WS_CLOSE | WS_PING | WS_PONG) && (!fin || length > 125) {
+        return Err(CurlError::RecvError);
+    }
+    if matches!(opcode, 0x3..=0x7 | 0xB..=0xF) {
+        return Err(CurlError::RecvError);
+    }
+
+    let mut payload = vec![0_u8; length as usize];
+    stream
+        .read_exact(&mut payload)
+        .await
+        .map_err(tcp_io_error)?;
+    Ok(Some(WsFrame {
+        fin,
+        opcode,
+        payload,
+    }))
+}
+
+fn ws_masked_frame(opcode: u8, payload: &[u8]) -> Vec<u8> {
+    let mut frame = Vec::with_capacity(payload.len() + 14);
+    frame.push(0x80 | opcode);
+    if payload.len() <= 125 {
+        frame.push(0x80 | payload.len() as u8);
+    } else if payload.len() <= u16::MAX as usize {
+        frame.push(0x80 | 126);
+        frame.extend_from_slice(&(payload.len() as u16).to_be_bytes());
+    } else {
+        frame.push(0x80 | 127);
+        frame.extend_from_slice(&(payload.len() as u64).to_be_bytes());
+    }
+    frame.extend_from_slice(&[0, 0, 0, 0]);
+    frame.extend_from_slice(payload);
+    frame
 }
 
 async fn run_gopher_transfer(
