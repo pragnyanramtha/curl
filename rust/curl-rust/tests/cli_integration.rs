@@ -5930,6 +5930,32 @@ fn file_range_outputs_slice() {
 }
 
 #[test]
+fn file_missing_source_returns_file_read_error() {
+    let temp = tempdir().unwrap();
+    let url = Url::from_file_path(temp.path().join("missing.txt"))
+        .unwrap()
+        .to_string();
+
+    let mut command = Command::cargo_bin("curl").unwrap();
+    command.args(["-q", "-sS", &url]);
+    command.assert().failure().code(37).stdout("");
+}
+
+#[test]
+fn file_urls_accept_uppercase_scheme_and_single_slash() {
+    let temp = tempdir().unwrap();
+    let file = temp.path().join("plain.txt");
+    std::fs::write(&file, "hello").unwrap();
+    let url = Url::from_file_path(&file).unwrap().to_string();
+    let uppercase_url = url.replacen("file://", "FILE://", 1);
+    let single_slash_url = format!("file:{}", file.display());
+
+    let mut command = Command::cargo_bin("curl").unwrap();
+    command.args(["-q", "-sS", &uppercase_url, &single_slash_url]);
+    command.assert().success().stdout("hellohello");
+}
+
+#[test]
 fn continue_at_fixed_offset_sends_range_and_appends_output() {
     let (url, rx) = spawn_server(b"HTTP/1.1 206 Partial Content\r\nContent-Length: 3\r\n\r\nllo");
     let temp = tempdir().unwrap();

@@ -311,71 +311,71 @@ async fn run_expanded_url(
         metrics.method = method_label.clone();
     }
 
-    let result = if expanded.url.starts_with("file://") {
+    let result = if has_url_scheme(&expanded.url, "file") {
         run_file_transfer(transfer, &expanded, &method_label, &mut metrics).await
-    } else if expanded.url.starts_with("dict://") {
+    } else if has_url_scheme_with_authority(&expanded.url, "dict") {
         run_dict_transfer(transfer, &expanded, &method_label, &mut metrics).await
-    } else if expanded.url.starts_with("ftp://") {
+    } else if has_url_scheme_with_authority(&expanded.url, "ftp") {
         run_ftp_transfer(transfer, &expanded, &method_label, &mut metrics).await
-    } else if expanded.url.starts_with("ftps://") {
+    } else if has_url_scheme_with_authority(&expanded.url, "ftps") {
         Err(CurlError::Unsupported(
             "ftps:// URLs are not implemented in the Rust sidecar".to_string(),
         ))
-    } else if expanded.url.starts_with("gopher://") {
+    } else if has_url_scheme_with_authority(&expanded.url, "gopher") {
         run_gopher_transfer(transfer, &expanded, &method_label, &mut metrics).await
-    } else if expanded.url.starts_with("gophers://") {
+    } else if has_url_scheme_with_authority(&expanded.url, "gophers") {
         Err(CurlError::Unsupported(
             "gophers:// URLs are not implemented in the Rust sidecar".to_string(),
         ))
-    } else if expanded.url.starts_with("telnet://") {
+    } else if has_url_scheme_with_authority(&expanded.url, "telnet") {
         run_telnet_transfer(transfer, &expanded, &method_label, &mut metrics).await
-    } else if expanded.url.starts_with("pop3://") {
+    } else if has_url_scheme_with_authority(&expanded.url, "pop3") {
         run_pop3_transfer(transfer, &expanded, &method_label, &mut metrics).await
-    } else if expanded.url.starts_with("pop3s://") {
+    } else if has_url_scheme_with_authority(&expanded.url, "pop3s") {
         Err(CurlError::Unsupported(
             "pop3s:// URLs are not implemented in the Rust sidecar".to_string(),
         ))
-    } else if expanded.url.starts_with("imap://") {
+    } else if has_url_scheme_with_authority(&expanded.url, "imap") {
         run_imap_transfer(transfer, &expanded, &method_label, &mut metrics).await
-    } else if expanded.url.starts_with("imaps://") {
+    } else if has_url_scheme_with_authority(&expanded.url, "imaps") {
         Err(CurlError::Unsupported(
             "imaps:// URLs are not implemented in the Rust sidecar".to_string(),
         ))
-    } else if expanded.url.starts_with("ldap://") {
+    } else if has_url_scheme_with_authority(&expanded.url, "ldap") {
         run_ldap_transfer(transfer, &expanded, &method_label, &mut metrics).await
-    } else if expanded.url.starts_with("ldaps://") {
+    } else if has_url_scheme_with_authority(&expanded.url, "ldaps") {
         Err(CurlError::Unsupported(
             "ldaps:// URLs are not implemented in the Rust sidecar".to_string(),
         ))
-    } else if expanded.url.starts_with("smb://") {
+    } else if has_url_scheme_with_authority(&expanded.url, "smb") {
         run_smb_transfer(transfer, &expanded, &method_label, &mut metrics).await
-    } else if expanded.url.starts_with("smbs://") {
+    } else if has_url_scheme_with_authority(&expanded.url, "smbs") {
         Err(CurlError::Unsupported(
             "smbs:// URLs are not implemented in the Rust sidecar".to_string(),
         ))
-    } else if expanded.url.starts_with("scp://") {
+    } else if has_url_scheme_with_authority(&expanded.url, "scp") {
         run_scp_transfer(transfer, &expanded, &method_label, &mut metrics).await
-    } else if expanded.url.starts_with("sftp://") {
+    } else if has_url_scheme_with_authority(&expanded.url, "sftp") {
         run_sftp_transfer(transfer, &expanded, &method_label, &mut metrics).await
-    } else if expanded.url.starts_with("smtp://") {
+    } else if has_url_scheme_with_authority(&expanded.url, "smtp") {
         run_smtp_transfer(transfer, &expanded, &method_label, &mut metrics).await
-    } else if expanded.url.starts_with("smtps://") {
+    } else if has_url_scheme_with_authority(&expanded.url, "smtps") {
         Err(CurlError::Unsupported(
             "smtps:// URLs are not implemented in the Rust sidecar".to_string(),
         ))
-    } else if expanded.url.starts_with("tftp://") {
+    } else if has_url_scheme_with_authority(&expanded.url, "tftp") {
         run_tftp_transfer(transfer, &expanded, &method_label, &mut metrics).await
-    } else if expanded.url.starts_with("mqtt://") {
+    } else if has_url_scheme_with_authority(&expanded.url, "mqtt") {
         run_mqtt_transfer(transfer, &expanded, &method_label, &mut metrics).await
-    } else if expanded.url.starts_with("mqtts://") {
+    } else if has_url_scheme_with_authority(&expanded.url, "mqtts") {
         Err(CurlError::Unsupported(
             "mqtts:// URLs are not implemented in the Rust sidecar".to_string(),
         ))
-    } else if expanded.url.starts_with("rtsp://") {
+    } else if has_url_scheme_with_authority(&expanded.url, "rtsp") {
         run_rtsp_transfer(transfer, &expanded, &mut metrics).await
-    } else if expanded.url.starts_with("ws://") {
+    } else if has_url_scheme_with_authority(&expanded.url, "ws") {
         run_ws_transfer(transfer, &expanded, &method_label, &mut metrics).await
-    } else if expanded.url.starts_with("wss://") {
+    } else if has_url_scheme_with_authority(&expanded.url, "wss") {
         Err(CurlError::Unsupported(
             "wss:// URLs are not implemented in the Rust sidecar".to_string(),
         ))
@@ -428,7 +428,8 @@ async fn run_file_transfer(
     let path = url
         .to_file_path()
         .map_err(|_| CurlError::Url("file URL cannot be converted to a local path".to_string()))?;
-    let metadata_size = std::fs::metadata(&path)?.len();
+    let metadata = std::fs::metadata(&path).map_err(file_read_error)?;
+    let metadata_size = metadata.len();
     let output_url =
         Url::parse(&expanded.url).map_err(|error| CurlError::Url(error.to_string()))?;
     output::validate_output_target(transfer, &output_url)?;
@@ -442,7 +443,7 @@ async fn run_file_transfer(
     let body = if method == "HEAD" {
         Vec::new()
     } else {
-        std::fs::read(path)?
+        std::fs::read(path).map_err(file_read_error)?
     };
     let body = if method == "HEAD" {
         body
@@ -494,6 +495,10 @@ async fn run_file_transfer(
         return Err(CurlError::FileSizeExceeded);
     }
     Ok(())
+}
+
+fn file_read_error(error: io::Error) -> CurlError {
+    CurlError::FileCouldntReadFile(error.to_string())
 }
 
 async fn run_dict_transfer(
@@ -6419,7 +6424,30 @@ fn effective_http_method(transfer: &TransferConfig) -> Result<Method> {
 }
 
 fn is_http_url(url: &str) -> bool {
-    url.starts_with("http://") || url.starts_with("https://")
+    has_url_scheme_with_authority(url, "http") || has_url_scheme_with_authority(url, "https")
+}
+
+fn has_url_scheme(url: &str, expected: &str) -> bool {
+    let Some((scheme, _)) = url.split_once(':') else {
+        return false;
+    };
+    is_valid_url_scheme(scheme) && scheme.eq_ignore_ascii_case(expected)
+}
+
+fn has_url_scheme_with_authority(url: &str, expected: &str) -> bool {
+    let Some((scheme, rest)) = url.split_once(':') else {
+        return false;
+    };
+    is_valid_url_scheme(scheme) && scheme.eq_ignore_ascii_case(expected) && rest.starts_with("//")
+}
+
+fn is_valid_url_scheme(scheme: &str) -> bool {
+    let mut bytes = scheme.bytes();
+    let Some(first) = bytes.next() else {
+        return false;
+    };
+    first.is_ascii_alphabetic()
+        && bytes.all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'+' | b'-' | b'.'))
 }
 
 fn apply_version(

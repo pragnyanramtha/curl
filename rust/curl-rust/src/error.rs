@@ -36,6 +36,8 @@ pub enum CurlError {
     QuoteError,
     #[error("IPFS automatic gateway detection failed")]
     IpfsGatewayDetection,
+    #[error("Couldn't read a file:// file: {0}")]
+    FileCouldntReadFile(String),
     #[error("{0}")]
     BadFunctionArgument(String),
     #[error("Maximum ({max}) redirects followed")]
@@ -111,7 +113,7 @@ impl CurlError {
             Self::Io(_) => 23,
             Self::ReadError(_) => 26,
             Self::Timeout => 28,
-            Self::IpfsGatewayDetection => 37,
+            Self::IpfsGatewayDetection | Self::FileCouldntReadFile(_) => 37,
             Self::BadFunctionArgument(_) => 43,
         }
     }
