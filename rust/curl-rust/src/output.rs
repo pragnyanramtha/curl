@@ -57,6 +57,9 @@ pub fn write_response(
     let path = output_path(transfer, url, headers, variables)?;
     match path {
         Some(path) => {
+            let is_header_filename_output = transfer.remote_name
+                && transfer.remote_header_name
+                && remote_header_filename(headers).is_some();
             if transfer.create_dirs
                 && let Some(parent) = path
                     .parent()
@@ -68,6 +71,12 @@ pub fn write_response(
                 OpenOptions::new()
                     .create(true)
                     .append(true)
+                    .open(&path)?
+                    .write_all(bytes)?;
+            } else if is_header_filename_output {
+                OpenOptions::new()
+                    .write(true)
+                    .create_new(true)
                     .open(&path)?
                     .write_all(bytes)?;
             } else {

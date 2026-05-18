@@ -63,7 +63,7 @@ companion data before this rewrite can be called complete.
 | `--tftp-blksize`, `--tftp-no-options` | partial | `TransferConfig::tftp_blksize`, `TransferConfig::tftp_no_options` | `parses_tftp_options`, `rejects_bad_tftp_blksize_values`, TFTP integration tests, `libcurl_writes_tftp_options` | Basic TFTP RRQ/WRQ option emission and libcurl output only; exact C timeout option derivation, retry negotiation, malformed OACK handling, and full corpus mapping remain incomplete |
 | `--telnet-option` | partial | `TransferConfig::telnet_options` | `telnet_options_fail_explicitly_until_negotiation_options_are_supported`, `parses_upload_file_and_telnet_options` | Parsed and rejected explicitly for TELNET until TTYPE/XDISPLOC/NEW_ENV/NAWS negotiation support is implemented |
 | `--ipfs-gateway` | partial | `TransferConfig::ipfs_gateway` | `parses_ipfs_gateway`, `rejects_empty_ipfs_gateway`, IPFS/IPNS rewrite tests | Explicit gateway parsing and IPFS/IPNS HTTP rewrite support only; generated libcurl rewrites URL through the same helper, but full corpus mapping and exact C URL parser edge cases remain incomplete |
-| `--output`, `--remote-name`, `--remote-header-name` | partial | output module | output and `-OJ` tests | Needs full Content-Disposition parity |
+| `--output`, `--remote-name`, `--remote-header-name` | partial | output module | output and `-OJ` tests, `remote_header_name_with_remote_name_refuses_to_overwrite_header_filename`, curl corpus 1460 | Header-derived remote filenames refuse to overwrite existing files; needs full Content-Disposition parity |
 | `--dump-header` | partial | `TransferConfig::dump_header` | `dump_header_dash_writes_headers_to_stdout`, `ftp_dump_header_writes_control_replies_and_include_adds_no_bytes` | HTTP/file header dumping plus FTP control-reply dumping are covered; redirect header history and exact FTP `-D -` interleaving remain incomplete |
 | `--write-out` | partial | `writeout.rs` | `renders_common_variables` | Many variables missing |
 | `--referer` | partial | `TransferConfig::referer`, `TransferConfig::auto_referer` | `sends_referer_range_and_url_query`, `location_does_not_auto_referer_without_referer_auto`, `fixed_referer_is_reused_across_redirects_without_auto`, `auto_referer_strips_credentials_and_fragment_on_redirect`, `auto_referer_tracks_immediately_previous_redirect_url`, `auto_referer_respects_max_redirs_limit`, `initial_referer_auto_replaces_referer_after_redirect`, `custom_referer_header_suppresses_generated_referer` | Basic header, `;auto` redirect behavior, `%{referer}`, max-redirs exhaustion for the auto path, and libcurl `CURLOPT_AUTOREFERER` covered; method rewriting, auth/cookie redirect scoping, and full corpus mapping remain incomplete |
@@ -100,13 +100,14 @@ companion data before this rewrite can be called complete.
 | CMake sidecar build | partial | `BUILD_RUST_CURL_EXE=ON`, `curl-rust-test`, `curl-rust-corpus-test` |
 | Autotools sidecar build | partial | `--enable-rust-curl`, `make -C rust rust-test`, `make -C rust rust-corpus-test` |
 | Existing curl Perl suite with C binary | verified for C path | Does not prove Rust parity |
-| Existing curl Perl suite with Rust binary | partial | `curl-rust-corpus-test` maps 44 smoke cases across FILE, FTP, DICT, GOPHER, IMAP, MQTT, POP3, SMTP, TFTP, TELNET, and URL/HTTP preflight/error cases; broader protocol corpus remains required before full parity |
+| Existing curl Perl suite with Rust binary | partial | `curl-rust-corpus-test` maps 45 smoke cases across FILE, FTP, DICT, GOPHER, HTTP, IMAP, MQTT, POP3, SMTP, TFTP, TELNET, and URL/HTTP preflight/error cases; broader protocol corpus remains required before full parity |
 | Pytest HTTP suite with Rust binary | missing | Required before full parity |
 
 Current `curl-rust-corpus-test` selection:
 
 - FILE: 200, 231, 1016, 1017, 1018, 1019, 1020, 1220, 2072
 - FTP: 100, 102, 104, 1219, 1224
+- HTTP: 1460
 - IMAP: 806, 807
 - DICT: 1450
 - GOPHER: 1200, 1201, 1202

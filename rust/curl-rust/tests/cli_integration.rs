@@ -6236,6 +6236,35 @@ fn remote_header_name_with_remote_name_writes_header_filename() {
 }
 
 #[test]
+fn remote_header_name_with_remote_name_refuses_to_overwrite_header_filename() {
+    let (url, rx) = spawn_server(
+        b"HTTP/1.1 200 OK\r\nContent-Disposition: filename=name1460; charset=funny\r\nContent-Length: 4\r\n\r\nhej\n",
+    );
+    let temp = tempdir().unwrap();
+    let output = temp.path().join("name1460");
+    std::fs::write(&output, "initial content\n").unwrap();
+
+    let mut command = Command::cargo_bin("curl").unwrap();
+    command.args([
+        "-q",
+        "-sS",
+        "-J",
+        "-i",
+        "-O",
+        "--output-dir",
+        temp.path().to_str().unwrap(),
+        &url,
+    ]);
+    command.assert().failure().code(23).stdout("");
+
+    rx.recv().unwrap();
+    assert_eq!(
+        std::fs::read_to_string(output).unwrap(),
+        "initial content\n"
+    );
+}
+
+#[test]
 fn writes_file_urls_with_globbed_output_markers() {
     let temp = tempdir().unwrap();
     std::fs::write(temp.path().join("file01.txt"), "one").unwrap();
