@@ -34,9 +34,28 @@ const FTP_DEFAULT_PORT: u16 = 21;
 const IMAP_DEFAULT_PORT: u16 = 143;
 const MQTT_DEFAULT_PORT: u16 = 1883;
 const RTSP_DEFAULT_PORT: u16 = 554;
+const SMB_DEFAULT_PORT: u16 = 445;
 const WS_DEFAULT_PORT: u16 = 80;
 const LDAP_DEFAULT_PORT: u16 = 389;
 const MQTT_CLIENT_ID: &[u8; 12] = b"curlrust0000";
+const SMB_COM_CLOSE: u8 = 0x04;
+const SMB_COM_READ_ANDX: u8 = 0x2e;
+const SMB_COM_TREE_DISCONNECT: u8 = 0x71;
+const SMB_COM_NEGOTIATE: u8 = 0x72;
+const SMB_COM_SETUP_ANDX: u8 = 0x73;
+const SMB_COM_TREE_CONNECT_ANDX: u8 = 0x75;
+const SMB_COM_NT_CREATE_ANDX: u8 = 0xa2;
+const SMB_COM_NO_ANDX_COMMAND: u8 = 0xff;
+const SMB_ERR_NOACCESS: u32 = 0x0005_0001;
+const SMB_FILE_OPEN: u32 = 0x01;
+const SMB_FILE_SHARE_ALL: u32 = 0x07;
+const SMB_GENERIC_READ: u32 = 0x8000_0000;
+const SMB_CAP_LARGE_FILES: u32 = 0x08;
+const SMB_MAX_PAYLOAD_SIZE: usize = 0x8000;
+const SMB_MAX_MESSAGE_SIZE: usize = SMB_MAX_PAYLOAD_SIZE + 0x1000;
+const SMB_HEADER_START: usize = 4;
+const SMB_HEADER_LEN: usize = 32;
+const SMB_FULL_HEADER_LEN: usize = SMB_HEADER_START + SMB_HEADER_LEN;
 const WS_KEY: &str = "NDMyMTUzMjE2MzIxNzMyMQ==";
 const WS_ACCEPT: &str = "HkPsVga7+8LuxM4RGQ5p9tZHeYs=";
 const WS_BINARY: u8 = 0x2;
@@ -322,6 +341,12 @@ async fn run_expanded_url(
     } else if expanded.url.starts_with("ldaps://") {
         Err(CurlError::Unsupported(
             "ldaps:// URLs are not implemented in the Rust sidecar".to_string(),
+        ))
+    } else if expanded.url.starts_with("smb://") {
+        run_smb_transfer(transfer, &expanded, &method_label, &mut metrics).await
+    } else if expanded.url.starts_with("smbs://") {
+        Err(CurlError::Unsupported(
+            "smbs:// URLs are not implemented in the Rust sidecar".to_string(),
         ))
     } else if expanded.url.starts_with("smtp://") {
         run_smtp_transfer(transfer, &expanded, &method_label, &mut metrics).await
@@ -2441,6 +2466,581 @@ fn ws_masked_frame(opcode: u8, payload: &[u8]) -> Vec<u8> {
     frame.extend_from_slice(&[0, 0, 0, 0]);
     frame.extend_from_slice(payload);
     frame
+}
+
+async fn run_smb_transfer(
+    transfer: &TransferConfig,
+    expanded: &glob::ExpandedUrl,
+    method: &str,
+    metrics: &mut writeout::Metrics,
+) -> Result<()> {
+    if transfer.method.is_some() {
+        return Err(CurlError::Unsupported(
+            "custom SMB requests in the Rust sidecar".to_string(),
+        ));
+    }
+    if method != "GET" && method != "HEAD" {
+        return Err(CurlError::Unsupported(format!(
+            "{method} requests for smb:// URLs"
+        )));
+    }
+    if !transfer.data.is_empty() || !transfer.url_query.is_empty() || !transfer.forms.is_empty() {
+        return Err(CurlError::Unsupported(
+            "data/form/query request bodies for smb:// URLs".to_string(),
+        ));
+    }
+    reject_upload_file_for_scheme(transfer, "smb://")?;
+    if transfer.oauth2_bearer.is_some() {
+        return Err(CurlError::Unsupported(
+            "--oauth2-bearer for smb:// URLs".to_string(),
+        ));
+    }
+    if transfer.range.is_some() || transfer.continue_at.is_some() {
+        return Err(CurlError::Unsupported(
+            "SMB range/resume in the Rust sidecar".to_string(),
+        ));
+    }
+    if transfer.list_only {
+        return Err(CurlError::Unsupported(
+            "SMB directory listing in the Rust sidecar".to_string(),
+        ));
+    }
+
+    if let Some(timeout) = transfer.max_time {
+        tokio::time::timeout(
+            timeout,
+            run_smb_exchange(transfer, expanded, method, metrics),
+        )
+        .await
+        .map_err(|_| CurlError::Timeout)?
+    } else {
+        run_smb_exchange(transfer, expanded, method, metrics).await
+    }
+}
+
+async fn run_smb_exchange(
+    transfer: &TransferConfig,
+    expanded: &glob::ExpandedUrl,
+    method: &str,
+    metrics: &mut writeout::Metrics,
+) -> Result<()> {
+    let url = Url::parse(&expanded.url).map_err(|error| CurlError::Url(error.to_string()))?;
+    output::validate_output_target(transfer, &url)?;
+    let host = url
+        .host_str()
+        .ok_or_else(|| CurlError::Url("SMB URL is missing a host".to_string()))?;
+    let port = url.port().unwrap_or(SMB_DEFAULT_PORT);
+    let path = smb_url_path(&url)?;
+    let credentials = smb_credentials(transfer, &url, host)?;
+    let mut stream = connect_tcp(host, port, transfer).await?;
+    let mut state = SmbConnection::default();
+
+    smb_send_command(
+        &mut stream,
+        &mut state,
+        SMB_COM_NEGOTIATE,
+        &smb_negotiate_body(),
+    )
+    .await?;
+    let packet = smb_read_packet(&mut stream).await?;
+    let response = smb_response(&packet, SMB_COM_NEGOTIATE)?;
+    if response.status != 0 {
+        return Err(CurlError::Transfer("SMB negotiate failed".to_string()));
+    }
+
+    smb_send_command(
+        &mut stream,
+        &mut state,
+        SMB_COM_SETUP_ANDX,
+        &smb_setup_body(&credentials)?,
+    )
+    .await?;
+    let packet = smb_read_packet(&mut stream).await?;
+    let response = smb_response(&packet, SMB_COM_SETUP_ANDX)?;
+    if response.status != 0 {
+        return Err(CurlError::LoginDenied);
+    }
+    state.uid = response.uid;
+
+    smb_send_command(
+        &mut stream,
+        &mut state,
+        SMB_COM_TREE_CONNECT_ANDX,
+        &smb_tree_connect_body(host, &path)?,
+    )
+    .await?;
+    let packet = smb_read_packet(&mut stream).await?;
+    let response = smb_response(&packet, SMB_COM_TREE_CONNECT_ANDX)?;
+    if response.status != 0 {
+        return Err(smb_file_error(response.status));
+    }
+    state.tid = response.tid;
+
+    smb_send_command(
+        &mut stream,
+        &mut state,
+        SMB_COM_NT_CREATE_ANDX,
+        &smb_open_body(&path)?,
+    )
+    .await?;
+    let packet = smb_read_packet(&mut stream).await?;
+    let response = smb_response(&packet, SMB_COM_NT_CREATE_ANDX)?;
+    if response.status != 0 {
+        let error = smb_file_error(response.status);
+        let _ = smb_tree_disconnect(&mut stream, &mut state).await;
+        return Err(error);
+    }
+    let fid = smb_read_u16_at(response.body, 6)?;
+    let eof = smb_read_u64_at(response.body, 56)?;
+
+    let mut body = Vec::new();
+    let transfer_result = if method == "HEAD" || transfer.head {
+        Ok(())
+    } else {
+        smb_download_body(&mut stream, &mut state, fid, eof, &mut body).await
+    };
+
+    let _ = smb_close(&mut stream, &mut state, fid).await;
+    let _ = smb_tree_disconnect(&mut stream, &mut state).await;
+
+    if let Some(path) = &transfer.dump_header {
+        output::dump_headers(path, &[], transfer.create_dirs)?;
+    }
+
+    transfer_result?;
+
+    metrics.url_effective = url.to_string();
+    let (body_bytes, max_filesize_exceeded) = if method == "HEAD" || transfer.head {
+        (&[][..], false)
+    } else {
+        limit_body_for_max_filesize(transfer, &body)
+    };
+    metrics.size_download = body_bytes.len() as u64;
+    let filename = output::write_response(
+        transfer,
+        &url,
+        &reqwest::header::HeaderMap::new(),
+        &expanded.variables,
+        body_bytes,
+        false,
+    )?;
+    metrics.filename_effective = filename.map(|path| path.display().to_string());
+    if max_filesize_exceeded {
+        return Err(CurlError::FileSizeExceeded);
+    }
+    Ok(())
+}
+
+struct SmbPath {
+    share: Vec<u8>,
+    file: Vec<u8>,
+}
+
+struct SmbCredentials {
+    user: Vec<u8>,
+    domain: Vec<u8>,
+}
+
+#[derive(Default)]
+struct SmbConnection {
+    uid: u16,
+    tid: u16,
+    mid: u16,
+}
+
+struct SmbResponse<'a> {
+    status: u32,
+    tid: u16,
+    uid: u16,
+    body: &'a [u8],
+}
+
+impl SmbConnection {
+    fn next_mid(&mut self) -> u16 {
+        let mid = self.mid;
+        self.mid = self.mid.wrapping_add(1);
+        mid
+    }
+}
+
+fn smb_url_path(url: &Url) -> Result<SmbPath> {
+    let decoded = percent_decode(url.path().as_bytes()).collect::<Vec<_>>();
+    if has_control_byte(&decoded) {
+        return Err(CurlError::Url(
+            "SMB path contains a decoded control byte".to_string(),
+        ));
+    }
+
+    let start = decoded
+        .iter()
+        .position(|byte| *byte != b'/' && *byte != b'\\')
+        .unwrap_or(decoded.len());
+    let path = &decoded[start..];
+    let separator = path
+        .iter()
+        .position(|byte| *byte == b'/' || *byte == b'\\')
+        .ok_or_else(|| CurlError::Url("SMB URL is missing a share path".to_string()))?;
+    if separator == 0 || separator + 1 >= path.len() {
+        return Err(CurlError::Url(
+            "SMB URL is missing a share path".to_string(),
+        ));
+    }
+
+    let share = path[..separator].to_vec();
+    let mut file = path[separator + 1..].to_vec();
+    for byte in &mut file {
+        if *byte == b'/' {
+            *byte = b'\\';
+        }
+    }
+    Ok(SmbPath { share, file })
+}
+
+fn smb_credentials(transfer: &TransferConfig, url: &Url, host: &str) -> Result<SmbCredentials> {
+    let (login, password) = if let Some(user) = &transfer.user {
+        let (login, password) = split_user_password(user);
+        (login.as_bytes().to_vec(), password.as_bytes().to_vec())
+    } else {
+        let login = percent_decode(url.username().as_bytes()).collect::<Vec<_>>();
+        let password = url
+            .password()
+            .map(|password| percent_decode(password.as_bytes()).collect::<Vec<_>>())
+            .unwrap_or_default();
+        (login, password)
+    };
+
+    if login.is_empty() {
+        return Err(CurlError::LoginDenied);
+    }
+    if has_control_byte(&login) || has_control_byte(&password) {
+        return Err(CurlError::Url(
+            "SMB credentials contain a decoded control byte".to_string(),
+        ));
+    }
+
+    let separator = login
+        .iter()
+        .position(|byte| *byte == b'/' || *byte == b'\\');
+    let (domain, user) = if let Some(separator) = separator {
+        if separator == 0 || separator + 1 >= login.len() {
+            return Err(CurlError::LoginDenied);
+        }
+        (login[..separator].to_vec(), login[separator + 1..].to_vec())
+    } else {
+        (host.as_bytes().to_vec(), login)
+    };
+
+    Ok(SmbCredentials { user, domain })
+}
+
+async fn smb_download_body(
+    stream: &mut TcpStream,
+    state: &mut SmbConnection,
+    fid: u16,
+    eof: u64,
+    body: &mut Vec<u8>,
+) -> Result<()> {
+    let mut offset = 0_u64;
+    while offset < eof {
+        let remaining = eof.saturating_sub(offset);
+        let max_bytes = remaining.min(SMB_MAX_PAYLOAD_SIZE as u64) as u16;
+        smb_send_command(
+            stream,
+            state,
+            SMB_COM_READ_ANDX,
+            &smb_read_body(fid, offset, max_bytes),
+        )
+        .await?;
+        let packet = smb_read_packet(stream).await?;
+        let response = smb_response(&packet, SMB_COM_READ_ANDX)?;
+        if response.status != 0 {
+            return Err(CurlError::RecvError);
+        }
+        let chunk = smb_read_response_data(&packet, response.body)?;
+        if chunk.is_empty() {
+            break;
+        }
+        body.extend_from_slice(chunk);
+        offset = offset.saturating_add(chunk.len() as u64);
+        if chunk.len() < SMB_MAX_PAYLOAD_SIZE {
+            break;
+        }
+    }
+    Ok(())
+}
+
+async fn smb_close(stream: &mut TcpStream, state: &mut SmbConnection, fid: u16) -> Result<()> {
+    smb_send_command(stream, state, SMB_COM_CLOSE, &smb_close_body(fid)).await?;
+    let packet = smb_read_packet(stream).await?;
+    let _ = smb_response(&packet, SMB_COM_CLOSE)?;
+    Ok(())
+}
+
+async fn smb_tree_disconnect(stream: &mut TcpStream, state: &mut SmbConnection) -> Result<()> {
+    smb_send_command(
+        stream,
+        state,
+        SMB_COM_TREE_DISCONNECT,
+        &smb_tree_disconnect_body(),
+    )
+    .await?;
+    let packet = smb_read_packet(stream).await?;
+    let _ = smb_response(&packet, SMB_COM_TREE_DISCONNECT)?;
+    Ok(())
+}
+
+async fn smb_send_command(
+    stream: &mut TcpStream,
+    state: &mut SmbConnection,
+    command: u8,
+    body: &[u8],
+) -> Result<()> {
+    let packet = smb_message(command, state.tid, state.uid, state.next_mid(), body)?;
+    stream
+        .write_all(&packet)
+        .await
+        .map_err(|_| CurlError::SendError)
+}
+
+fn smb_message(command: u8, tid: u16, uid: u16, mid: u16, body: &[u8]) -> Result<Vec<u8>> {
+    let length = SMB_HEADER_LEN
+        .checked_add(body.len())
+        .filter(|length| *length <= u16::MAX as usize)
+        .ok_or(CurlError::SendError)?;
+    let mut packet = Vec::with_capacity(SMB_HEADER_START + length);
+    packet.push(0);
+    packet.push(0);
+    packet.push((length >> 8) as u8);
+    packet.push(length as u8);
+    packet.extend_from_slice(b"\xffSMB");
+    packet.push(command);
+    push_le_u32(&mut packet, 0);
+    packet.push(0x18);
+    push_le_u16(&mut packet, 0x0041);
+    push_le_u16(&mut packet, 0);
+    packet.extend_from_slice(&[0; 8]);
+    push_le_u16(&mut packet, 0);
+    push_le_u16(&mut packet, tid);
+    push_le_u16(&mut packet, 0x4242);
+    push_le_u16(&mut packet, uid);
+    push_le_u16(&mut packet, mid);
+    packet.extend_from_slice(body);
+    Ok(packet)
+}
+
+fn smb_negotiate_body() -> Vec<u8> {
+    let mut body = Vec::new();
+    body.push(0);
+    push_le_u16(&mut body, 12);
+    body.push(0x02);
+    body.extend_from_slice(b"NT LM 0.12");
+    body.push(0);
+    body
+}
+
+fn smb_setup_body(credentials: &SmbCredentials) -> Result<Vec<u8>> {
+    let mut bytes = Vec::new();
+    bytes.extend_from_slice(&credentials.user);
+    bytes.push(0);
+    bytes.extend_from_slice(&credentials.domain);
+    bytes.push(0);
+    bytes.extend_from_slice(b"Unix\0curl\0");
+
+    let byte_count = u16::try_from(bytes.len()).map_err(|_| CurlError::FileSizeExceeded)?;
+    let mut body = Vec::new();
+    body.push(0x0d);
+    body.extend_from_slice(&[SMB_COM_NO_ANDX_COMMAND, 0]);
+    push_le_u16(&mut body, 0);
+    push_le_u16(&mut body, 0x9000);
+    push_le_u16(&mut body, 1);
+    push_le_u16(&mut body, 1);
+    push_le_u32(&mut body, 0);
+    push_le_u16(&mut body, 0);
+    push_le_u16(&mut body, 0);
+    push_le_u32(&mut body, 0);
+    push_le_u32(&mut body, SMB_CAP_LARGE_FILES);
+    push_le_u16(&mut body, byte_count);
+    body.extend_from_slice(&bytes);
+    Ok(body)
+}
+
+fn smb_tree_connect_body(host: &str, path: &SmbPath) -> Result<Vec<u8>> {
+    let mut bytes = Vec::new();
+    bytes.extend_from_slice(b"\\\\");
+    bytes.extend_from_slice(host.as_bytes());
+    bytes.push(b'\\');
+    bytes.extend_from_slice(&path.share);
+    bytes.push(0);
+    bytes.extend_from_slice(b"?????\0");
+
+    let byte_count = u16::try_from(bytes.len()).map_err(|_| CurlError::FileSizeExceeded)?;
+    let mut body = Vec::new();
+    body.push(0x04);
+    body.extend_from_slice(&[SMB_COM_NO_ANDX_COMMAND, 0]);
+    push_le_u16(&mut body, 0);
+    push_le_u16(&mut body, 0);
+    push_le_u16(&mut body, 0);
+    push_le_u16(&mut body, byte_count);
+    body.extend_from_slice(&bytes);
+    Ok(body)
+}
+
+fn smb_open_body(path: &SmbPath) -> Result<Vec<u8>> {
+    let name_length = u16::try_from(path.file.len()).map_err(|_| CurlError::FileSizeExceeded)?;
+    let byte_count = name_length
+        .checked_add(1)
+        .ok_or(CurlError::FileSizeExceeded)?;
+    let mut body = Vec::new();
+    body.push(0x18);
+    body.extend_from_slice(&[SMB_COM_NO_ANDX_COMMAND, 0]);
+    push_le_u16(&mut body, 0);
+    body.push(0);
+    push_le_u16(&mut body, name_length);
+    push_le_u32(&mut body, 0);
+    push_le_u32(&mut body, 0);
+    push_le_u32(&mut body, SMB_GENERIC_READ);
+    push_le_u64(&mut body, 0);
+    push_le_u32(&mut body, 0);
+    push_le_u32(&mut body, SMB_FILE_SHARE_ALL);
+    push_le_u32(&mut body, SMB_FILE_OPEN);
+    push_le_u32(&mut body, 0);
+    push_le_u32(&mut body, 0);
+    body.push(0);
+    push_le_u16(&mut body, byte_count);
+    body.extend_from_slice(&path.file);
+    body.push(0);
+    Ok(body)
+}
+
+fn smb_read_body(fid: u16, offset: u64, max_bytes: u16) -> Vec<u8> {
+    let mut body = Vec::new();
+    body.push(0x0c);
+    body.extend_from_slice(&[SMB_COM_NO_ANDX_COMMAND, 0]);
+    push_le_u16(&mut body, 0);
+    push_le_u16(&mut body, fid);
+    push_le_u32(&mut body, offset as u32);
+    push_le_u16(&mut body, max_bytes);
+    push_le_u16(&mut body, max_bytes);
+    push_le_u32(&mut body, 0);
+    push_le_u16(&mut body, 0);
+    push_le_u32(&mut body, (offset >> 32) as u32);
+    push_le_u16(&mut body, 0);
+    body
+}
+
+fn smb_close_body(fid: u16) -> Vec<u8> {
+    let mut body = Vec::new();
+    body.push(0x03);
+    push_le_u16(&mut body, fid);
+    push_le_u32(&mut body, 0);
+    push_le_u16(&mut body, 0);
+    body
+}
+
+fn smb_tree_disconnect_body() -> Vec<u8> {
+    let mut body = Vec::new();
+    body.push(0);
+    push_le_u16(&mut body, 0);
+    body
+}
+
+async fn smb_read_packet(stream: &mut TcpStream) -> Result<Vec<u8>> {
+    let mut nbt = [0; SMB_HEADER_START];
+    stream.read_exact(&mut nbt).await.map_err(smb_read_error)?;
+    let length = (((nbt[1] & 0x01) as usize) << 16) | ((nbt[2] as usize) << 8) | nbt[3] as usize;
+    if nbt[0] != 0 || !(SMB_HEADER_LEN..=SMB_MAX_MESSAGE_SIZE).contains(&length) {
+        return Err(CurlError::RecvError);
+    }
+
+    let mut packet = Vec::with_capacity(SMB_HEADER_START + length);
+    packet.extend_from_slice(&nbt);
+    packet.resize(SMB_HEADER_START + length, 0);
+    stream
+        .read_exact(&mut packet[SMB_HEADER_START..])
+        .await
+        .map_err(smb_read_error)?;
+    if &packet[SMB_HEADER_START..SMB_HEADER_START + 4] != b"\xffSMB" {
+        return Err(CurlError::RecvError);
+    }
+    Ok(packet)
+}
+
+fn smb_read_error(error: io::Error) -> CurlError {
+    if error.kind() == io::ErrorKind::UnexpectedEof {
+        CurlError::RecvError
+    } else {
+        tcp_io_error(error)
+    }
+}
+
+fn smb_response<'a>(packet: &'a [u8], command: u8) -> Result<SmbResponse<'a>> {
+    if packet.len() < SMB_FULL_HEADER_LEN
+        || &packet[SMB_HEADER_START..SMB_HEADER_START + 4] != b"\xffSMB"
+    {
+        return Err(CurlError::RecvError);
+    }
+    if packet[8] != command {
+        return Err(CurlError::WeirdServerReply);
+    }
+    Ok(SmbResponse {
+        status: smb_read_u32_at(packet, 9)?,
+        tid: smb_read_u16_at(packet, 28)?,
+        uid: smb_read_u16_at(packet, 32)?,
+        body: &packet[SMB_FULL_HEADER_LEN..],
+    })
+}
+
+fn smb_read_response_data<'a>(packet: &'a [u8], body: &[u8]) -> Result<&'a [u8]> {
+    if body.len() < 15 {
+        return Err(CurlError::RecvError);
+    }
+    let length = smb_read_u16_at(body, 11)? as usize;
+    let offset = smb_read_u16_at(body, 13)? as usize;
+    let data_start = SMB_HEADER_START
+        .checked_add(offset)
+        .ok_or(CurlError::RecvError)?;
+    let data_end = data_start
+        .checked_add(length)
+        .filter(|end| *end <= packet.len())
+        .ok_or(CurlError::RecvError)?;
+    Ok(&packet[data_start..data_end])
+}
+
+fn smb_file_error(status: u32) -> CurlError {
+    if status == SMB_ERR_NOACCESS {
+        CurlError::RemoteAccessDenied
+    } else {
+        CurlError::RemoteFileNotFound
+    }
+}
+
+fn push_le_u16(bytes: &mut Vec<u8>, value: u16) {
+    bytes.extend_from_slice(&value.to_le_bytes());
+}
+
+fn push_le_u32(bytes: &mut Vec<u8>, value: u32) {
+    bytes.extend_from_slice(&value.to_le_bytes());
+}
+
+fn push_le_u64(bytes: &mut Vec<u8>, value: u64) {
+    bytes.extend_from_slice(&value.to_le_bytes());
+}
+
+fn smb_read_u16_at(bytes: &[u8], offset: usize) -> Result<u16> {
+    let value = bytes.get(offset..offset + 2).ok_or(CurlError::RecvError)?;
+    Ok(u16::from_le_bytes([value[0], value[1]]))
+}
+
+fn smb_read_u32_at(bytes: &[u8], offset: usize) -> Result<u32> {
+    let value = bytes.get(offset..offset + 4).ok_or(CurlError::RecvError)?;
+    Ok(u32::from_le_bytes([value[0], value[1], value[2], value[3]]))
+}
+
+fn smb_read_u64_at(bytes: &[u8], offset: usize) -> Result<u64> {
+    let value = bytes.get(offset..offset + 8).ok_or(CurlError::RecvError)?;
+    Ok(u64::from_le_bytes([
+        value[0], value[1], value[2], value[3], value[4], value[5], value[6], value[7],
+    ]))
 }
 
 async fn run_ldap_transfer(

@@ -19,6 +19,14 @@ const TELNET_WONT: u8 = 252;
 const TELNET_WILL: u8 = 251;
 const TELNET_NEW_ENVIRON: u8 = 39;
 const TELNET_NAWS: u8 = 31;
+const TEST_SMB_COM_CLOSE: u8 = 0x04;
+const TEST_SMB_COM_READ_ANDX: u8 = 0x2e;
+const TEST_SMB_COM_TREE_DISCONNECT: u8 = 0x71;
+const TEST_SMB_COM_NEGOTIATE: u8 = 0x72;
+const TEST_SMB_COM_SETUP_ANDX: u8 = 0x73;
+const TEST_SMB_COM_TREE_CONNECT_ANDX: u8 = 0x75;
+const TEST_SMB_COM_NT_CREATE_ANDX: u8 = 0xa2;
+const TEST_SMB_ERR_NOACCESS: u32 = 0x0005_0001;
 const TELNET_NEGOTIATION_GREETING: &[u8] = &[
     TELNET_IAC,
     TELNET_DO,
@@ -76,6 +84,19 @@ struct LdapRecord {
     bind: Vec<u8>,
     search: Vec<u8>,
     unbind: Vec<u8>,
+}
+
+#[derive(Debug)]
+struct SmbRecord {
+    packets: Vec<Vec<u8>>,
+}
+
+#[derive(Debug)]
+struct SmbFixture {
+    body: Vec<u8>,
+    tree_status: u32,
+    open_status: u32,
+    malformed_read: bool,
 }
 
 #[derive(Debug)]
@@ -837,6 +858,201 @@ fn spawn_ldap_server(
     });
 
     (format!("ldap://{addr}{path}"), rx)
+}
+
+impl SmbFixture {
+    fn body(body: &[u8]) -> Self {
+        Self {
+            body: body.to_vec(),
+            tree_status: 0,
+            open_status: 0,
+            malformed_read: false,
+        }
+    }
+}
+
+fn spawn_smb_server(path: &'static str, fixture: SmbFixture) -> (String, Receiver<SmbRecord>) {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = listener.local_addr().unwrap();
+    let (tx, rx) = mpsc::channel();
+
+    thread::spawn(move || {
+        let (mut stream, _) = listener.accept().unwrap();
+        stream
+            .set_read_timeout(Some(Duration::from_secs(2)))
+            .unwrap();
+        let mut packets = Vec::new();
+        let uid = 0x2001;
+        let tid = 0x3001;
+        let fid = 0x4001;
+
+        packets.push(smb_read_client_packet(&mut stream).unwrap());
+        stream
+            .write_all(&smb_test_packet(TEST_SMB_COM_NEGOTIATE, 0, 0, 0, &[0]))
+            .unwrap();
+
+        packets.push(smb_read_client_packet(&mut stream).unwrap());
+        stream
+            .write_all(&smb_test_packet(TEST_SMB_COM_SETUP_ANDX, 0, 0, uid, &[0]))
+            .unwrap();
+
+        packets.push(smb_read_client_packet(&mut stream).unwrap());
+        stream
+            .write_all(&smb_test_packet(
+                TEST_SMB_COM_TREE_CONNECT_ANDX,
+                fixture.tree_status,
+                tid,
+                uid,
+                &[0],
+            ))
+            .unwrap();
+        if fixture.tree_status != 0 {
+            tx.send(SmbRecord { packets }).unwrap();
+            return;
+        }
+
+        packets.push(smb_read_client_packet(&mut stream).unwrap());
+        let open_body = if fixture.open_status == 0 {
+            smb_open_response_body(fid, fixture.body.len() as u64)
+        } else {
+            Vec::new()
+        };
+        stream
+            .write_all(&smb_test_packet(
+                TEST_SMB_COM_NT_CREATE_ANDX,
+                fixture.open_status,
+                tid,
+                uid,
+                &open_body,
+            ))
+            .unwrap();
+        if fixture.open_status != 0 {
+            if let Some(packet) = smb_read_client_packet(&mut stream) {
+                let command = smb_packet_command(&packet);
+                packets.push(packet);
+                if command == TEST_SMB_COM_TREE_DISCONNECT {
+                    let _ = stream.write_all(&smb_test_packet(
+                        TEST_SMB_COM_TREE_DISCONNECT,
+                        0,
+                        tid,
+                        uid,
+                        &[0, 0, 0],
+                    ));
+                }
+            }
+            tx.send(SmbRecord { packets }).unwrap();
+            return;
+        }
+
+        while let Some(packet) = smb_read_client_packet(&mut stream) {
+            let command = smb_packet_command(&packet);
+            packets.push(packet);
+            match command {
+                TEST_SMB_COM_READ_ANDX => {
+                    if fixture.malformed_read {
+                        let _ = stream.write_all(&[0, 0, 0, 1, 0]);
+                        break;
+                    }
+                    stream
+                        .write_all(&smb_test_packet(
+                            TEST_SMB_COM_READ_ANDX,
+                            0,
+                            tid,
+                            uid,
+                            &smb_read_response_body(&fixture.body),
+                        ))
+                        .unwrap();
+                }
+                TEST_SMB_COM_CLOSE => {
+                    stream
+                        .write_all(&smb_test_packet(
+                            TEST_SMB_COM_CLOSE,
+                            0,
+                            tid,
+                            uid,
+                            &[0, 0, 0],
+                        ))
+                        .unwrap();
+                }
+                TEST_SMB_COM_TREE_DISCONNECT => {
+                    stream
+                        .write_all(&smb_test_packet(
+                            TEST_SMB_COM_TREE_DISCONNECT,
+                            0,
+                            tid,
+                            uid,
+                            &[0, 0, 0],
+                        ))
+                        .unwrap();
+                    break;
+                }
+                _ => break,
+            }
+        }
+
+        tx.send(SmbRecord { packets }).unwrap();
+    });
+
+    (format!("smb://{addr}{path}"), rx)
+}
+
+fn smb_read_client_packet(stream: &mut impl Read) -> Option<Vec<u8>> {
+    let mut nbt = [0; 4];
+    stream.read_exact(&mut nbt).ok()?;
+    let length = (((nbt[1] & 0x01) as usize) << 16) | ((nbt[2] as usize) << 8) | nbt[3] as usize;
+    let mut packet = Vec::with_capacity(4 + length);
+    packet.extend_from_slice(&nbt);
+    packet.resize(4 + length, 0);
+    stream.read_exact(&mut packet[4..]).ok()?;
+    Some(packet)
+}
+
+fn smb_test_packet(command: u8, status: u32, tid: u16, uid: u16, body: &[u8]) -> Vec<u8> {
+    let length = 32 + body.len();
+    let mut packet = Vec::with_capacity(4 + length);
+    packet.push(0);
+    packet.push(0);
+    packet.push((length >> 8) as u8);
+    packet.push(length as u8);
+    packet.extend_from_slice(b"\xffSMB");
+    packet.push(command);
+    packet.extend_from_slice(&status.to_le_bytes());
+    packet.push(0x18);
+    packet.extend_from_slice(&0x0041_u16.to_le_bytes());
+    packet.extend_from_slice(&0_u16.to_le_bytes());
+    packet.extend_from_slice(&[0; 8]);
+    packet.extend_from_slice(&0_u16.to_le_bytes());
+    packet.extend_from_slice(&tid.to_le_bytes());
+    packet.extend_from_slice(&0x5151_u16.to_le_bytes());
+    packet.extend_from_slice(&uid.to_le_bytes());
+    packet.extend_from_slice(&1_u16.to_le_bytes());
+    packet.extend_from_slice(body);
+    packet
+}
+
+fn smb_open_response_body(fid: u16, size: u64) -> Vec<u8> {
+    let mut body = vec![0; 64];
+    body[0] = 0x22;
+    body[1] = 0xff;
+    body[6..8].copy_from_slice(&fid.to_le_bytes());
+    body[56..64].copy_from_slice(&size.to_le_bytes());
+    body
+}
+
+fn smb_read_response_body(data: &[u8]) -> Vec<u8> {
+    let header_len = 27;
+    let data_offset = 32 + header_len;
+    let mut body = vec![0; header_len];
+    body[0] = 0x0c;
+    body[1] = 0xff;
+    body[11..13].copy_from_slice(&(data.len() as u16).to_le_bytes());
+    body[13..15].copy_from_slice(&(data_offset as u16).to_le_bytes());
+    body.extend_from_slice(data);
+    body
+}
+
+fn smb_packet_command(packet: &[u8]) -> u8 {
+    packet.get(8).copied().unwrap_or_default()
 }
 
 fn contains_bytes(haystack: &[u8], needle: &[u8]) -> bool {
@@ -3513,6 +3729,211 @@ fn version_lists_ldap_protocol() {
 
     assert!(output.status.success());
     assert!(String::from_utf8(output.stdout).unwrap().contains("LDAP"));
+}
+
+#[test]
+fn smb_download_outputs_body_and_sends_expected_sequence() {
+    let body = b"Basic SMB test complete\n";
+    let (url, rx) = spawn_smb_server("/TESTS/1451", SmbFixture::body(body));
+
+    let mut command = Command::cargo_bin("curl").unwrap();
+    command.args(["-q", "-sS", "-u", "curltest:curltest", &url]);
+    command
+        .assert()
+        .success()
+        .stdout("Basic SMB test complete\n");
+
+    let record = rx.recv().unwrap();
+    let commands = record
+        .packets
+        .iter()
+        .map(|packet| smb_packet_command(packet))
+        .collect::<Vec<_>>();
+    assert_eq!(
+        commands,
+        vec![
+            TEST_SMB_COM_NEGOTIATE,
+            TEST_SMB_COM_SETUP_ANDX,
+            TEST_SMB_COM_TREE_CONNECT_ANDX,
+            TEST_SMB_COM_NT_CREATE_ANDX,
+            TEST_SMB_COM_READ_ANDX,
+            TEST_SMB_COM_CLOSE,
+            TEST_SMB_COM_TREE_DISCONNECT,
+        ]
+    );
+    assert!(contains_bytes(&record.packets[1], b"curltest"));
+    assert!(contains_bytes(&record.packets[2], b"\\\\127.0.0.1\\TESTS"));
+    assert!(contains_bytes(&record.packets[3], b"1451"));
+}
+
+#[test]
+fn smb_url_userinfo_splits_domain_and_decodes_path() {
+    let (base_url, rx) = spawn_smb_server("/SHARE/dir/file%20x", SmbFixture::body(b"body"));
+    let addr = base_url
+        .strip_prefix("smb://")
+        .unwrap()
+        .split('/')
+        .next()
+        .unwrap();
+    let url = format!("smb://DOMAIN%2Fuser:secret@{addr}/SHARE/dir/file%20x");
+
+    let mut command = Command::cargo_bin("curl").unwrap();
+    command.args(["-q", "-sS", &url]);
+    command.assert().success().stdout("body");
+
+    let record = rx.recv().unwrap();
+    assert!(contains_bytes(&record.packets[1], b"user"));
+    assert!(contains_bytes(&record.packets[1], b"DOMAIN"));
+    assert!(contains_bytes(&record.packets[3], b"dir\\file x"));
+}
+
+#[test]
+fn smb_requires_credentials_returns_67() {
+    let mut command = Command::cargo_bin("curl").unwrap();
+    command.args(["-q", "-sS", "smb://127.0.0.1:1/SHARE/file"]);
+    command.assert().failure().code(67).stdout("");
+}
+
+#[test]
+fn smb_missing_share_path_returns_url_error() {
+    let mut command = Command::cargo_bin("curl").unwrap();
+    command.args(["-q", "-sS", "-u", "user:secret", "smb://127.0.0.1/SHARE"]);
+    command.assert().failure().code(3).stdout("");
+}
+
+#[test]
+fn smb_tree_noaccess_returns_9() {
+    let mut fixture = SmbFixture::body(b"");
+    fixture.tree_status = TEST_SMB_ERR_NOACCESS;
+    let (url, rx) = spawn_smb_server("/SHARE/file", fixture);
+
+    let mut command = Command::cargo_bin("curl").unwrap();
+    command.args(["-q", "-sS", "-u", "user:secret", &url]);
+    command.assert().failure().code(9).stdout("");
+
+    let record = rx.recv().unwrap();
+    assert_eq!(
+        smb_packet_command(&record.packets[2]),
+        TEST_SMB_COM_TREE_CONNECT_ANDX
+    );
+}
+
+#[test]
+fn smb_open_missing_returns_78() {
+    let mut fixture = SmbFixture::body(b"");
+    fixture.open_status = 0x0002_0001;
+    let (url, rx) = spawn_smb_server("/SHARE/missing", fixture);
+
+    let mut command = Command::cargo_bin("curl").unwrap();
+    command.args(["-q", "-sS", "-u", "user:secret", &url]);
+    command.assert().failure().code(78).stdout("");
+
+    let record = rx.recv().unwrap();
+    assert_eq!(
+        smb_packet_command(&record.packets[3]),
+        TEST_SMB_COM_NT_CREATE_ANDX
+    );
+}
+
+#[test]
+fn smb_malformed_read_frame_returns_56() {
+    let mut fixture = SmbFixture::body(b"body");
+    fixture.malformed_read = true;
+    let (url, rx) = spawn_smb_server("/SHARE/file", fixture);
+
+    let mut command = Command::cargo_bin("curl").unwrap();
+    command.args(["-q", "-sS", "-u", "user:secret", &url]);
+    command.assert().failure().code(56).stdout("");
+
+    let record = rx.recv().unwrap();
+    assert_eq!(
+        smb_packet_command(&record.packets[4]),
+        TEST_SMB_COM_READ_ANDX
+    );
+}
+
+#[test]
+fn smb_head_suppresses_body_and_keeps_zero_code() {
+    let (url, rx) = spawn_smb_server("/SHARE/file", SmbFixture::body(b"body"));
+
+    let mut command = Command::cargo_bin("curl").unwrap();
+    command.args([
+        "-q",
+        "-sS",
+        "-I",
+        "-w",
+        "%{size_download} %{http_code}",
+        "-u",
+        "user:secret",
+        &url,
+    ]);
+    command.assert().success().stdout("0 000");
+
+    let record = rx.recv().unwrap();
+    let commands = record
+        .packets
+        .iter()
+        .map(|packet| smb_packet_command(packet))
+        .collect::<Vec<_>>();
+    assert!(!commands.contains(&TEST_SMB_COM_READ_ANDX));
+}
+
+#[test]
+fn smb_dump_header_is_empty_and_include_adds_no_headers() {
+    let temp = tempdir().unwrap();
+    let dump = temp.path().join("smb.headers");
+    let (url, rx) = spawn_smb_server("/SHARE/file", SmbFixture::body(b"body"));
+
+    let mut command = Command::cargo_bin("curl").unwrap();
+    command.args([
+        "-q",
+        "-sS",
+        "-i",
+        "-D",
+        dump.to_str().unwrap(),
+        "-u",
+        "user:secret",
+        &url,
+    ]);
+    command.assert().success().stdout("body");
+
+    let _ = rx.recv().unwrap();
+    assert_eq!(std::fs::read(dump).unwrap(), b"");
+}
+
+#[test]
+fn smb_max_filesize_truncates_and_returns_63() {
+    let (url, rx) = spawn_smb_server("/SHARE/file", SmbFixture::body(b"abcdef"));
+
+    let mut command = Command::cargo_bin("curl").unwrap();
+    command.args([
+        "-q",
+        "-sS",
+        "--max-filesize",
+        "3",
+        "-u",
+        "user:secret",
+        &url,
+    ]);
+    command.assert().failure().code(63).stdout("abc");
+
+    let _ = rx.recv().unwrap();
+}
+
+#[test]
+fn smbs_is_explicitly_unsupported() {
+    let mut command = Command::cargo_bin("curl").unwrap();
+    command.args(["-q", "-sS", "smbs://example.com/SHARE/file"]);
+    command.assert().failure().code(2).stdout("");
+}
+
+#[test]
+fn version_lists_smb_protocol() {
+    let mut command = Command::cargo_bin("curl").unwrap();
+    let output = command.args(["-q", "-V"]).output().unwrap();
+
+    assert!(output.status.success());
+    assert!(String::from_utf8(output.stdout).unwrap().contains("SMB"));
 }
 
 #[test]
