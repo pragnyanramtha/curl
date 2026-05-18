@@ -1,5 +1,6 @@
 use std::io;
 use std::path::Path;
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use reqwest::header::{
@@ -10,6 +11,7 @@ use reqwest::header::{
 use reqwest::{Client, Method, StatusCode, Url, Version};
 
 use crate::cli::{Config, ContinueAt, HttpVersionPreference, TransferConfig};
+use crate::cookie::CookieJar;
 use crate::data::{self, PreparedBody};
 use crate::error::{CurlError, Result, ResultExt};
 use crate::{glob, output, writeout};
@@ -28,7 +30,11 @@ pub async fn run(config: Config) -> Result<i32> {
     let mut final_code = 0;
 
     for transfer in &config.transfers {
-        let client = build_client(transfer)?;
+        let cookie_jar = transfer
+            .cookie_jar
+            .as_ref()
+            .map(|_| Arc::new(CookieJar::default()));
+        let client = build_client(transfer, cookie_jar.clone())?;
         let expanded_urls = expand_urls(transfer)?;
 
         for expanded in expanded_urls {
@@ -36,6 +42,10 @@ pub async fn run(config: Config) -> Result<i32> {
             if code != 0 {
                 final_code = code;
             }
+        }
+
+        if let (Some(path), Some(cookie_jar)) = (&transfer.cookie_jar, &cookie_jar) {
+            cookie_jar.save_to_path(path, transfer.create_dirs, transfer.verbose);
         }
     }
 
@@ -50,7 +60,7 @@ fn expand_urls(transfer: &TransferConfig) -> Result<Vec<glob::ExpandedUrl>> {
     Ok(expanded)
 }
 
-fn build_client(transfer: &TransferConfig) -> Result<Client> {
+fn build_client(transfer: &TransferConfig, cookie_jar: Option<Arc<CookieJar>>) -> Result<Client> {
     let redirect = if transfer.follow_location {
         reqwest::redirect::Policy::limited(transfer.max_redirs)
     } else {
@@ -63,6 +73,10 @@ fn build_client(transfer: &TransferConfig) -> Result<Client> {
 
     if !transfer.compressed {
         builder = builder.no_gzip().no_brotli().no_deflate();
+    }
+
+    if let Some(cookie_jar) = cookie_jar {
+        builder = builder.cookie_provider(cookie_jar);
     }
 
     if let Some(timeout) = transfer.max_time {

@@ -55,6 +55,7 @@ pub struct TransferConfig {
     pub range: Option<String>,
     pub continue_at: Option<ContinueAt>,
     pub cookie: Option<String>,
+    pub cookie_jar: Option<PathBuf>,
     pub compressed: bool,
     pub verbose: bool,
     pub silent: bool,
@@ -132,6 +133,7 @@ impl Default for TransferConfig {
             range: None,
             continue_at: None,
             cookie: None,
+            cookie_jar: None,
             compressed: false,
             verbose: false,
             silent: false,
@@ -420,6 +422,10 @@ impl Parser {
                 let value = self.value_for(name, inline_value)?;
                 self.current().cookie = Some(value);
             }
+            "cookie-jar" => {
+                let value = self.value_for(name, inline_value)?;
+                self.current().cookie_jar = Some(parse_nonempty_path(name, &value)?);
+            }
             "compressed" => self.current().compressed = true,
             "verbose" => self.current().verbose = true,
             "silent" | "no-progress-meter" => self.current().silent = true,
@@ -599,6 +605,11 @@ impl Parser {
                     self.current().cookie = Some(value);
                     break;
                 }
+                'c' => {
+                    let value = self.short_value('c', rest)?;
+                    self.current().cookie_jar = Some(parse_nonempty_path("cookie-jar", &value)?);
+                    break;
+                }
                 's' => self.current().silent = true,
                 'S' => self.current().show_error = true,
                 'v' => self.current().verbose = true,
@@ -712,6 +723,7 @@ impl TransferConfig {
             || self.range.is_some()
             || self.continue_at.is_some()
             || self.cookie.is_some()
+            || self.cookie_jar.is_some()
             || self.compressed
             || self.verbose
             || self.silent
@@ -739,6 +751,16 @@ fn parse_continue_at(name: &str, value: &str) -> Result<ContinueAt> {
         Ok(ContinueAt::Auto)
     } else {
         Ok(ContinueAt::Offset(parse_u64(name, value)?))
+    }
+}
+
+fn parse_nonempty_path(name: &str, value: &str) -> Result<PathBuf> {
+    if value.is_empty() {
+        Err(CurlError::Usage(format!(
+            "option --{name} requires a non-empty value"
+        )))
+    } else {
+        Ok(PathBuf::from(value))
     }
 }
 
@@ -792,6 +814,8 @@ pub fn print_help() {
            -w, --write-out <format>    Write transfer metrics\n\
            -X, --request <method>      Specify request method\n\
            -u, --user <user:pass>      Server user and password\n\
+           -b, --cookie <data>         Send cookies from string\n\
+           -c, --cookie-jar <file>     Save cookies to file\n\
                --oauth2-bearer <token> OAuth 2 Bearer token\n\
            -U, --proxy-user <user:pass> Proxy user and password\n\
                --noproxy <list>        List hosts that do not use proxy\n\
@@ -1102,6 +1126,33 @@ mod tests {
         assert_eq!(transfer.proxy.as_deref(), Some("http://proxy.example:8080"));
         assert_eq!(transfer.proxy_user.as_deref(), Some("proxy-user:secret"));
         assert_eq!(transfer.noproxy.as_deref(), Some("example.com"));
+    }
+
+    #[test]
+    fn parses_cookie_jar_options() {
+        let config = parse_args(["-q", "-c", "jar.txt", "https://example.com"]).unwrap();
+        assert_eq!(
+            config.transfers[0].cookie_jar.as_deref(),
+            Some(std::path::Path::new("jar.txt"))
+        );
+
+        let config = parse_args(["-q", "-cjar.txt", "https://example.com"]).unwrap();
+        assert_eq!(
+            config.transfers[0].cookie_jar.as_deref(),
+            Some(std::path::Path::new("jar.txt"))
+        );
+
+        let config = parse_args(["-q", "--cookie-jar=jar.txt", "https://example.com"]).unwrap();
+        assert_eq!(
+            config.transfers[0].cookie_jar.as_deref(),
+            Some(std::path::Path::new("jar.txt"))
+        );
+    }
+
+    #[test]
+    fn rejects_empty_cookie_jar_path() {
+        let error = parse_args(["-q", "--cookie-jar=", "https://example.com"]).unwrap_err();
+        assert!(error.to_string().contains("non-empty"));
     }
 
     #[test]

@@ -6,6 +6,8 @@ pub mod output;
 pub mod transfer;
 pub mod writeout;
 
+mod cookie;
+
 pub use cli::{Config, TransferConfig, parse_args};
 pub use error::{CurlError, ResultExt};
 
