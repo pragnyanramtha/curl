@@ -2,6 +2,7 @@ use std::io::{Read, Write};
 use std::net::TcpListener;
 use std::sync::mpsc::{self, Receiver};
 use std::thread;
+use std::time::Duration;
 
 use assert_cmd::Command;
 use tempfile::tempdir;
@@ -141,6 +142,60 @@ fn username_only_basic_auth_encodes_empty_password() {
 
     let request = rx.recv().unwrap();
     assert_eq!(header(&request, "authorization"), Some("Basic YWxpY2U6"));
+}
+
+#[test]
+fn sends_oauth2_bearer_authorization_header() {
+    let (url, rx) = spawn_server(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok");
+
+    let mut command = Command::cargo_bin("curl").unwrap();
+    command.args(["-q", "-sS", "--oauth2-bearer", "token123", &url]);
+    command.assert().success().stdout("ok");
+
+    let request = rx.recv().unwrap();
+    assert_eq!(header(&request, "authorization"), Some("Bearer token123"));
+}
+
+#[test]
+fn proxy_user_sets_proxy_authorization_header() {
+    let (proxy_url, rx) = spawn_server(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok");
+
+    let mut command = Command::cargo_bin("curl").unwrap();
+    command.args([
+        "-q",
+        "-sS",
+        "-x",
+        &proxy_url,
+        "-U",
+        "aladdin:opensesame",
+        "http://example.test/resource",
+    ]);
+    command.assert().success().stdout("ok");
+
+    let request = rx.recv().unwrap();
+    assert!(
+        request
+            .start_line
+            .starts_with("GET http://example.test/resource HTTP/1.1")
+    );
+    assert_eq!(
+        header(&request, "proxy-authorization"),
+        Some("Basic YWxhZGRpbjpvcGVuc2VzYW1l")
+    );
+}
+
+#[test]
+fn noproxy_bypasses_configured_proxy() {
+    let (target_url, target_rx) =
+        spawn_server(b"HTTP/1.1 200 OK\r\nContent-Length: 6\r\n\r\ntarget");
+    let (proxy_url, proxy_rx) = spawn_server(b"HTTP/1.1 200 OK\r\nContent-Length: 5\r\n\r\nproxy");
+
+    let mut command = Command::cargo_bin("curl").unwrap();
+    command.args(["-q", "-sS", "-x", &proxy_url, "--noproxy", "*", &target_url]);
+    command.assert().success().stdout("target");
+
+    target_rx.recv().unwrap();
+    assert!(proxy_rx.recv_timeout(Duration::from_millis(100)).is_err());
 }
 
 #[test]

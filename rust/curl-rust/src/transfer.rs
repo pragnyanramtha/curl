@@ -1,8 +1,8 @@
 use std::time::Instant;
 
 use reqwest::header::{
-    ACCEPT, ACCEPT_ENCODING, CONTENT_LENGTH, CONTENT_TYPE, COOKIE, HeaderName, HeaderValue,
-    LOCATION, RANGE, REFERER, USER_AGENT,
+    ACCEPT, ACCEPT_ENCODING, AUTHORIZATION, CONTENT_LENGTH, CONTENT_TYPE, COOKIE, HeaderName,
+    HeaderValue, LOCATION, RANGE, REFERER, USER_AGENT,
 };
 use reqwest::{Client, Method, StatusCode, Url, Version};
 
@@ -60,8 +60,17 @@ fn build_client(transfer: &TransferConfig) -> Result<Client> {
         builder = builder.connect_timeout(timeout);
     }
 
-    if let Some(proxy) = &transfer.proxy {
-        let proxy = reqwest::Proxy::all(proxy).transfer_err()?;
+    if let Some(proxy) = &transfer.proxy
+        && !transfer.noproxy.as_deref().is_some_and(is_global_noproxy)
+    {
+        let mut proxy = reqwest::Proxy::all(proxy).transfer_err()?;
+        if let Some(proxy_user) = &transfer.proxy_user {
+            let (login, password) = split_user_password(proxy_user);
+            proxy = proxy.basic_auth(login, password);
+        }
+        if let Some(noproxy) = &transfer.noproxy {
+            proxy = proxy.no_proxy(reqwest::NoProxy::from_string(noproxy));
+        }
         builder = builder.proxy(proxy);
     }
 
@@ -73,6 +82,10 @@ fn build_client(transfer: &TransferConfig) -> Result<Client> {
     }
 
     builder.build().transfer_err()
+}
+
+fn is_global_noproxy(value: &str) -> bool {
+    value.split(',').any(|entry| entry.trim() == "*")
 }
 
 async fn run_expanded_url(
@@ -345,6 +358,10 @@ fn apply_headers(
         request = request.header(COOKIE, cookie);
     }
 
+    if let Some(token) = &transfer.oauth2_bearer {
+        request = request.header(AUTHORIZATION, format!("Bearer {token}"));
+    }
+
     if let Some(referer) = &transfer.referer {
         request = request.header(REFERER, referer);
     }
@@ -405,8 +422,16 @@ fn apply_auth(
         return request;
     };
 
-    let (login, password) = user.split_once(':').unwrap_or((user, ""));
+    if transfer.oauth2_bearer.is_some() {
+        return request;
+    }
+
+    let (login, password) = split_user_password(user);
     request.basic_auth(login.to_string(), Some(password.to_string()))
+}
+
+fn split_user_password(value: &str) -> (&str, &str) {
+    value.split_once(':').unwrap_or((value, ""))
 }
 
 fn append_query_body(url: &mut Url, body: &[u8]) {

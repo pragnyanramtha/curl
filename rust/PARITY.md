@@ -60,7 +60,10 @@ companion data before this rewrite can be called complete.
 | `--referer` | partial | `TransferConfig::referer` | `sends_referer_range_and_url_query` | `;auto` semantics missing |
 | `--range` | partial | `TransferConfig::range` | `file_range_outputs_slice`, HTTP header test | Multipart ranges and resume interactions missing |
 | `--user` | partial | `TransferConfig::user` | `username_only_basic_auth_encodes_empty_password` | Basic auth only |
-| `--proxy` | partial | `TransferConfig::proxy` | none | Proxy auth and no-proxy missing |
+| `--oauth2-bearer` | partial | `TransferConfig::oauth2_bearer` | `sends_oauth2_bearer_authorization_header` | Redirect credential scoping needs parity work |
+| `--proxy` | partial | `TransferConfig::proxy` | `proxy_user_sets_proxy_authorization_header`, `noproxy_bypasses_configured_proxy` | Basic HTTP proxy path only |
+| `--proxy-user` | partial | `TransferConfig::proxy_user` | `proxy_user_sets_proxy_authorization_header` | Basic proxy auth only |
+| `--noproxy` | partial | `TransferConfig::noproxy` | `noproxy_bypasses_configured_proxy` | Delegates matching to reqwest |
 | `--compressed` | partial | `TransferConfig::compressed` | default encoding assertion | Compression negotiation subset |
 | `--location` | partial | reqwest redirect policy | parser tests only | Manual redirect behavior needed for full parity |
 | `--fail`, `--fail-with-body` | partial | transfer status handling | none | Needs corpus mapping |
@@ -69,9 +72,6 @@ companion data before this rewrite can be called complete.
 | `--retry*` | missing | none | retry corpus | |
 | `--continue-at` | missing | none | resume tests | |
 | `--cookie-jar` | missing | none | cookie persistence tests | |
-| `--oauth2-bearer` | missing | none | auth tests | |
-| `--proxy-user` | missing | none | proxy auth tests | |
-| `--noproxy` | missing | none | proxy bypass tests | |
 | `--etag-save`, `--etag-compare` | missing | none | ETag tests | |
 | `--time-cond` | missing | none | conditional request tests | |
 | `--parallel` | missing | none | parallel tests | |
@@ -88,4 +88,3 @@ companion data before this rewrite can be called complete.
 | Existing curl Perl suite with C binary | verified for C path | Does not prove Rust parity |
 | Existing curl Perl suite with Rust binary | missing | Required before full parity |
 | Pytest HTTP suite with Rust binary | missing | Required before full parity |
-

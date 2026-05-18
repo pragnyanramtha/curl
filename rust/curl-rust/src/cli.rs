@@ -35,7 +35,10 @@ pub struct TransferConfig {
     pub fail: bool,
     pub fail_with_body: bool,
     pub user: Option<String>,
+    pub oauth2_bearer: Option<String>,
     pub proxy: Option<String>,
+    pub proxy_user: Option<String>,
+    pub noproxy: Option<String>,
     pub insecure: bool,
     pub connect_timeout: Option<Duration>,
     pub max_time: Option<Duration>,
@@ -94,7 +97,10 @@ impl Default for TransferConfig {
             fail: false,
             fail_with_body: false,
             user: None,
+            oauth2_bearer: None,
             proxy: None,
+            proxy_user: None,
+            noproxy: None,
             insecure: false,
             connect_timeout: None,
             max_time: None,
@@ -317,9 +323,21 @@ impl Parser {
                 let value = self.value_for(name, inline_value)?;
                 self.current().user = Some(value);
             }
+            "oauth2-bearer" => {
+                let value = self.value_for(name, inline_value)?;
+                self.current().oauth2_bearer = Some(value);
+            }
             "proxy" => {
                 let value = self.value_for(name, inline_value)?;
                 self.current().proxy = Some(value);
+            }
+            "proxy-user" => {
+                let value = self.value_for(name, inline_value)?;
+                self.current().proxy_user = Some(value);
+            }
+            "noproxy" => {
+                let value = self.value_for(name, inline_value)?;
+                self.current().noproxy = Some(value);
             }
             "insecure" => self.current().insecure = true,
             "connect-timeout" => {
@@ -469,6 +487,11 @@ impl Parser {
                     self.current().user = Some(value);
                     break;
                 }
+                'U' => {
+                    let value = self.short_value('U', rest)?;
+                    self.current().proxy_user = Some(value);
+                    break;
+                }
                 'x' => {
                     let value = self.short_value('x', rest)?;
                     self.current().proxy = Some(value);
@@ -583,7 +606,10 @@ impl TransferConfig {
             || self.fail
             || self.fail_with_body
             || self.user.is_some()
+            || self.oauth2_bearer.is_some()
             || self.proxy.is_some()
+            || self.proxy_user.is_some()
+            || self.noproxy.is_some()
             || self.insecure
             || self.connect_timeout.is_some()
             || self.max_time.is_some()
@@ -640,6 +666,9 @@ pub fn print_help() {
            -w, --write-out <format>    Write transfer metrics\n\
            -X, --request <method>      Specify request method\n\
            -u, --user <user:pass>      Server user and password\n\
+               --oauth2-bearer <token> OAuth 2 Bearer token\n\
+           -U, --proxy-user <user:pass> Proxy user and password\n\
+               --noproxy <list>        List hosts that do not use proxy\n\
            -k, --insecure              Allow insecure TLS\n\
            -s, --silent                Silent mode\n\
            -v, --verbose               Verbose transfer trace\n\
@@ -906,6 +935,29 @@ mod tests {
         assert_eq!(transfer.forms.len(), 2);
         assert_eq!(transfer.forms[0].kind, FormKind::Form);
         assert_eq!(transfer.forms[1].kind, FormKind::FormString);
+    }
+
+    #[test]
+    fn parses_bearer_proxy_user_and_noproxy() {
+        let config = parse_args([
+            "-q",
+            "--oauth2-bearer",
+            "token",
+            "-x",
+            "http://proxy.example:8080",
+            "-U",
+            "proxy-user:secret",
+            "--noproxy",
+            "example.com",
+            "https://example.com",
+        ])
+        .unwrap();
+
+        let transfer = &config.transfers[0];
+        assert_eq!(transfer.oauth2_bearer.as_deref(), Some("token"));
+        assert_eq!(transfer.proxy.as_deref(), Some("http://proxy.example:8080"));
+        assert_eq!(transfer.proxy_user.as_deref(), Some("proxy-user:secret"));
+        assert_eq!(transfer.noproxy.as_deref(), Some("example.com"));
     }
 
     #[test]
