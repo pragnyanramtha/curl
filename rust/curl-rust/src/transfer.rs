@@ -1,5 +1,5 @@
 use std::io::{self, Read, Write};
-use std::net::{TcpStream as StdTcpStream, ToSocketAddrs};
+use std::net::{IpAddr, SocketAddr, TcpStream as StdTcpStream, ToSocketAddrs};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -4294,7 +4294,17 @@ async fn run_gopher_transfer(
 }
 
 async fn connect_tcp(host: &str, port: u16, transfer: &TransferConfig) -> Result<TcpStream> {
-    let connect = TcpStream::connect((host, port));
+    let connect = async move {
+        let literal_host = host
+            .strip_prefix('[')
+            .and_then(|host| host.strip_suffix(']'))
+            .unwrap_or(host);
+        if let Ok(ip) = literal_host.parse::<IpAddr>() {
+            TcpStream::connect(SocketAddr::new(ip, port)).await
+        } else {
+            TcpStream::connect((host, port)).await
+        }
+    };
     if let Some(timeout) = transfer.connect_timeout {
         tokio::time::timeout(timeout, connect)
             .await

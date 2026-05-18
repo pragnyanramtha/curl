@@ -1675,6 +1675,24 @@ fn spawn_timed_server(
 fn spawn_gopher_server(response: &'static [u8]) -> (String, Receiver<Vec<u8>>) {
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let addr = listener.local_addr().unwrap();
+    spawn_gopher_server_with_listener(listener, format!("gopher://{addr}/1/resource"), response)
+}
+
+fn spawn_gopher_ipv6_server(response: &'static [u8]) -> Option<(String, Receiver<Vec<u8>>)> {
+    let listener = TcpListener::bind("[::1]:0").ok()?;
+    let port = listener.local_addr().ok()?.port();
+    Some(spawn_gopher_server_with_listener(
+        listener,
+        format!("gopher://[::1]:{port}/1/resource"),
+        response,
+    ))
+}
+
+fn spawn_gopher_server_with_listener(
+    listener: TcpListener,
+    url: String,
+    response: &'static [u8],
+) -> (String, Receiver<Vec<u8>>) {
     let (tx, rx) = mpsc::channel();
 
     thread::spawn(move || {
@@ -1697,7 +1715,7 @@ fn spawn_gopher_server(response: &'static [u8]) -> (String, Receiver<Vec<u8>>) {
         stream.write_all(response).unwrap();
     });
 
-    (format!("gopher://{addr}/1/resource"), rx)
+    (url, rx)
 }
 
 fn read_request(stream: &mut impl Read) -> RequestRecord {
@@ -5210,6 +5228,19 @@ fn gopher_degenerate_selector_sends_only_crlf() {
     command.assert().success().stdout("root\r\n");
 
     assert_eq!(rx.recv().unwrap(), b"\r\n");
+}
+
+#[test]
+fn gopher_ipv6_literal_sends_selector() {
+    let Some((url, rx)) = spawn_gopher_ipv6_server(b"ipv6\r\n") else {
+        return;
+    };
+
+    let mut command = Command::cargo_bin("curl").unwrap();
+    command.args(["-q", "-sS", "-g", &url]);
+    command.assert().success().stdout("ipv6\r\n");
+
+    assert_eq!(rx.recv().unwrap(), b"/resource\r\n");
 }
 
 #[test]
