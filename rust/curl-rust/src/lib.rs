@@ -7,6 +7,7 @@ pub mod transfer;
 pub mod writeout;
 
 mod cookie;
+mod libcurl;
 
 pub use cli::{Config, TransferConfig, parse_args};
 pub use error::{CurlError, ResultExt};
@@ -22,5 +23,11 @@ pub async fn run(config: Config) -> Result<i32, CurlError> {
         return Ok(0);
     }
 
-    transfer::run(config).await
+    let result = transfer::run(config.clone()).await;
+    if let Some(path) = &config.libcurl
+        && let Err(error) = libcurl::write_source(path, &config)
+    {
+        eprintln!("curl: warning: failed to write --libcurl output: {error}");
+    }
+    result
 }

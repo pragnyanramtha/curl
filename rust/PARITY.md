@@ -75,7 +75,7 @@ companion data before this rewrite can be called complete.
 | `--continue-at` | partial | `TransferConfig::continue_at` | `continue_at_fixed_offset_sends_range_and_appends_output`, `continue_at_auto_uses_existing_output_size`, `continue_at_fixed_offset_to_stdout_sends_range`, `continue_at_resumes_file_url_output` | Download resume for HTTP/file output and stdout only; upload resume, HTTP resume response validation, partial-output retry resume, and remote-header filename auto-resume incomplete |
 | `--cookie-jar` | partial | `TransferConfig::cookie_jar` | `cookie_jar_saves_response_cookies`, `cookie_jar_creates_header_only_file_without_cookies`, `cookie_jar_sends_cookie_on_later_url_in_group` | Basic HTTP cookie engine and Netscape jar output only; full `--cookie` file import, PSL/supercookie rejection, exact expiry/order/domain/path parity, and complete redirect-cookie export remain incomplete |
 | `--parallel` | missing | none | parallel tests | |
-| `--libcurl` | missing | none | tool output tests | |
+| `--libcurl` | partial | `Config::libcurl`, `libcurl.rs` | `parses_libcurl_options_as_global_state`, `libcurl_writes_source_file_for_supported_options` | Emits C source for supported HTTP/file URL expansion and common scalar/string/slist options; exact C curl formatting, callbacks, multipart MIME source, protocol-specific options, multi-transfer ordering, and full fixture parity remain incomplete |
 
 ## Build and test parity
 

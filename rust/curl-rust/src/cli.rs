@@ -10,6 +10,7 @@ use crate::error::{CurlError, Result};
 pub struct Config {
     pub show_help: bool,
     pub show_version: bool,
+    pub libcurl: Option<PathBuf>,
     pub transfers: Vec<TransferConfig>,
 }
 
@@ -85,6 +86,7 @@ impl Default for Config {
         Self {
             show_help: false,
             show_version: false,
+            libcurl: None,
             transfers: vec![TransferConfig::default()],
         }
     }
@@ -239,6 +241,10 @@ impl Parser {
             "config" => {
                 let value = self.value_for(name, inline_value)?;
                 self.insert_config_file(&value)?;
+            }
+            "libcurl" => {
+                let value = self.value_for(name, inline_value)?;
+                self.config.libcurl = Some(parse_nonempty_path(name, &value)?);
             }
             "url" => {
                 let value = self.value_for(name, inline_value)?;
@@ -812,6 +818,7 @@ pub fn print_help() {
                --etag-save <file>      Save response ETag to file\n\
            -z, --time-cond <time>      Transfer based on time condition\n\
            -w, --write-out <format>    Write transfer metrics\n\
+               --libcurl <file>        Generate libcurl code\n\
            -X, --request <method>      Specify request method\n\
            -u, --user <user:pass>      Server user and password\n\
            -b, --cookie <data>         Send cookies from string\n\
@@ -1153,6 +1160,48 @@ mod tests {
     fn rejects_empty_cookie_jar_path() {
         let error = parse_args(["-q", "--cookie-jar=", "https://example.com"]).unwrap_err();
         assert!(error.to_string().contains("non-empty"));
+    }
+
+    #[test]
+    fn parses_libcurl_options_as_global_state() {
+        let config = parse_args(["-q", "--libcurl", "client.c", "https://example.com"]).unwrap();
+        assert_eq!(
+            config.libcurl.as_deref(),
+            Some(std::path::Path::new("client.c"))
+        );
+
+        let config = parse_args(["-q", "--libcurl=client.c", "https://example.com"]).unwrap();
+        assert_eq!(
+            config.libcurl.as_deref(),
+            Some(std::path::Path::new("client.c"))
+        );
+    }
+
+    #[test]
+    fn rejects_empty_libcurl_path() {
+        let error = parse_args(["-q", "--libcurl=", "https://example.com"]).unwrap_err();
+        assert!(error.to_string().contains("non-empty"));
+    }
+
+    #[test]
+    fn libcurl_alone_still_requires_a_url() {
+        let error = parse_args(["-q", "--libcurl", "client.c"]).unwrap_err();
+        assert!(error.to_string().contains("no URL specified"));
+    }
+
+    #[test]
+    fn libcurl_does_not_retain_empty_next_group() {
+        let config = parse_args([
+            "-q",
+            "--libcurl",
+            "client.c",
+            "--next",
+            "https://example.com",
+        ])
+        .unwrap();
+
+        assert_eq!(config.transfers.len(), 1);
+        assert_eq!(config.transfers[0].urls, ["https://example.com"]);
     }
 
     #[test]
