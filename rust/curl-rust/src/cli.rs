@@ -35,6 +35,11 @@ pub struct TransferConfig {
     pub write_out: Option<String>,
     pub follow_location: bool,
     pub max_redirs: usize,
+    pub retry: usize,
+    pub retry_all_errors: bool,
+    pub retry_connrefused: bool,
+    pub retry_delay: Duration,
+    pub retry_max_time: Duration,
     pub fail: bool,
     pub fail_with_body: bool,
     pub user: Option<String>,
@@ -100,6 +105,11 @@ impl Default for TransferConfig {
             write_out: None,
             follow_location: false,
             max_redirs: 50,
+            retry: 0,
+            retry_all_errors: false,
+            retry_connrefused: false,
+            retry_delay: Duration::ZERO,
+            retry_max_time: Duration::ZERO,
             fail: false,
             fail_with_body: false,
             user: None,
@@ -332,6 +342,20 @@ impl Parser {
                 let value = self.value_for(name, inline_value)?;
                 self.current().max_redirs = parse_usize(name, &value)?;
             }
+            "retry" => {
+                let value = self.value_for(name, inline_value)?;
+                self.current().retry = parse_usize(name, &value)?;
+            }
+            "retry-all-errors" => self.current().retry_all_errors = true,
+            "retry-connrefused" => self.current().retry_connrefused = true,
+            "retry-delay" => {
+                let value = self.value_for(name, inline_value)?;
+                self.current().retry_delay = parse_retry_delay(name, &value)?;
+            }
+            "retry-max-time" => {
+                let value = self.value_for(name, inline_value)?;
+                self.current().retry_max_time = parse_duration(name, &value)?;
+            }
             "fail" => self.current().fail = true,
             "fail-with-body" => {
                 self.current().fail = true;
@@ -405,6 +429,8 @@ impl Parser {
             "remote-name" => self.current().remote_name = false,
             "remote-header-name" => self.current().remote_header_name = false,
             "location" | "location-trusted" => self.current().follow_location = false,
+            "retry-all-errors" => self.current().retry_all_errors = false,
+            "retry-connrefused" => self.current().retry_connrefused = false,
             "fail" => {
                 self.current().fail = false;
                 self.current().fail_with_body = false;
@@ -629,6 +655,11 @@ impl TransferConfig {
             || self.time_cond.is_some()
             || self.write_out.is_some()
             || self.follow_location
+            || self.retry != 0
+            || self.retry_all_errors
+            || self.retry_connrefused
+            || self.retry_delay != Duration::ZERO
+            || self.retry_max_time != Duration::ZERO
             || self.fail
             || self.fail_with_body
             || self.user.is_some()
@@ -663,12 +694,22 @@ fn parse_duration(name: &str, value: &str) -> Result<Duration> {
     let seconds: f64 = value
         .parse()
         .map_err(|_| CurlError::Usage(format!("option --{name} expects seconds")))?;
-    if seconds.is_sign_negative() {
+    if seconds.is_sign_negative() || !seconds.is_finite() || seconds > u64::MAX as f64 {
         return Err(CurlError::Usage(format!(
             "option --{name} expects a non-negative duration"
         )));
     }
     Ok(Duration::from_secs_f64(seconds))
+}
+
+fn parse_retry_delay(name: &str, value: &str) -> Result<Duration> {
+    let duration = parse_duration(name, value)?;
+    if duration.as_millis() > i32::MAX as u128 {
+        return Err(CurlError::Usage(format!(
+            "option --{name} value is too large"
+        )));
+    }
+    Ok(duration)
 }
 
 pub fn print_help() {
@@ -687,6 +728,9 @@ pub fn print_help() {
            -H, --header <header>       Pass custom header\n\
            -I, --head                  Show document information only\n\
            -L, --location              Follow redirects\n\
+               --retry <num>           Retry transient transfer problems\n\
+               --retry-delay <seconds> Wait time between retries\n\
+               --retry-max-time <sec>  Retry only within this period\n\
            -o, --output <file>         Write output to file\n\
            -O, --remote-name           Write output to remote filename\n\
                --etag-compare <file>   Load ETag from file\n\
@@ -1005,6 +1049,60 @@ mod tests {
         assert_eq!(transfer.proxy.as_deref(), Some("http://proxy.example:8080"));
         assert_eq!(transfer.proxy_user.as_deref(), Some("proxy-user:secret"));
         assert_eq!(transfer.noproxy.as_deref(), Some("example.com"));
+    }
+
+    #[test]
+    fn parses_retry_options() {
+        let config = parse_args([
+            "-q",
+            "--retry",
+            "3",
+            "--retry-all-errors",
+            "--retry-connrefused",
+            "--retry-delay",
+            "0.1",
+            "--retry-max-time",
+            "10",
+            "https://example.com",
+        ])
+        .unwrap();
+
+        let transfer = &config.transfers[0];
+        assert_eq!(transfer.retry, 3);
+        assert!(transfer.retry_all_errors);
+        assert!(transfer.retry_connrefused);
+        assert_eq!(transfer.retry_delay, Duration::from_millis(100));
+        assert_eq!(transfer.retry_max_time, Duration::from_secs(10));
+    }
+
+    #[test]
+    fn no_prefixed_retry_booleans_disable_previous_values() {
+        let config = parse_args([
+            "-q",
+            "--retry-all-errors",
+            "--retry-connrefused",
+            "--no-retry-all-errors",
+            "--no-retry-connrefused",
+            "https://example.com",
+        ])
+        .unwrap();
+
+        let transfer = &config.transfers[0];
+        assert!(!transfer.retry_all_errors);
+        assert!(!transfer.retry_connrefused);
+    }
+
+    #[test]
+    fn rejects_retry_delay_overflow() {
+        let error = parse_args([
+            "-q",
+            "--retry-delay",
+            "9223372036854776",
+            "https://example.com",
+        ])
+        .unwrap_err();
+
+        assert!(error.to_string().contains("too large"));
     }
 
     #[test]

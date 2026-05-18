@@ -1,10 +1,10 @@
 use std::path::Path;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use reqwest::header::{
     ACCEPT, ACCEPT_ENCODING, AUTHORIZATION, CONTENT_LENGTH, CONTENT_TYPE, COOKIE, ETAG, HeaderName,
     HeaderValue, IF_MODIFIED_SINCE, IF_NONE_MATCH, IF_UNMODIFIED_SINCE, LOCATION, RANGE, REFERER,
-    USER_AGENT,
+    RETRY_AFTER, USER_AGENT,
 };
 use reqwest::{Client, Method, StatusCode, Url, Version};
 
@@ -12,6 +12,15 @@ use crate::cli::{Config, HttpVersionPreference, TransferConfig};
 use crate::data::{self, PreparedBody};
 use crate::error::{CurlError, Result, ResultExt};
 use crate::{glob, output, writeout};
+
+struct HttpAttempt {
+    status: StatusCode,
+    version: Version,
+    final_url: Url,
+    headers: reqwest::header::HeaderMap,
+    body: Vec<u8>,
+    retry_after: Option<Duration>,
+}
 
 pub async fn run(config: Config) -> Result<i32> {
     let mut final_code = 0;
@@ -102,7 +111,7 @@ async fn run_expanded_url(
     let result = if expanded.url.starts_with("file://") {
         run_file_transfer(transfer, &expanded, method.as_str(), &mut metrics).await
     } else {
-        run_http_transfer(transfer, client, &expanded, method, &mut metrics).await
+        run_http_with_retries(transfer, client, &expanded, method, &mut metrics, started).await
     };
 
     metrics.time_total = started.elapsed();
@@ -190,7 +199,7 @@ async fn run_http_transfer(
     expanded: &glob::ExpandedUrl,
     method: Method,
     metrics: &mut writeout::Metrics,
-) -> Result<()> {
+) -> Result<HttpAttempt> {
     let prepared_query = data::prepare_body(&transfer.url_query)?;
     let prepared_body = data::prepare_body(&transfer.data)?;
     let multipart = data::prepare_multipart(&transfer.forms)?;
@@ -260,25 +269,86 @@ async fn run_http_transfer(
         }
     }
 
-    let header_bytes = output::render_headers(version, status, &headers);
-    if let Some(path) = &transfer.dump_header {
-        output::dump_headers(path, &header_bytes, transfer.create_dirs)?;
-    }
-    if let Some(path) = &transfer.etag_save {
-        save_etag(path, &headers, transfer.create_dirs)?;
-    }
-
     let body = if method == Method::HEAD {
         Vec::new()
     } else {
         response.bytes().await.transfer_err()?.to_vec()
     };
     metrics.size_download = body.len() as u64;
+    let retry_after = retry_after_delay(&headers);
+
+    Ok(HttpAttempt {
+        status,
+        version,
+        final_url,
+        headers,
+        body,
+        retry_after,
+    })
+}
+
+async fn run_http_with_retries(
+    transfer: &TransferConfig,
+    client: &Client,
+    expanded: &glob::ExpandedUrl,
+    method: Method,
+    metrics: &mut writeout::Metrics,
+    retry_started: Instant,
+) -> Result<()> {
+    loop {
+        reset_attempt_metrics(metrics);
+
+        match run_http_transfer(transfer, client, expanded, method.clone(), metrics).await {
+            Ok(attempt) => {
+                if should_retry_http_attempt(transfer, &attempt)
+                    && schedule_retry(transfer, metrics, retry_started, attempt.retry_after).await
+                {
+                    continue;
+                }
+                return finish_http_transfer(transfer, expanded, method, metrics, attempt);
+            }
+            Err(error) => {
+                if should_retry_transfer_error(transfer, &error)
+                    && schedule_retry(transfer, metrics, retry_started, None).await
+                {
+                    continue;
+                }
+                return Err(error);
+            }
+        }
+    }
+}
+
+fn reset_attempt_metrics(metrics: &mut writeout::Metrics) {
+    metrics.response_code = None;
+    metrics.size_download = 0;
+    metrics.content_type = None;
+    metrics.filename_effective = None;
+    metrics.exit_code = 0;
+    metrics.errormsg.clear();
+    metrics.redirect_url = None;
+    metrics.headers = reqwest::header::HeaderMap::new();
+}
+
+fn finish_http_transfer(
+    transfer: &TransferConfig,
+    expanded: &glob::ExpandedUrl,
+    method: Method,
+    metrics: &mut writeout::Metrics,
+    attempt: HttpAttempt,
+) -> Result<()> {
+    let header_bytes = output::render_headers(attempt.version, attempt.status, &attempt.headers);
+    if let Some(path) = &transfer.dump_header {
+        output::dump_headers(path, &header_bytes, transfer.create_dirs)?;
+    }
+    if let Some(path) = &transfer.etag_save {
+        save_etag(path, &attempt.headers, transfer.create_dirs)?;
+    }
 
     let should_write_body =
-        !transfer.fail || !status.is_client_error() && !status.is_server_error();
-    let should_write_fail_body =
-        transfer.fail_with_body && (status.is_client_error() || status.is_server_error());
+        !transfer.fail || !attempt.status.is_client_error() && !attempt.status.is_server_error();
+    let should_write_fail_body = transfer.fail_with_body
+        && (attempt.status.is_client_error() || attempt.status.is_server_error());
 
     if should_write_body || should_write_fail_body {
         let mut bytes = Vec::new();
@@ -286,20 +356,124 @@ async fn run_http_transfer(
             bytes.extend_from_slice(&header_bytes);
         }
         if method != Method::HEAD {
-            bytes.extend_from_slice(&body);
+            bytes.extend_from_slice(&attempt.body);
         }
-        let filename =
-            output::write_response(transfer, &final_url, &headers, &expanded.variables, &bytes)?;
+        let filename = output::write_response(
+            transfer,
+            &attempt.final_url,
+            &attempt.headers,
+            &expanded.variables,
+            &bytes,
+        )?;
         metrics.filename_effective = filename.map(|path| path.display().to_string());
     }
 
-    if transfer.fail && (status.is_client_error() || status.is_server_error()) {
+    if transfer.fail && (attempt.status.is_client_error() || attempt.status.is_server_error()) {
         return Err(CurlError::HttpStatus {
-            status: status.as_u16(),
+            status: attempt.status.as_u16(),
         });
     }
 
     Ok(())
+}
+
+async fn schedule_retry(
+    transfer: &TransferConfig,
+    metrics: &mut writeout::Metrics,
+    retry_started: Instant,
+    retry_after: Option<Duration>,
+) -> bool {
+    if metrics.num_retries >= transfer.retry {
+        return false;
+    }
+
+    let next_retry = metrics.num_retries + 1;
+    let delay = retry_after.unwrap_or_else(|| retry_delay(transfer, next_retry));
+    if !retry_within_max_time(transfer, retry_started, delay) {
+        return false;
+    }
+
+    metrics.num_retries = next_retry;
+    if delay > Duration::ZERO {
+        tokio::time::sleep(delay).await;
+    }
+    true
+}
+
+fn should_retry_http_attempt(transfer: &TransferConfig, attempt: &HttpAttempt) -> bool {
+    if is_retryable_http_status(attempt.status) {
+        return true;
+    }
+
+    transfer.retry_all_errors
+        && transfer.fail
+        && (attempt.status.is_client_error() || attempt.status.is_server_error())
+}
+
+fn should_retry_transfer_error(transfer: &TransferConfig, error: &CurlError) -> bool {
+    let CurlError::Transfer(message) = error else {
+        return false;
+    };
+
+    if transfer.retry_all_errors {
+        return true;
+    }
+
+    let message = message.to_ascii_lowercase();
+    message.contains("timed out")
+        || message.contains("timeout")
+        || message.contains("resolve")
+        || message.contains("dns")
+        || message.contains("failed to lookup")
+        || (transfer.retry_connrefused
+            && (message.contains("connection refused")
+                || message.contains("os error 111")
+                || message.contains("refused")))
+}
+
+fn is_retryable_http_status(status: StatusCode) -> bool {
+    matches!(
+        status.as_u16(),
+        408 | 429 | 500 | 502 | 503 | 504 | 522 | 524
+    )
+}
+
+fn retry_delay(transfer: &TransferConfig, retry_number: usize) -> Duration {
+    if transfer.retry_delay > Duration::ZERO {
+        return transfer.retry_delay;
+    }
+
+    let exponent = retry_number.saturating_sub(1);
+    Duration::from_secs((1_u64 << exponent.min(10)).min(600))
+}
+
+fn retry_within_max_time(
+    transfer: &TransferConfig,
+    retry_started: Instant,
+    delay: Duration,
+) -> bool {
+    if transfer.retry_max_time == Duration::ZERO {
+        return true;
+    }
+
+    retry_started
+        .elapsed()
+        .checked_add(delay)
+        .is_some_and(|elapsed_after_delay| elapsed_after_delay <= transfer.retry_max_time)
+}
+
+fn retry_after_delay(headers: &reqwest::header::HeaderMap) -> Option<Duration> {
+    let value = headers.get(RETRY_AFTER)?.to_str().ok()?.trim();
+    if let Ok(seconds) = value.parse::<f64>()
+        && seconds.is_finite()
+        && !seconds.is_sign_negative()
+        && seconds <= u64::MAX as f64
+    {
+        return Some(Duration::from_secs_f64(seconds));
+    }
+
+    let retry_at = httpdate::parse_http_date(value).ok()?;
+    retry_at.duration_since(std::time::SystemTime::now()).ok()
 }
 
 fn effective_method(transfer: &TransferConfig) -> Result<Method> {

@@ -71,7 +71,7 @@ companion data before this rewrite can be called complete.
 | `--fail`, `--fail-with-body` | partial | transfer status handling | none | Needs corpus mapping |
 | `--connect-timeout`, `--max-time` | partial | reqwest client builder | none | Needs edge case tests |
 | `--http1.0`, `--http1.1`, `--http2` | partial | reqwest versions | `http2_does_not_force_prior_knowledge` | HTTP/3 missing |
-| `--retry*` | missing | none | retry corpus | |
+| `--retry*` | partial | `TransferConfig::retry` | `retries_transient_http_status_then_succeeds`, `retry_all_errors_retries_failed_http_status` | HTTP transient status retry and basic retry timers only; FTP, upload rewind, partial-output resume, and full error taxonomy missing |
 | `--continue-at` | missing | none | resume tests | |
 | `--cookie-jar` | missing | none | cookie persistence tests | |
 | `--parallel` | missing | none | parallel tests | |

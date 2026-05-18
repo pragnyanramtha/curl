@@ -14,6 +14,7 @@ pub struct Metrics {
     pub exit_code: i32,
     pub errormsg: String,
     pub redirect_url: Option<String>,
+    pub num_retries: usize,
     pub headers: HeaderMap,
 }
 
@@ -30,6 +31,7 @@ impl Metrics {
             exit_code: 0,
             errormsg: String::new(),
             redirect_url: None,
+            num_retries: 0,
             headers: HeaderMap::new(),
         }
     }
@@ -94,6 +96,7 @@ fn variable(name: &str, metrics: &Metrics) -> String {
         "exitcode" => metrics.exit_code.to_string(),
         "errormsg" => metrics.errormsg.clone(),
         "redirect_url" => metrics.redirect_url.clone().unwrap_or_default(),
+        "num_retries" => metrics.num_retries.to_string(),
         "json" => json(metrics),
         "header_json" => header_json(&metrics.headers),
         "stdout" | "stderr" => String::new(),
@@ -103,7 +106,7 @@ fn variable(name: &str, metrics: &Metrics) -> String {
 
 fn json(metrics: &Metrics) -> String {
     format!(
-        "{{\"url_effective\":\"{}\",\"http_code\":{},\"response_code\":{},\"size_download\":{},\"time_total\":{:.6},\"method\":\"{}\",\"exitcode\":{},\"errormsg\":\"{}\"}}",
+        "{{\"url_effective\":\"{}\",\"http_code\":{},\"response_code\":{},\"size_download\":{},\"time_total\":{:.6},\"method\":\"{}\",\"exitcode\":{},\"errormsg\":\"{}\",\"num_retries\":{}}}",
         escape_json(&metrics.url_effective),
         metrics.response_code.unwrap_or(0),
         metrics.response_code.unwrap_or(0),
@@ -111,7 +114,8 @@ fn json(metrics: &Metrics) -> String {
         metrics.time_total.as_secs_f64(),
         escape_json(&metrics.method),
         metrics.exit_code,
-        escape_json(&metrics.errormsg)
+        escape_json(&metrics.errormsg),
+        metrics.num_retries
     )
 }
 
@@ -153,13 +157,14 @@ mod tests {
         let mut metrics = Metrics::empty("https://example.com/", "GET");
         metrics.response_code = Some(200);
         metrics.size_download = 5;
+        metrics.num_retries = 2;
 
         assert_eq!(
             render(
-                "%{url_effective} %{http_code} %{size_download}\\n",
+                "%{url_effective} %{http_code} %{size_download} %{num_retries}\\n",
                 &metrics
             ),
-            "https://example.com/ 200 5\n"
+            "https://example.com/ 200 5 2\n"
         );
     }
 }

@@ -16,65 +16,74 @@ struct RequestRecord {
 }
 
 fn spawn_server(response: &'static [u8]) -> (String, Receiver<RequestRecord>) {
+    spawn_sequence_server(vec![response])
+}
+
+fn spawn_sequence_server(responses: Vec<&'static [u8]>) -> (String, Receiver<RequestRecord>) {
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let addr = listener.local_addr().unwrap();
     let (tx, rx) = mpsc::channel();
 
     thread::spawn(move || {
-        let (mut stream, _) = listener.accept().unwrap();
-        let mut bytes = Vec::new();
-        let mut buffer = [0; 1024];
-
-        loop {
-            let read = stream.read(&mut buffer).unwrap();
-            if read == 0 {
-                break;
-            }
-            bytes.extend_from_slice(&buffer[..read]);
-            if bytes.windows(4).any(|window| window == b"\r\n\r\n") {
-                break;
-            }
+        for response in responses {
+            let (mut stream, _) = listener.accept().unwrap();
+            tx.send(read_request(&mut stream)).unwrap();
+            stream.write_all(response).unwrap();
         }
-
-        let header_end = bytes
-            .windows(4)
-            .position(|window| window == b"\r\n\r\n")
-            .map(|index| index + 4)
-            .unwrap();
-        let header_text = String::from_utf8_lossy(&bytes[..header_end]);
-        let mut lines = header_text.split("\r\n").filter(|line| !line.is_empty());
-        let start_line = lines.next().unwrap_or("").to_string();
-        let headers: Vec<_> = lines
-            .filter_map(|line| {
-                let (name, value) = line.split_once(':')?;
-                Some((name.to_ascii_lowercase(), value.trim().to_string()))
-            })
-            .collect();
-        let content_length = headers
-            .iter()
-            .find(|(name, _)| name == "content-length")
-            .and_then(|(_, value)| value.parse::<usize>().ok())
-            .unwrap_or(0);
-
-        while bytes.len() < header_end + content_length {
-            let read = stream.read(&mut buffer).unwrap();
-            if read == 0 {
-                break;
-            }
-            bytes.extend_from_slice(&buffer[..read]);
-        }
-
-        let body = bytes[header_end..header_end + content_length].to_vec();
-        tx.send(RequestRecord {
-            start_line,
-            headers,
-            body,
-        })
-        .unwrap();
-        stream.write_all(response).unwrap();
     });
 
     (format!("http://{addr}/resource"), rx)
+}
+
+fn read_request(stream: &mut impl Read) -> RequestRecord {
+    let mut bytes = Vec::new();
+    let mut buffer = [0; 1024];
+
+    loop {
+        let read = stream.read(&mut buffer).unwrap();
+        if read == 0 {
+            break;
+        }
+        bytes.extend_from_slice(&buffer[..read]);
+        if bytes.windows(4).any(|window| window == b"\r\n\r\n") {
+            break;
+        }
+    }
+
+    let header_end = bytes
+        .windows(4)
+        .position(|window| window == b"\r\n\r\n")
+        .map(|index| index + 4)
+        .unwrap();
+    let header_text = String::from_utf8_lossy(&bytes[..header_end]);
+    let mut lines = header_text.split("\r\n").filter(|line| !line.is_empty());
+    let start_line = lines.next().unwrap_or("").to_string();
+    let headers: Vec<_> = lines
+        .filter_map(|line| {
+            let (name, value) = line.split_once(':')?;
+            Some((name.to_ascii_lowercase(), value.trim().to_string()))
+        })
+        .collect();
+    let content_length = headers
+        .iter()
+        .find(|(name, _)| name == "content-length")
+        .and_then(|(_, value)| value.parse::<usize>().ok())
+        .unwrap_or(0);
+
+    while bytes.len() < header_end + content_length {
+        let read = stream.read(&mut buffer).unwrap();
+        if read == 0 {
+            break;
+        }
+        bytes.extend_from_slice(&buffer[..read]);
+    }
+
+    let body = bytes[header_end..header_end + content_length].to_vec();
+    RequestRecord {
+        start_line,
+        headers,
+        body,
+    }
 }
 
 fn header<'a>(request: &'a RequestRecord, name: &str) -> Option<&'a str> {
@@ -103,6 +112,92 @@ fn downloads_http_and_renders_writeout() {
             .starts_with("curl-rust/")
     );
     assert_eq!(header(&request, "accept-encoding"), None);
+}
+
+#[test]
+fn retries_transient_http_status_then_succeeds() {
+    let (url, rx) = spawn_sequence_server(vec![
+        b"HTTP/1.1 503 Service Unavailable\r\nContent-Length: 3\r\n\r\nbad",
+        b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok",
+    ]);
+
+    let mut command = Command::cargo_bin("curl").unwrap();
+    command.args([
+        "-q",
+        "-sS",
+        "--retry",
+        "1",
+        "--retry-delay",
+        "0.001",
+        "-w",
+        " %{num_retries}",
+        &url,
+    ]);
+    command.assert().success().stdout("ok 1");
+
+    rx.recv().unwrap();
+    rx.recv().unwrap();
+}
+
+#[test]
+fn retry_all_errors_retries_failed_http_status() {
+    let (url, rx) = spawn_sequence_server(vec![
+        b"HTTP/1.1 404 Not Found\r\nContent-Length: 7\r\n\r\nmissing",
+        b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok",
+    ]);
+
+    let mut command = Command::cargo_bin("curl").unwrap();
+    command.args([
+        "-q",
+        "-sS",
+        "--fail",
+        "--retry",
+        "1",
+        "--retry-all-errors",
+        "--retry-delay",
+        "0.001",
+        &url,
+    ]);
+    command.assert().success().stdout("ok");
+
+    rx.recv().unwrap();
+    rx.recv().unwrap();
+}
+
+#[test]
+fn nontransient_http_status_is_not_retried_without_retry_all_errors() {
+    let (url, rx) = spawn_server(b"HTTP/1.1 404 Not Found\r\nContent-Length: 7\r\n\r\nmissing");
+
+    let mut command = Command::cargo_bin("curl").unwrap();
+    command.args(["-q", "-sS", "--fail", "--retry", "1", &url]);
+    command.assert().failure().code(22).stdout("");
+
+    rx.recv().unwrap();
+    assert!(rx.recv_timeout(Duration::from_millis(100)).is_err());
+}
+
+#[test]
+fn retry_after_respects_retry_max_time() {
+    let (url, rx) = spawn_server(
+        b"HTTP/1.1 503 Service Unavailable\r\nRetry-After: 200\r\nContent-Length: 4\r\n\r\nslow",
+    );
+
+    let mut command = Command::cargo_bin("curl").unwrap();
+    command.args([
+        "-q",
+        "-sS",
+        "--retry",
+        "2",
+        "--retry-max-time",
+        "10",
+        "-w",
+        " %{num_retries}",
+        &url,
+    ]);
+    command.assert().success().stdout("slow 0");
+
+    rx.recv().unwrap();
+    assert!(rx.recv_timeout(Duration::from_millis(100)).is_err());
 }
 
 #[test]
