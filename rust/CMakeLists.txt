@@ -35,14 +35,41 @@ add_custom_command(
 add_custom_target(curl-rust ALL DEPENDS "${_curl_rust_sidecar}")
 
 set(_curl_rust_corpus_tests
+  100
+  102
+  104
   200
   231
+  271
+  283
+  900
+  909
+  912
+  923
+  927
+  928
+  929
+  930
   1016
   1017
   1018
   1019
   1020
+  1190
+  1191
+  1198
+  1199
+  1200
+  1201
+  1202
   1220
+  1224
+  1242
+  1450
+  1452
+  1548
+  1673
+  1714
   2072
 )
 
@@ -68,7 +95,7 @@ if(CURL_BUILD_TESTING AND PERL_EXECUTABLE)
         "\$TFLAGS"
     DEPENDS curl-rust testdeps
     WORKING_DIRECTORY "${PROJECT_BINARY_DIR}/tests"
-    COMMENT "Running curl file:// corpus smoke tests with Rust sidecar"
+    COMMENT "Running curl corpus smoke tests with Rust sidecar"
     VERBATIM USES_TERMINAL
   )
 endif()

@@ -776,6 +776,7 @@ async fn ftp_download_body(
     control_headers: &mut Vec<u8>,
 ) -> Result<Vec<u8>> {
     let (data_host, data_port) = ftp_enter_passive(stream, host, metrics, control_headers).await?;
+    let mut data_stream = connect_tcp(&data_host, data_port, transfer).await?;
     let ascii = transfer.list_only || path.file.is_none();
     ftp_set_type(
         stream,
@@ -798,7 +799,6 @@ async fn ftp_download_body(
         }
     }
 
-    let mut data_stream = connect_tcp(&data_host, data_port, transfer).await?;
     let command = ftp_transfer_command(path, transfer.list_only);
     let response = ftp_command(stream, &command, metrics, control_headers).await?;
     if response.code / 100 != 1 {

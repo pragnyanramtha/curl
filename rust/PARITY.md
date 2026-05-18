@@ -97,5 +97,17 @@ companion data before this rewrite can be called complete.
 | CMake sidecar build | partial | `BUILD_RUST_CURL_EXE=ON`, `curl-rust-test`, `curl-rust-corpus-test` |
 | Autotools sidecar build | partial | `--enable-rust-curl`, `make -C rust rust-test`, `make -C rust rust-corpus-test` |
 | Existing curl Perl suite with C binary | verified for C path | Does not prove Rust parity |
-| Existing curl Perl suite with Rust binary | partial | `curl-rust-corpus-test` maps file:// smoke cases 200, 231, 1016, 1017, 1018, 1019, 1020, 1220, 2072; broader protocol corpus remains required before full parity |
+| Existing curl Perl suite with Rust binary | partial | `curl-rust-corpus-test` maps 36 smoke cases across FILE, FTP, DICT, GOPHER, MQTT, SMTP, TFTP, TELNET, and one HTTP preflight case; broader protocol corpus remains required before full parity |
 | Pytest HTTP suite with Rust binary | missing | Required before full parity |
+
+Current `curl-rust-corpus-test` selection:
+
+- FILE: 200, 231, 1016, 1017, 1018, 1019, 1020, 1220, 2072
+- FTP: 100, 102, 104, 1224
+- DICT: 1450
+- GOPHER: 1200, 1201, 1202
+- HTTP preflight/error path: 1673
+- MQTT: 1190, 1191, 1198, 1199
+- SMTP: 900, 909, 912, 923, 927, 928, 929, 930
+- TFTP: 271, 283, 1242
+- TELNET: 1452, 1548, 1714
