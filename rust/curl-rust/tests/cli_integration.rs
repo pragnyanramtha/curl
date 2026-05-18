@@ -5069,6 +5069,22 @@ fn ipfs_auto_gateway_missing_exits_37() {
 }
 
 #[test]
+fn ipfs_auto_gateway_malformed_file_host_exits_3() {
+    let temp = tempdir().unwrap();
+    let ipfs_dir = temp.path().join(".ipfs");
+    std::fs::create_dir(&ipfs_dir).unwrap();
+    std::fs::write(ipfs_dir.join("gateway"), "http://nonexisting,local:8080\n").unwrap();
+
+    let mut command = Command::cargo_bin("curl").unwrap();
+    command
+        .env_remove("IPFS_GATEWAY")
+        .env_remove("IPFS_PATH")
+        .env("HOME", temp.path())
+        .args(["-q", "-sS", &format!("ipfs://{IPFS_CID}")]);
+    command.assert().failure().code(3).stdout("");
+}
+
+#[test]
 fn ipfs_malformed_explicit_gateway_exits_43() {
     let mut command = Command::cargo_bin("curl").unwrap();
     command.args([
@@ -5076,6 +5092,19 @@ fn ipfs_malformed_explicit_gateway_exits_43() {
         "-sS",
         "--ipfs-gateway",
         "http://",
+        &format!("ipfs://{IPFS_CID}"),
+    ]);
+    command.assert().failure().code(43).stdout("");
+}
+
+#[test]
+fn ipfs_malformed_explicit_gateway_host_exits_43() {
+    let mut command = Command::cargo_bin("curl").unwrap();
+    command.args([
+        "-q",
+        "-sS",
+        "--ipfs-gateway",
+        "http://nonexisting,local:8080",
         &format!("ipfs://{IPFS_CID}"),
     ]);
     command.assert().failure().code(43).stdout("");

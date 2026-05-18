@@ -56,7 +56,9 @@ fn gateway_url(configured_gateway: Option<&str>) -> Result<Url> {
     }
 
     let gateway = detect_gateway()?;
-    Url::parse(&gateway).map_err(|_| malformed_target())
+    let url = Url::parse(&gateway).map_err(|_| malformed_target())?;
+    validate_gateway_host(&url).map_err(|_| malformed_target())?;
+    Ok(url)
 }
 
 fn parse_explicit_gateway(gateway: &str) -> Result<Url> {
@@ -65,9 +67,17 @@ fn parse_explicit_gateway(gateway: &str) -> Result<Url> {
     } else {
         format!("http://{gateway}")
     };
-    Url::parse(&candidate).map_err(|_| {
-        CurlError::BadFunctionArgument("--ipfs-gateway was given a malformed URL".to_string())
-    })
+    let url = Url::parse(&candidate).map_err(|_| malformed_gateway_argument())?;
+    validate_gateway_host(&url).map_err(|_| malformed_gateway_argument())?;
+    Ok(url)
+}
+
+fn validate_gateway_host(url: &Url) -> Result<()> {
+    let host = url.host_str().ok_or_else(malformed_target)?;
+    if host.contains(',') {
+        return Err(malformed_target());
+    }
+    Ok(())
 }
 
 fn detect_gateway() -> Result<String> {
@@ -98,6 +108,10 @@ fn detect_gateway() -> Result<String> {
 
 fn malformed_target() -> CurlError {
     CurlError::Url("malformed target URL".to_string())
+}
+
+fn malformed_gateway_argument() -> CurlError {
+    CurlError::BadFunctionArgument("--ipfs-gateway was given a malformed URL".to_string())
 }
 
 #[cfg(test)]
@@ -134,5 +148,13 @@ mod tests {
             .unwrap_err();
 
         assert_eq!(error.exit_code(), 3);
+    }
+
+    #[test]
+    fn rejects_comma_gateway_hosts() {
+        let error =
+            maybe_rewrite_url("ipfs://bafy", Some("http://nonexisting,local:8080")).unwrap_err();
+
+        assert_eq!(error.exit_code(), 43);
     }
 }
