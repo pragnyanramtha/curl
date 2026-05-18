@@ -13,6 +13,7 @@ pub const PARALLEL_MAX_HOST_DEFAULT: usize = 0;
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Config {
     pub show_help: bool,
+    pub help_category: Option<String>,
     pub show_version: bool,
     pub libcurl: Option<PathBuf>,
     pub parallel: bool,
@@ -112,6 +113,7 @@ impl Default for Config {
     fn default() -> Self {
         Self {
             show_help: false,
+            help_category: None,
             show_version: false,
             libcurl: None,
             parallel: false,
@@ -285,7 +287,10 @@ impl Parser {
         }
 
         match name {
-            "help" => self.config.show_help = true,
+            "help" => {
+                self.config.show_help = true;
+                self.config.help_category = self.optional_help_category(inline_value);
+            }
             "version" => self.config.show_version = true,
             "disable" => {}
             "config" => {
@@ -810,6 +815,16 @@ impl Parser {
         next
     }
 
+    fn optional_help_category(&mut self, inline_value: Option<String>) -> Option<String> {
+        inline_value.or_else(|| {
+            self.args
+                .get(self.pos)
+                .filter(|arg| !arg.starts_with('-'))
+                .cloned()
+                .inspect(|_| self.pos += 1)
+        })
+    }
+
     fn current(&mut self) -> &mut TransferConfig {
         self.config
             .transfers
@@ -1116,7 +1131,82 @@ fn parse_retry_delay(name: &str, value: &str) -> Result<Duration> {
     Ok(duration)
 }
 
-pub fn print_help() {
+pub fn print_help(category: Option<&str>) {
+    if category.is_some_and(is_help_category) {
+        print_common_help();
+    } else if category.is_some() {
+        print_help_categories();
+    } else {
+        print_common_help();
+    }
+}
+
+fn is_help_category(category: &str) -> bool {
+    matches!(
+        category,
+        "auth"
+            | "connection"
+            | "curl"
+            | "deprecated"
+            | "dns"
+            | "file"
+            | "ftp"
+            | "global"
+            | "http"
+            | "imap"
+            | "ldap"
+            | "output"
+            | "pop3"
+            | "post"
+            | "proxy"
+            | "scp"
+            | "sftp"
+            | "smtp"
+            | "ssh"
+            | "telnet"
+            | "tftp"
+            | "timeout"
+            | "tls"
+            | "upload"
+            | "verbose"
+    )
+}
+
+fn print_help_categories() {
+    println!(
+        "{}",
+        concat!(
+            "Unknown category provided, here is a list of all categories:\n\n",
+            " auth        Authentication methods\n",
+            " connection  Manage connections\n",
+            " curl        The command line tool itself\n",
+            " deprecated  Legacy\n",
+            " dns         Names and resolving\n",
+            " file        FILE protocol\n",
+            " ftp         FTP protocol\n",
+            " global      Global options\n",
+            " http        HTTP and HTTPS protocol\n",
+            " imap        IMAP protocol\n",
+            " ldap        LDAP protocol\n",
+            " output      File system output\n",
+            " pop3        POP3 protocol\n",
+            " post        HTTP POST specific\n",
+            " proxy       Options for proxies\n",
+            " scp         SCP protocol\n",
+            " sftp        SFTP protocol\n",
+            " smtp        SMTP protocol\n",
+            " ssh         SSH protocol\n",
+            " telnet      TELNET protocol\n",
+            " tftp        TFTP protocol\n",
+            " timeout     Timeouts and delays\n",
+            " tls         TLS/SSL related\n",
+            " upload      Upload, sending data\n",
+            " verbose     Tracing, logging etc"
+        )
+    );
+}
+
+fn print_common_help() {
     println!(
         "Usage: curl [options...] <url>\n\
          Rust curl rewrite prototype\n\n\
@@ -1644,6 +1734,27 @@ mod tests {
     fn rejects_url_less_option_group() {
         let error = parse_args(["-q", "-d", "x"]).unwrap_err();
         assert!(error.to_string().contains("no URL specified"));
+    }
+
+    #[test]
+    fn parses_optional_help_category() {
+        let config = parse_args(["-q", "--help", "http"]).unwrap();
+        assert!(config.show_help);
+        assert_eq!(config.help_category.as_deref(), Some("http"));
+        assert!(config.transfers.is_empty());
+
+        let config = parse_args(["-q", "--help=ldap"]).unwrap();
+        assert!(config.show_help);
+        assert_eq!(config.help_category.as_deref(), Some("ldap"));
+        assert!(config.transfers.is_empty());
+    }
+
+    #[test]
+    fn help_option_without_category_leaves_following_option() {
+        let config = parse_args(["-q", "--help", "--version"]).unwrap();
+        assert!(config.show_help);
+        assert!(config.show_version);
+        assert_eq!(config.help_category, None);
     }
 
     #[test]

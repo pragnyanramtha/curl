@@ -15,7 +15,7 @@ pub use error::{CurlError, ResultExt};
 
 pub async fn run(config: Config) -> Result<i32, CurlError> {
     if config.show_help {
-        cli::print_help();
+        cli::print_help(config.help_category.as_deref());
         return Ok(0);
     }
 

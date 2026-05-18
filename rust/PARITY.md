@@ -49,6 +49,7 @@ companion data before this rewrite can be called complete.
 
 | Option or behavior | Status | Rust field/parser | Behavior tests | Notes |
 | --- | --- | --- | --- | --- |
+| `--help` | partial | `Config::show_help`, `Config::help_category` | `parses_optional_help_category`, `help_option_without_category_leaves_following_option`, `help_unknown_category_lists_categories`, curl corpus 1462 | Generic help and unknown-category category listing are covered; category-specific option help, exact full option text, markdown generation parity, and full help corpus mapping remain incomplete |
 | `--config`, default `.curlrc`, `-q` | partial | `cli.rs::insert_config_file` | `tokenizes_curl_config_lines` | Limited tokenizer and recursion handling |
 | `--next` | partial | `TransferConfig` groups | `splits_transfer_groups_on_next` | Needs full option reset audit |
 | `--no-*` boolean negation | partial | `cli.rs::parse_no_long` | `no_prefixed_boolean_options_disable_previous_values` | Only supported booleans are recognized |
@@ -100,7 +101,7 @@ companion data before this rewrite can be called complete.
 | CMake sidecar build | partial | `BUILD_RUST_CURL_EXE=ON`, `curl-rust-test`, `curl-rust-corpus-test` |
 | Autotools sidecar build | partial | `--enable-rust-curl`, `make -C rust rust-test`, `make -C rust rust-corpus-test` |
 | Existing curl Perl suite with C binary | verified for C path | Does not prove Rust parity |
-| Existing curl Perl suite with Rust binary | partial | `curl-rust-corpus-test` maps 110 smoke cases across FILE, FTP, DICT, GOPHER, HTTP, IPFS/IPNS, IMAP, MQTT, POP3, SCP/SFTP, SMTP, TFTP, TELNET, and URL/HTTP preflight/error cases; broader protocol corpus remains required before full parity |
+| Existing curl Perl suite with Rust binary | partial | `curl-rust-corpus-test` maps 111 smoke cases across FILE, FTP, DICT, GOPHER, HTTP, IPFS/IPNS, IMAP, MQTT, POP3, SCP/SFTP, SMTP, TFTP, TELNET, CLI help, and URL/HTTP preflight/error cases; broader protocol corpus remains required before full parity |
 | Pytest HTTP suite with Rust binary | missing | Required before full parity |
 
 Current `curl-rust-corpus-test` selection:
@@ -111,6 +112,7 @@ Current `curl-rust-corpus-test` selection:
 - IMAP: 800, 801, 802, 803, 806, 807, 808, 809, 810, 811, 812, 813, 814, 817, 818, 829, 846, 847, 1847, 1848, 3206
 - DICT: 1450
 - GOPHER: 1200, 1201, 1202
+- CLI/help: 1462
 - URL/HTTP preflight/error paths: 23, 419, 426, 1673
 - IPFS/IPNS: 723, 725, 726, 738, 739, 741
 - MQTT: 1190, 1191, 1198, 1199

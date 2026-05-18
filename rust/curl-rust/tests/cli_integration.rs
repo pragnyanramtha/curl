@@ -2337,6 +2337,21 @@ fn version_lists_dict_protocol() {
 }
 
 #[test]
+fn help_unknown_category_lists_categories() {
+    let mut command = Command::cargo_bin("curl").unwrap();
+    let output = command
+        .args(["-q", "--help", "sdfafdsfadsfsd"])
+        .output()
+        .unwrap();
+
+    assert!(output.status.success());
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    assert!(stdout.starts_with("Unknown category provided"));
+    assert!(stdout.contains("\n ldap        LDAP protocol\n"));
+    assert!(!stdout.contains("Usage: curl"));
+}
+
+#[test]
 fn ftp_retr_downloads_file_and_sends_default_sequence() {
     let (url, rx) = spawn_ftp_server("/path/file.txt", ftp_options(b"hello from ftp"));
 
