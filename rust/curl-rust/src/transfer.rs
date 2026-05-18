@@ -1,7 +1,7 @@
 use std::io::{self, Read};
 use std::path::Path;
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use percent_encoding::percent_decode;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -9,9 +9,9 @@ use tokio::net::{TcpStream, UdpSocket};
 use tokio::task::JoinSet;
 
 use reqwest::header::{
-    ACCEPT, ACCEPT_ENCODING, AUTHORIZATION, CONTENT_LENGTH, CONTENT_TYPE, COOKIE, ETAG, HeaderName,
-    HeaderValue, IF_MODIFIED_SINCE, IF_NONE_MATCH, IF_UNMODIFIED_SINCE, LOCATION, RANGE, REFERER,
-    RETRY_AFTER, USER_AGENT,
+    ACCEPT, ACCEPT_ENCODING, ACCEPT_RANGES, AUTHORIZATION, CONTENT_LENGTH, CONTENT_TYPE, COOKIE,
+    ETAG, HeaderName, HeaderValue, IF_MODIFIED_SINCE, IF_NONE_MATCH, IF_UNMODIFIED_SINCE,
+    LAST_MODIFIED, LOCATION, RANGE, REFERER, RETRY_AFTER, USER_AGENT,
 };
 use reqwest::{Client, Method, StatusCode, Url, Version};
 
@@ -30,6 +30,7 @@ const TELNET_SB: u8 = 250;
 const TELNET_SE: u8 = 240;
 const TFTP_DEFAULT_BLKSIZE: u16 = 512;
 const TFTP_MAX_PACKET_SIZE: usize = 65_468;
+const FTP_DEFAULT_PORT: u16 = 21;
 const IMAP_DEFAULT_PORT: u16 = 143;
 const MQTT_DEFAULT_PORT: u16 = 1883;
 const RTSP_DEFAULT_PORT: u16 = 554;
@@ -282,6 +283,12 @@ async fn run_expanded_url(
         run_file_transfer(transfer, &expanded, &method_label, &mut metrics).await
     } else if expanded.url.starts_with("dict://") {
         run_dict_transfer(transfer, &expanded, &method_label, &mut metrics).await
+    } else if expanded.url.starts_with("ftp://") {
+        run_ftp_transfer(transfer, &expanded, &method_label, &mut metrics).await
+    } else if expanded.url.starts_with("ftps://") {
+        Err(CurlError::Unsupported(
+            "ftps:// URLs are not implemented in the Rust sidecar".to_string(),
+        ))
     } else if expanded.url.starts_with("gopher://") {
         run_gopher_transfer(transfer, &expanded, &method_label, &mut metrics).await
     } else if expanded.url.starts_with("gophers://") {
@@ -485,6 +492,613 @@ async fn run_dict_transfer(
         return Err(CurlError::FileSizeExceeded);
     }
     Ok(())
+}
+
+async fn run_ftp_transfer(
+    transfer: &TransferConfig,
+    expanded: &glob::ExpandedUrl,
+    method: &str,
+    metrics: &mut writeout::Metrics,
+) -> Result<()> {
+    if transfer.method.is_some() {
+        return Err(CurlError::Unsupported(
+            "custom FTP requests in the Rust sidecar".to_string(),
+        ));
+    }
+    if method != "GET" && method != "HEAD" {
+        return Err(CurlError::Unsupported(format!(
+            "{method} requests for ftp:// URLs"
+        )));
+    }
+    if !transfer.data.is_empty() || !transfer.url_query.is_empty() || !transfer.forms.is_empty() {
+        return Err(CurlError::Unsupported(
+            "data/form/query request bodies for ftp:// URLs".to_string(),
+        ));
+    }
+    reject_upload_file_for_scheme(transfer, "ftp://")?;
+    if transfer.oauth2_bearer.is_some() {
+        return Err(CurlError::Unsupported(
+            "--oauth2-bearer for ftp:// URLs".to_string(),
+        ));
+    }
+    if transfer.range.is_some() || transfer.continue_at.is_some() {
+        return Err(CurlError::Unsupported(
+            "FTP range/resume in the Rust sidecar".to_string(),
+        ));
+    }
+
+    if let Some(timeout) = transfer.max_time {
+        tokio::time::timeout(
+            timeout,
+            run_ftp_exchange(transfer, expanded, method, metrics),
+        )
+        .await
+        .map_err(|_| CurlError::Timeout)?
+    } else {
+        run_ftp_exchange(transfer, expanded, method, metrics).await
+    }
+}
+
+async fn run_ftp_exchange(
+    transfer: &TransferConfig,
+    expanded: &glob::ExpandedUrl,
+    method: &str,
+    metrics: &mut writeout::Metrics,
+) -> Result<()> {
+    let url = Url::parse(&expanded.url).map_err(|error| CurlError::Url(error.to_string()))?;
+    output::validate_output_target(transfer, &url)?;
+    let host = url
+        .host_str()
+        .ok_or_else(|| CurlError::Url("FTP URL is missing a host".to_string()))?;
+    let port = url.port().unwrap_or(FTP_DEFAULT_PORT);
+    let path = ftp_path(&url)?;
+    let (user, password) = ftp_credentials(transfer, &url)?;
+
+    let mut stream = connect_tcp(host, port, transfer).await?;
+    let mut control_headers = Vec::new();
+    let greeting = ftp_read_response(&mut stream, metrics, &mut control_headers).await?;
+    ftp_require_positive(&greeting, CurlError::WeirdServerReply)?;
+
+    let mut user_command = Vec::from(&b"USER "[..]);
+    user_command.extend_from_slice(&user);
+    let response = ftp_command(&mut stream, &user_command, metrics, &mut control_headers).await?;
+    match response.code {
+        230 => {}
+        331 => {
+            let mut pass_command = Vec::from(&b"PASS "[..]);
+            pass_command.extend_from_slice(&password);
+            let response =
+                ftp_command(&mut stream, &pass_command, metrics, &mut control_headers).await?;
+            if response.code != 230 {
+                return Err(CurlError::LoginDenied);
+            }
+        }
+        _ => return Err(CurlError::LoginDenied),
+    }
+
+    let response = ftp_command(&mut stream, b"PWD", metrics, &mut control_headers).await?;
+    ftp_require_positive(&response, CurlError::WeirdServerReply)?;
+
+    for directory in &path.directories {
+        let mut command = Vec::from(&b"CWD "[..]);
+        command.extend_from_slice(directory);
+        let response = ftp_command(&mut stream, &command, metrics, &mut control_headers).await?;
+        ftp_require_positive(&response, CurlError::RemoteAccessDenied)?;
+    }
+
+    let mut synthetic_headers = reqwest::header::HeaderMap::new();
+    let mut body = Vec::new();
+    let transfer_result = if method == "HEAD" || transfer.head {
+        ftp_head_file(
+            &mut stream,
+            &path,
+            metrics,
+            &mut control_headers,
+            &mut synthetic_headers,
+        )
+        .await
+    } else {
+        match ftp_download_body(
+            transfer,
+            &mut stream,
+            host,
+            &path,
+            metrics,
+            &mut control_headers,
+        )
+        .await
+        {
+            Ok(downloaded) => {
+                body = downloaded;
+                Ok(())
+            }
+            Err(error) => Err(error),
+        }
+    };
+
+    let response_code_before_quit = metrics.response_code;
+    let _ = ftp_command(&mut stream, b"QUIT", metrics, &mut control_headers).await;
+    metrics.response_code = response_code_before_quit;
+
+    if let Some(path) = &transfer.dump_header {
+        output::dump_headers(path, &control_headers, transfer.create_dirs)?;
+    }
+
+    transfer_result?;
+
+    metrics.url_effective = url.to_string();
+    if method == "HEAD" || transfer.head {
+        metrics.headers = synthetic_headers.clone();
+        let header_bytes = if synthetic_headers.is_empty() {
+            Vec::new()
+        } else {
+            output::render_file_headers(&synthetic_headers)
+        };
+        let filename = output::write_response(
+            transfer,
+            &url,
+            &synthetic_headers,
+            &expanded.variables,
+            &header_bytes,
+            false,
+        )?;
+        metrics.filename_effective = filename.map(|path| path.display().to_string());
+        metrics.size_download = 0;
+        return Ok(());
+    }
+
+    let (body_bytes, max_filesize_exceeded) = limit_body_for_max_filesize(transfer, &body);
+    metrics.size_download = body_bytes.len() as u64;
+    let filename = output::write_response(
+        transfer,
+        &url,
+        &reqwest::header::HeaderMap::new(),
+        &expanded.variables,
+        body_bytes,
+        false,
+    )?;
+    metrics.filename_effective = filename.map(|path| path.display().to_string());
+    if max_filesize_exceeded {
+        return Err(CurlError::FileSizeExceeded);
+    }
+    Ok(())
+}
+
+struct FtpPath {
+    directories: Vec<Vec<u8>>,
+    file: Option<Vec<u8>>,
+}
+
+struct FtpResponse {
+    code: u16,
+    lines: Vec<Vec<u8>>,
+}
+
+async fn ftp_head_file(
+    stream: &mut TcpStream,
+    path: &FtpPath,
+    metrics: &mut writeout::Metrics,
+    control_headers: &mut Vec<u8>,
+    synthetic_headers: &mut reqwest::header::HeaderMap,
+) -> Result<()> {
+    let Some(file) = &path.file else {
+        return Ok(());
+    };
+
+    let mut mdtm = Vec::from(&b"MDTM "[..]);
+    mdtm.extend_from_slice(file);
+    let response = ftp_command(stream, &mdtm, metrics, control_headers).await?;
+    if response.code == 213
+        && let Some(modified) = ftp_mdtm_time(&response)
+        && let Ok(value) = HeaderValue::from_str(&httpdate::fmt_http_date(modified))
+    {
+        synthetic_headers.insert(LAST_MODIFIED, value);
+    }
+
+    ftp_set_type(stream, b'I', metrics, control_headers).await?;
+
+    let mut size_command = Vec::from(&b"SIZE "[..]);
+    size_command.extend_from_slice(file);
+    let response = ftp_command(stream, &size_command, metrics, control_headers).await?;
+    if response.code == 213
+        && let Some(size) = ftp_size_value(&response)
+        && let Ok(value) = HeaderValue::from_str(&size.to_string())
+    {
+        synthetic_headers.insert(CONTENT_LENGTH, value);
+    }
+
+    let response = ftp_command(stream, b"REST 0", metrics, control_headers).await?;
+    ftp_require_code(&response, &[350], CurlError::FtpCouldntRetrFile)?;
+    synthetic_headers.insert(ACCEPT_RANGES, HeaderValue::from_static("bytes"));
+    Ok(())
+}
+
+async fn ftp_download_body(
+    transfer: &TransferConfig,
+    stream: &mut TcpStream,
+    host: &str,
+    path: &FtpPath,
+    metrics: &mut writeout::Metrics,
+    control_headers: &mut Vec<u8>,
+) -> Result<Vec<u8>> {
+    let (data_host, data_port) = ftp_enter_passive(stream, host, metrics, control_headers).await?;
+    let ascii = transfer.list_only || path.file.is_none();
+    ftp_set_type(
+        stream,
+        if ascii { b'A' } else { b'I' },
+        metrics,
+        control_headers,
+    )
+    .await?;
+
+    if let Some(file) = path.file.as_ref().filter(|_| !transfer.list_only) {
+        let mut size_command = Vec::from(&b"SIZE "[..]);
+        size_command.extend_from_slice(file);
+        let response = ftp_command(stream, &size_command, metrics, control_headers).await?;
+        if response.code == 213
+            && let (Some(max), Some(size)) = (transfer.max_filesize, ftp_size_value(&response))
+            && max > 0
+            && size > max
+        {
+            return Err(CurlError::FileSizeExceeded);
+        }
+    }
+
+    let mut data_stream = connect_tcp(&data_host, data_port, transfer).await?;
+    let command = ftp_transfer_command(path, transfer.list_only);
+    let response = ftp_command(stream, &command, metrics, control_headers).await?;
+    if response.code / 100 != 1 {
+        return if command.starts_with(b"RETR ") && response.code == 550 {
+            Err(CurlError::RemoteFileNotFound)
+        } else {
+            Err(CurlError::FtpCouldntRetrFile)
+        };
+    }
+
+    let mut body = Vec::new();
+    data_stream
+        .read_to_end(&mut body)
+        .await
+        .map_err(tcp_io_error)?;
+    let response = ftp_read_response(stream, metrics, control_headers).await?;
+    ftp_require_positive(&response, CurlError::FtpCouldntRetrFile)?;
+    Ok(body)
+}
+
+async fn ftp_enter_passive(
+    stream: &mut TcpStream,
+    host: &str,
+    metrics: &mut writeout::Metrics,
+    control_headers: &mut Vec<u8>,
+) -> Result<(String, u16)> {
+    let response = ftp_command(stream, b"EPSV", metrics, control_headers).await?;
+    if response.code == 229 {
+        let port = ftp_epsv_port(&response)?;
+        return Ok((host.to_string(), port));
+    }
+
+    let response = ftp_command(stream, b"PASV", metrics, control_headers).await?;
+    if response.code != 227 {
+        return Err(CurlError::FtpWeirdPasvReply);
+    }
+    ftp_pasv_addr(&response)
+}
+
+async fn ftp_set_type(
+    stream: &mut TcpStream,
+    mode: u8,
+    metrics: &mut writeout::Metrics,
+    control_headers: &mut Vec<u8>,
+) -> Result<()> {
+    let command = [b'T', b'Y', b'P', b'E', b' ', mode];
+    let response = ftp_command(stream, &command, metrics, control_headers).await?;
+    ftp_require_positive(&response, CurlError::FtpCouldntSetType)
+}
+
+fn ftp_transfer_command(path: &FtpPath, list_only: bool) -> Vec<u8> {
+    if list_only {
+        Vec::from(&b"NLST"[..])
+    } else if let Some(file) = &path.file {
+        let mut command = Vec::from(&b"RETR "[..]);
+        command.extend_from_slice(file);
+        command
+    } else {
+        Vec::from(&b"LIST"[..])
+    }
+}
+
+async fn ftp_command(
+    stream: &mut TcpStream,
+    command: &[u8],
+    metrics: &mut writeout::Metrics,
+    control_headers: &mut Vec<u8>,
+) -> Result<FtpResponse> {
+    ftp_send_line(stream, command).await?;
+    ftp_read_response(stream, metrics, control_headers).await
+}
+
+async fn ftp_send_line(stream: &mut TcpStream, line: &[u8]) -> Result<()> {
+    stream.write_all(line).await.map_err(tcp_io_error)?;
+    stream.write_all(b"\r\n").await.map_err(tcp_io_error)
+}
+
+async fn ftp_read_response(
+    stream: &mut TcpStream,
+    metrics: &mut writeout::Metrics,
+    control_headers: &mut Vec<u8>,
+) -> Result<FtpResponse> {
+    let first = ftp_read_line(stream).await?;
+    let code = ftp_response_code(&first)?;
+    let continued = first.get(3) == Some(&b'-');
+    control_headers.extend_from_slice(&first);
+    let mut lines = vec![first];
+
+    if continued {
+        loop {
+            let line = ftp_read_line(stream).await?;
+            let done = line.starts_with(format!("{code:03} ").as_bytes());
+            control_headers.extend_from_slice(&line);
+            lines.push(line);
+            if done {
+                break;
+            }
+        }
+    }
+
+    metrics.response_code = Some(code);
+    Ok(FtpResponse { code, lines })
+}
+
+async fn ftp_read_line(stream: &mut TcpStream) -> Result<Vec<u8>> {
+    let mut line = Vec::new();
+    let mut byte = [0; 1];
+    loop {
+        let read = stream.read(&mut byte).await.map_err(tcp_io_error)?;
+        if read == 0 {
+            if line.is_empty() {
+                return Err(CurlError::WeirdServerReply);
+            }
+            break;
+        }
+        line.push(byte[0]);
+        if byte[0] == b'\n' {
+            break;
+        }
+    }
+    Ok(line)
+}
+
+fn ftp_response_code(line: &[u8]) -> Result<u16> {
+    if line.len() < 3 || !line[..3].iter().all(u8::is_ascii_digit) {
+        return Err(CurlError::WeirdServerReply);
+    }
+    Ok(
+        u16::from(line[0] - b'0') * 100
+            + u16::from(line[1] - b'0') * 10
+            + u16::from(line[2] - b'0'),
+    )
+}
+
+fn ftp_require_positive(response: &FtpResponse, error: CurlError) -> Result<()> {
+    if response.code / 100 == 2 {
+        Ok(())
+    } else {
+        Err(error)
+    }
+}
+
+fn ftp_require_code(response: &FtpResponse, expected: &[u16], error: CurlError) -> Result<()> {
+    if expected.contains(&response.code) {
+        Ok(())
+    } else {
+        Err(error)
+    }
+}
+
+fn ftp_epsv_port(response: &FtpResponse) -> Result<u16> {
+    for line in &response.lines {
+        if let Some(open) = line.iter().position(|byte| *byte == b'(') {
+            let payload = &line[open + 1..];
+            if payload.len() < 5 {
+                continue;
+            }
+            let sep = payload[0];
+            if payload.get(1) != Some(&sep) || payload.get(2) != Some(&sep) {
+                continue;
+            }
+            let mut index = 3;
+            let start = index;
+            while payload.get(index).is_some_and(u8::is_ascii_digit) {
+                index += 1;
+            }
+            if index == start || payload.get(index) != Some(&sep) {
+                continue;
+            }
+            let port = std::str::from_utf8(&payload[start..index])
+                .ok()
+                .and_then(|value| value.parse::<u16>().ok())
+                .ok_or(CurlError::FtpWeirdPasvReply)?;
+            return Ok(port);
+        }
+    }
+    Err(CurlError::FtpWeirdPasvReply)
+}
+
+fn ftp_pasv_addr(response: &FtpResponse) -> Result<(String, u16)> {
+    for line in &response.lines {
+        for start in 0..line.len() {
+            if !line[start].is_ascii_digit() {
+                continue;
+            }
+            if let Some(numbers) = ftp_parse_pasv_numbers(&line[start..]) {
+                let host = format!(
+                    "{}.{}.{}.{}",
+                    numbers[0], numbers[1], numbers[2], numbers[3]
+                );
+                let port = u16::from(numbers[4]) * 256 + u16::from(numbers[5]);
+                return Ok((host, port));
+            }
+        }
+    }
+    Err(CurlError::FtpWeirdPasvReply)
+}
+
+fn ftp_parse_pasv_numbers(bytes: &[u8]) -> Option<[u8; 6]> {
+    let mut numbers = [0_u8; 6];
+    let mut index = 0;
+    for (slot, number) in numbers.iter_mut().enumerate() {
+        let start = index;
+        let mut value = 0_u16;
+        while bytes.get(index).is_some_and(u8::is_ascii_digit) {
+            value = value
+                .checked_mul(10)?
+                .checked_add(u16::from(bytes[index] - b'0'))?;
+            if value > u16::from(u8::MAX) {
+                return None;
+            }
+            index += 1;
+        }
+        if index == start {
+            return None;
+        }
+        *number = value as u8;
+        if slot < 5 {
+            if bytes.get(index) != Some(&b',') {
+                return None;
+            }
+            index += 1;
+        }
+    }
+    Some(numbers)
+}
+
+fn ftp_path(url: &Url) -> Result<FtpPath> {
+    let encoded = url.path().strip_prefix('/').unwrap_or(url.path());
+    let decoded = percent_decode(encoded.as_bytes()).collect::<Vec<_>>();
+    if has_control_byte(&decoded) {
+        return Err(CurlError::Url(
+            "FTP path contains a decoded control byte".to_string(),
+        ));
+    }
+
+    let (directory_bytes, file) = if decoded.is_empty() || decoded.ends_with(b"/") {
+        let directory = decoded.strip_suffix(b"/").unwrap_or(&decoded);
+        (directory, None)
+    } else if let Some(slash) = decoded.iter().rposition(|byte| *byte == b'/') {
+        let file = decoded[slash + 1..].to_vec();
+        let directory = if slash == 0 && decoded.starts_with(b"/") {
+            &decoded[..1]
+        } else {
+            &decoded[..slash]
+        };
+        (directory, Some(file))
+    } else {
+        (&[][..], Some(decoded.clone()))
+    };
+
+    Ok(FtpPath {
+        directories: ftp_directory_components(directory_bytes),
+        file,
+    })
+}
+
+fn ftp_directory_components(path: &[u8]) -> Vec<Vec<u8>> {
+    if path.is_empty() {
+        return Vec::new();
+    }
+
+    let mut components = Vec::new();
+    let mut rest = path;
+    if rest.starts_with(b"/") {
+        components.push(Vec::from(&b"/"[..]));
+        rest = &rest[1..];
+    }
+
+    for component in rest.split(|byte| *byte == b'/') {
+        if !component.is_empty() {
+            components.push(component.to_vec());
+        }
+    }
+    components
+}
+
+fn ftp_credentials(transfer: &TransferConfig, url: &Url) -> Result<(Vec<u8>, Vec<u8>)> {
+    if let Some(user) = &transfer.user {
+        let (login, password) = split_user_password(user);
+        let login = login.as_bytes().to_vec();
+        let password = password.as_bytes().to_vec();
+        if has_control_byte(&login) || has_control_byte(&password) {
+            return Err(CurlError::Url(
+                "FTP credentials contain a decoded control byte".to_string(),
+            ));
+        }
+        return Ok((login, password));
+    }
+
+    if !url.username().is_empty() || url.password().is_some() {
+        let login = percent_decode(url.username().as_bytes()).collect::<Vec<_>>();
+        let password = url
+            .password()
+            .map(|password| percent_decode(password.as_bytes()).collect::<Vec<_>>())
+            .unwrap_or_default();
+        if has_control_byte(&login) || has_control_byte(&password) {
+            return Err(CurlError::Url(
+                "FTP credentials contain a decoded control byte".to_string(),
+            ));
+        }
+        return Ok((login, password));
+    }
+
+    Ok((b"anonymous".to_vec(), b"ftp@example.com".to_vec()))
+}
+
+fn ftp_size_value(response: &FtpResponse) -> Option<u64> {
+    let line = response.lines.first()?;
+    let text = std::str::from_utf8(line).ok()?;
+    text.get(4..)?.trim().parse::<u64>().ok()
+}
+
+fn ftp_mdtm_time(response: &FtpResponse) -> Option<SystemTime> {
+    let line = response.lines.first()?;
+    let text = std::str::from_utf8(line).ok()?;
+    let timestamp = text.get(4..)?.trim();
+    if timestamp.len() < 14 {
+        return None;
+    }
+    let year = timestamp.get(0..4)?.parse::<i32>().ok()?;
+    let month = timestamp.get(4..6)?.parse::<u32>().ok()?;
+    let day = timestamp.get(6..8)?.parse::<u32>().ok()?;
+    let hour = timestamp.get(8..10)?.parse::<u32>().ok()?;
+    let minute = timestamp.get(10..12)?.parse::<u32>().ok()?;
+    let second = timestamp.get(12..14)?.parse::<u32>().ok()?;
+    if !(1..=12).contains(&month)
+        || !(1..=31).contains(&day)
+        || hour > 23
+        || minute > 59
+        || second > 60
+    {
+        return None;
+    }
+    let days = days_from_civil(year, month, day);
+    let seconds = days
+        .checked_mul(86_400)?
+        .checked_add(i64::from(hour) * 3_600)?
+        .checked_add(i64::from(minute) * 60)?
+        .checked_add(i64::from(second))?;
+    if seconds < 0 {
+        return None;
+    }
+    Some(UNIX_EPOCH + Duration::from_secs(seconds as u64))
+}
+
+fn days_from_civil(year: i32, month: u32, day: u32) -> i64 {
+    let year = year - i32::from(month <= 2);
+    let era = if year >= 0 { year } else { year - 399 } / 400;
+    let yoe = year - era * 400;
+    let month = month as i32;
+    let doy = (153 * (month + if month > 2 { -3 } else { 9 }) + 2) / 5 + day as i32 - 1;
+    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+    i64::from(era * 146_097 + doe - 719_468)
 }
 
 async fn run_pop3_transfer(

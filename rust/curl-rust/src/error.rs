@@ -18,6 +18,12 @@ pub enum CurlError {
     Transfer(String),
     #[error("weird server reply")]
     WeirdServerReply,
+    #[error("FTP weird PASV reply")]
+    FtpWeirdPasvReply,
+    #[error("FTP could not set transfer type")]
+    FtpCouldntSetType,
+    #[error("FTP could not retrieve file")]
+    FtpCouldntRetrFile,
     #[error("remote access denied")]
     RemoteAccessDenied,
     #[error("quote command failed")]
@@ -66,6 +72,9 @@ impl CurlError {
             Self::Transfer(_) => 7,
             Self::WeirdServerReply => 8,
             Self::RemoteAccessDenied => 9,
+            Self::FtpWeirdPasvReply => 13,
+            Self::FtpCouldntSetType => 17,
+            Self::FtpCouldntRetrFile => 19,
             Self::QuoteError => 21,
             Self::TooManyRedirects { .. } => 47,
             Self::HttpStatus { .. } => 22,

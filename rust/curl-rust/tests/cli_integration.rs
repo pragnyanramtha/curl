@@ -60,6 +60,25 @@ struct TftpUploadRecord {
 }
 
 #[derive(Debug)]
+struct FtpRecord {
+    commands: Vec<u8>,
+    data_connections: usize,
+}
+
+#[derive(Debug)]
+struct FtpServerOptions {
+    data: Vec<u8>,
+    epsv_fails: bool,
+    pasv_denied: bool,
+    login_denied: bool,
+    cwd_denied: bool,
+    type_denied: bool,
+    retr_denied: bool,
+    size: Option<u64>,
+    mdtm: Option<&'static str>,
+}
+
+#[derive(Debug)]
 struct MqttRecord {
     connect: Vec<u8>,
     subscribe: Option<Vec<u8>>,
@@ -125,6 +144,149 @@ fn spawn_dict_server(response: &'static [u8]) -> (String, Receiver<Vec<u8>>) {
     });
 
     (format!("dict://{addr}/d:basic"), rx)
+}
+
+fn ftp_options(data: impl Into<Vec<u8>>) -> FtpServerOptions {
+    let data = data.into();
+    let size = Some(data.len() as u64);
+    FtpServerOptions {
+        data,
+        epsv_fails: false,
+        pasv_denied: false,
+        login_denied: false,
+        cwd_denied: false,
+        type_denied: false,
+        retr_denied: false,
+        size,
+        mdtm: Some("20030409102659"),
+    }
+}
+
+fn spawn_ftp_server(path: &str, options: FtpServerOptions) -> (String, Receiver<FtpRecord>) {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = listener.local_addr().unwrap();
+    let (tx, rx) = mpsc::channel();
+
+    thread::spawn(move || {
+        let (mut stream, _) = listener.accept().unwrap();
+        stream.write_all(b"220 curl FTP test server\r\n").unwrap();
+
+        let mut commands = Vec::new();
+        let mut data_connections = 0_usize;
+        let mut passive_listener: Option<TcpListener> = None;
+
+        while let Some(line) = read_pop3_client_line(&mut stream) {
+            commands.extend_from_slice(&line);
+            let command = String::from_utf8_lossy(&line);
+            let command = command.trim_end_matches(['\r', '\n']);
+
+            if command.starts_with("USER ") {
+                if options.login_denied {
+                    stream.write_all(b"530 Login incorrect\r\n").unwrap();
+                    break;
+                }
+                stream.write_all(b"331 Password required\r\n").unwrap();
+            } else if command.starts_with("PASS ") {
+                stream.write_all(b"230 Login successful\r\n").unwrap();
+            } else if command == "PWD" {
+                stream
+                    .write_all(b"257 \"/\" is the current directory\r\n")
+                    .unwrap();
+            } else if command.starts_with("CWD ") {
+                if options.cwd_denied {
+                    stream
+                        .write_all(b"550 Failed to change directory\r\n")
+                        .unwrap();
+                    continue;
+                }
+                stream.write_all(b"250 Directory changed\r\n").unwrap();
+            } else if command == "EPSV" {
+                if options.epsv_fails {
+                    stream.write_all(b"500 EPSV unsupported\r\n").unwrap();
+                } else {
+                    let (listener, port) = ftp_passive_listener();
+                    passive_listener = Some(listener);
+                    stream
+                        .write_all(
+                            format!("229 Entering Extended Passive Mode (|||{port}|)\r\n")
+                                .as_bytes(),
+                        )
+                        .unwrap();
+                }
+            } else if command == "PASV" {
+                if options.pasv_denied {
+                    stream.write_all(b"500 PASV unsupported\r\n").unwrap();
+                    continue;
+                }
+                let (listener, port) = ftp_passive_listener();
+                passive_listener = Some(listener);
+                let p1 = port / 256;
+                let p2 = port % 256;
+                stream
+                    .write_all(
+                        format!("227 Entering Passive Mode (127,0,0,1,{p1},{p2})\r\n").as_bytes(),
+                    )
+                    .unwrap();
+            } else if command.starts_with("TYPE ") {
+                if options.type_denied {
+                    stream.write_all(b"500 Type failed\r\n").unwrap();
+                    continue;
+                }
+                stream.write_all(b"200 Type set\r\n").unwrap();
+            } else if command.starts_with("SIZE ") {
+                if let Some(size) = options.size {
+                    stream
+                        .write_all(format!("213 {size}\r\n").as_bytes())
+                        .unwrap();
+                } else {
+                    stream.write_all(b"550 SIZE failed\r\n").unwrap();
+                }
+            } else if command.starts_with("MDTM ") {
+                if let Some(mdtm) = options.mdtm {
+                    stream
+                        .write_all(format!("213 {mdtm}\r\n").as_bytes())
+                        .unwrap();
+                } else {
+                    stream.write_all(b"550 MDTM failed\r\n").unwrap();
+                }
+            } else if command == "REST 0" {
+                stream.write_all(b"350 Restarting at 0\r\n").unwrap();
+            } else if command.starts_with("RETR ") || command == "LIST" || command == "NLST" {
+                if options.retr_denied {
+                    stream.write_all(b"550 File unavailable\r\n").unwrap();
+                    continue;
+                }
+                stream
+                    .write_all(b"150 Opening data connection\r\n")
+                    .unwrap();
+                let listener = passive_listener.take().expect("passive listener");
+                let (mut data_stream, _) = listener.accept().unwrap();
+                data_stream.write_all(&options.data).unwrap();
+                let _ = data_stream.shutdown(Shutdown::Both);
+                data_connections += 1;
+                stream.write_all(b"226 Transfer complete\r\n").unwrap();
+            } else if command == "QUIT" {
+                let _ = stream.write_all(b"221 Bye\r\n");
+                break;
+            } else {
+                stream.write_all(b"500 Unknown command\r\n").unwrap();
+            }
+        }
+
+        tx.send(FtpRecord {
+            commands,
+            data_connections,
+        })
+        .unwrap();
+    });
+
+    (format!("ftp://{addr}{path}"), rx)
+}
+
+fn ftp_passive_listener() -> (TcpListener, u16) {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+    (listener, port)
 }
 
 fn spawn_pop3_server(path: &str, command_response: &'static [u8]) -> (String, Receiver<Vec<u8>>) {
@@ -1455,6 +1617,288 @@ fn version_lists_dict_protocol() {
 
     assert!(output.status.success());
     assert!(String::from_utf8(output.stdout).unwrap().contains("DICT"));
+}
+
+#[test]
+fn ftp_retr_downloads_file_and_sends_default_sequence() {
+    let (url, rx) = spawn_ftp_server("/path/file.txt", ftp_options(b"hello from ftp"));
+
+    let mut command = Command::cargo_bin("curl").unwrap();
+    command.args(["-q", "-sS", &url]);
+    command.assert().success().stdout("hello from ftp");
+
+    let record = rx.recv().unwrap();
+    assert_eq!(
+        record.commands,
+        b"USER anonymous\r\nPASS ftp@example.com\r\nPWD\r\nCWD path\r\nEPSV\r\nTYPE I\r\nSIZE file.txt\r\nRETR file.txt\r\nQUIT\r\n"
+    );
+    assert_eq!(record.data_connections, 1);
+}
+
+#[test]
+fn ftp_directory_url_lists_with_type_a_and_list() {
+    let listing = b"drwxr-xr-x pub\r\n-rw-r--r-- README\r\n";
+    let (url, rx) = spawn_ftp_server("/pub/", ftp_options(&listing[..]));
+
+    let mut command = Command::cargo_bin("curl").unwrap();
+    command.args(["-q", "-sS", &url]);
+    command
+        .assert()
+        .success()
+        .stdout("drwxr-xr-x pub\r\n-rw-r--r-- README\r\n");
+
+    let record = rx.recv().unwrap();
+    assert_eq!(
+        record.commands,
+        b"USER anonymous\r\nPASS ftp@example.com\r\nPWD\r\nCWD pub\r\nEPSV\r\nTYPE A\r\nLIST\r\nQUIT\r\n"
+    );
+}
+
+#[test]
+fn ftp_list_only_uses_nlst_without_cwd_for_root() {
+    let (url, rx) = spawn_ftp_server("/", ftp_options(b"one\r\ntwo\r\n"));
+
+    let mut command = Command::cargo_bin("curl").unwrap();
+    command.args(["-q", "-sS", "-l", &url]);
+    command.assert().success().stdout("one\r\ntwo\r\n");
+
+    let record = rx.recv().unwrap();
+    assert_eq!(
+        record.commands,
+        b"USER anonymous\r\nPASS ftp@example.com\r\nPWD\r\nEPSV\r\nTYPE A\r\nNLST\r\nQUIT\r\n"
+    );
+}
+
+#[test]
+fn ftp_uses_url_userinfo_and_falls_back_to_pasv() {
+    let mut options = ftp_options(b"fallback ok");
+    options.epsv_fails = true;
+    let (url, rx) = spawn_ftp_server("/file.bin", options);
+    let url = url.replacen("ftp://", "ftp://alice:secret@", 1);
+
+    let mut command = Command::cargo_bin("curl").unwrap();
+    command.args(["-q", "-sS", &url]);
+    command.assert().success().stdout("fallback ok");
+
+    let record = rx.recv().unwrap();
+    assert_eq!(
+        record.commands,
+        b"USER alice\r\nPASS secret\r\nPWD\r\nEPSV\r\nPASV\r\nTYPE I\r\nSIZE file.bin\r\nRETR file.bin\r\nQUIT\r\n"
+    );
+}
+
+#[test]
+fn ftp_double_slash_cwds_to_root_before_file() {
+    let (url, rx) = spawn_ftp_server("//rooted.txt", ftp_options(b"rooted"));
+
+    let mut command = Command::cargo_bin("curl").unwrap();
+    command.args(["-q", "-sS", &url]);
+    command.assert().success().stdout("rooted");
+
+    let record = rx.recv().unwrap();
+    assert_eq!(
+        record.commands,
+        b"USER anonymous\r\nPASS ftp@example.com\r\nPWD\r\nCWD /\r\nEPSV\r\nTYPE I\r\nSIZE rooted.txt\r\nRETR rooted.txt\r\nQUIT\r\n"
+    );
+}
+
+#[test]
+fn ftp_head_outputs_synthetic_file_headers_without_data_connection() {
+    let (url, rx) = spawn_ftp_server("/blalbla/141", ftp_options(Vec::new()));
+
+    let mut command = Command::cargo_bin("curl").unwrap();
+    let output = command.args(["-q", "-sS", "-I", &url]).output().unwrap();
+
+    assert!(output.status.success());
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    assert!(stdout.contains("last-modified: Wed, 09 Apr 2003 10:26:59 GMT\r\n"));
+    assert!(stdout.contains("content-length: 0\r\n"));
+    assert!(stdout.contains("accept-ranges: bytes\r\n"));
+
+    let record = rx.recv().unwrap();
+    assert_eq!(
+        record.commands,
+        b"USER anonymous\r\nPASS ftp@example.com\r\nPWD\r\nCWD blalbla\r\nMDTM 141\r\nTYPE I\r\nSIZE 141\r\nREST 0\r\nQUIT\r\n"
+    );
+    assert_eq!(record.data_connections, 0);
+}
+
+#[test]
+fn ftp_head_directory_only_logs_in_and_cwds() {
+    let (url, rx) = spawn_ftp_server("/pub/", ftp_options(Vec::new()));
+
+    let mut command = Command::cargo_bin("curl").unwrap();
+    command.args(["-q", "-sS", "-I", &url]);
+    command.assert().success().stdout("");
+
+    let record = rx.recv().unwrap();
+    assert_eq!(
+        record.commands,
+        b"USER anonymous\r\nPASS ftp@example.com\r\nPWD\r\nCWD pub\r\nQUIT\r\n"
+    );
+    assert_eq!(record.data_connections, 0);
+}
+
+#[test]
+fn ftp_writeout_reports_transfer_code_and_download_size() {
+    let (url, rx) = spawn_ftp_server("/file.txt", ftp_options(b"abcdef"));
+
+    let mut command = Command::cargo_bin("curl").unwrap();
+    command.args([
+        "-q",
+        "-sS",
+        "-w",
+        " code=%{response_code} size=%{size_download}",
+        &url,
+    ]);
+    command.assert().success().stdout("abcdef code=226 size=6");
+
+    rx.recv().unwrap();
+}
+
+#[test]
+fn ftp_max_filesize_rejects_after_size_before_retr() {
+    let (url, rx) = spawn_ftp_server("/large.bin", ftp_options(b"abcdef"));
+
+    let mut command = Command::cargo_bin("curl").unwrap();
+    command.args(["-q", "-sS", "--max-filesize", "3", &url]);
+    command.assert().failure().code(63).stdout("");
+
+    let record = rx.recv().unwrap();
+    assert_eq!(
+        record.commands,
+        b"USER anonymous\r\nPASS ftp@example.com\r\nPWD\r\nEPSV\r\nTYPE I\r\nSIZE large.bin\r\nQUIT\r\n"
+    );
+    assert_eq!(record.data_connections, 0);
+}
+
+#[test]
+fn ftp_dump_header_writes_control_replies_and_include_adds_no_bytes() {
+    let temp = tempdir().unwrap();
+    let dump = temp.path().join("ftp.headers");
+    let (url, rx) = spawn_ftp_server("/file.txt", ftp_options(b"body"));
+
+    let mut command = Command::cargo_bin("curl").unwrap();
+    command.args(["-q", "-sS", "-i", "-D", dump.to_str().unwrap(), &url]);
+    command.assert().success().stdout("body");
+
+    let headers = String::from_utf8(std::fs::read(dump).unwrap()).unwrap();
+    assert!(headers.contains("220 curl FTP test server\r\n"));
+    assert!(headers.contains("226 Transfer complete\r\n"));
+    rx.recv().unwrap();
+}
+
+#[test]
+fn ftp_login_failure_returns_login_denied() {
+    let mut options = ftp_options(Vec::new());
+    options.login_denied = true;
+    let (url, rx) = spawn_ftp_server("/file.txt", options);
+
+    let mut command = Command::cargo_bin("curl").unwrap();
+    command.args(["-q", "-sS", &url]);
+    command.assert().failure().code(67).stdout("");
+
+    assert_eq!(rx.recv().unwrap().commands, b"USER anonymous\r\n");
+}
+
+#[test]
+fn ftp_cwd_failure_returns_remote_access_denied() {
+    let mut options = ftp_options(Vec::new());
+    options.cwd_denied = true;
+    let (url, rx) = spawn_ftp_server("/private/file.txt", options);
+
+    let mut command = Command::cargo_bin("curl").unwrap();
+    command.args(["-q", "-sS", &url]);
+    command.assert().failure().code(9).stdout("");
+
+    assert_eq!(
+        rx.recv().unwrap().commands,
+        b"USER anonymous\r\nPASS ftp@example.com\r\nPWD\r\nCWD private\r\n"
+    );
+}
+
+#[test]
+fn ftp_passive_failure_returns_13() {
+    let mut options = ftp_options(Vec::new());
+    options.epsv_fails = true;
+    options.pasv_denied = true;
+    let (url, rx) = spawn_ftp_server("/file.txt", options);
+
+    let mut command = Command::cargo_bin("curl").unwrap();
+    command.args(["-q", "-sS", &url]);
+    command.assert().failure().code(13).stdout("");
+
+    assert_eq!(
+        rx.recv().unwrap().commands,
+        b"USER anonymous\r\nPASS ftp@example.com\r\nPWD\r\nEPSV\r\nPASV\r\nQUIT\r\n"
+    );
+}
+
+#[test]
+fn ftp_type_failure_returns_17() {
+    let mut options = ftp_options(Vec::new());
+    options.type_denied = true;
+    let (url, rx) = spawn_ftp_server("/file.txt", options);
+
+    let mut command = Command::cargo_bin("curl").unwrap();
+    command.args(["-q", "-sS", &url]);
+    command.assert().failure().code(17).stdout("");
+
+    let record = rx.recv().unwrap();
+    assert_eq!(
+        record.commands,
+        b"USER anonymous\r\nPASS ftp@example.com\r\nPWD\r\nEPSV\r\nTYPE I\r\nQUIT\r\n"
+    );
+}
+
+#[test]
+fn ftp_retr_550_returns_remote_file_not_found() {
+    let mut options = ftp_options(Vec::new());
+    options.retr_denied = true;
+    let (url, rx) = spawn_ftp_server("/missing.txt", options);
+
+    let mut command = Command::cargo_bin("curl").unwrap();
+    command.args(["-q", "-sS", &url]);
+    command.assert().failure().code(78).stdout("");
+
+    let record = rx.recv().unwrap();
+    assert_eq!(
+        record.commands,
+        b"USER anonymous\r\nPASS ftp@example.com\r\nPWD\r\nEPSV\r\nTYPE I\r\nSIZE missing.txt\r\nRETR missing.txt\r\nQUIT\r\n"
+    );
+}
+
+#[test]
+fn ftp_list_failure_returns_19() {
+    let mut options = ftp_options(Vec::new());
+    options.retr_denied = true;
+    let (url, rx) = spawn_ftp_server("/dir/", options);
+
+    let mut command = Command::cargo_bin("curl").unwrap();
+    command.args(["-q", "-sS", &url]);
+    command.assert().failure().code(19).stdout("");
+
+    let record = rx.recv().unwrap();
+    assert_eq!(
+        record.commands,
+        b"USER anonymous\r\nPASS ftp@example.com\r\nPWD\r\nCWD dir\r\nEPSV\r\nTYPE A\r\nLIST\r\nQUIT\r\n"
+    );
+}
+
+#[test]
+fn ftp_rejects_decoded_control_path() {
+    let mut command = Command::cargo_bin("curl").unwrap();
+    command.args(["-q", "-sS", "ftp://example.invalid/file%0dname"]);
+    command.assert().failure().code(3).stdout("");
+}
+
+#[test]
+fn version_lists_ftp_protocol() {
+    let mut command = Command::cargo_bin("curl").unwrap();
+    let output = command.args(["-q", "-V"]).output().unwrap();
+
+    assert!(output.status.success());
+    assert!(String::from_utf8(output.stdout).unwrap().contains("FTP"));
 }
 
 #[test]
