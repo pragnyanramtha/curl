@@ -550,6 +550,16 @@ impl Parser {
             "junk-session-cookies" => self.current().junk_session_cookies = true,
             "compressed" => self.current().compressed = true,
             "verbose" => self.current().verbose = true,
+            "trace" | "trace-ascii" => {
+                let _ = self.value_for(name, inline_value)?;
+            }
+            "trace-time" => {
+                if inline_value.is_some() {
+                    return Err(CurlError::Usage(
+                        "option --trace-time does not take a value".to_string(),
+                    ));
+                }
+            }
             "silent" | "no-progress-meter" => self.current().silent = true,
             "show-error" => self.current().show_error = true,
             "globoff" => self.current().globoff = true,
@@ -1158,15 +1168,34 @@ pub fn print_help() {
            -k, --insecure              Allow insecure TLS/SSH\n\
            -s, --silent                Silent mode\n\
            -v, --verbose               Verbose transfer trace\n\
+               --trace-ascii <file>    Accepted for compatibility\n\
+               --trace-time            Accepted for compatibility\n\
            -V, --version               Show version"
     );
 }
 
 pub fn print_version() {
+    let curl_version = curl_compat_version();
     println!(
-        "curl-rust {} (Rust rewrite) DICT FTP HTTP HTTPS FILE GOPHER IMAP IPFS IPNS LDAP MQTT POP3 RTSP SCP SFTP SMB SMTP TELNET TFTP WS",
+        "curl {curl_version} (curl-rust/{}) libcurl/{curl_version}",
         env!("CARGO_PKG_VERSION")
     );
+    println!("Release-Date: [unreleased]");
+    println!(
+        "Protocols: DICT FILE FTP GOPHER HTTP HTTPS IMAP IPFS IPNS LDAP MQTT POP3 RTSP SCP SFTP SMB SMTP TELNET TFTP WS"
+    );
+    println!("Features: AsynchDNS IPv6 Largefile SSL threadsafe");
+}
+
+fn curl_compat_version() -> &'static str {
+    const CURLVER_H: &str = include_str!("../../../include/curl/curlver.h");
+    CURLVER_H
+        .lines()
+        .find_map(|line| {
+            line.strip_prefix("#define LIBCURL_VERSION \"")
+                .and_then(|value| value.strip_suffix('"'))
+        })
+        .unwrap_or("8.21.0-DEV")
 }
 
 fn should_load_default_config(args: &[String]) -> bool {
@@ -1335,6 +1364,21 @@ mod tests {
         assert_eq!(transfer.data[0].value, "a=b");
         assert_eq!(transfer.output.as_deref(), Some("out.txt"));
         assert_eq!(transfer.urls, ["https://example.com"]);
+    }
+
+    #[test]
+    fn accepts_trace_options_for_corpus_runner() {
+        let config = parse_args([
+            "-q",
+            "--trace-ascii",
+            "log/trace1",
+            "--trace-time",
+            "file:///tmp/input",
+        ])
+        .unwrap();
+
+        let transfer = &config.transfers[0];
+        assert_eq!(transfer.urls, ["file:///tmp/input"]);
     }
 
     #[test]

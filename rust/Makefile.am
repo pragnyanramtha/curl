@@ -4,7 +4,8 @@
 
 RUST_CARGO_TARGET_DIR = $(abs_builddir)/target
 RUST_CURL_BINARY = $(RUST_CARGO_TARGET_DIR)/debug/curl$(EXEEXT)
-RUST_CURL_SIDECAR = $(abs_builddir)/curl-rust$(EXEEXT)
+RUST_CURL_SIDECAR = $(abs_builddir)/bin/curl-rust$(EXEEXT)
+RUST_CURL_CORPUS_TESTS = 200 231 1016 1017 1018 1019 1020 1220 2072
 
 EXTRA_DIST =                                      \
   README.md                                      \
@@ -29,14 +30,21 @@ all-local: rust-curl
 
 rust-curl:
 	CARGO_TARGET_DIR="$(RUST_CARGO_TARGET_DIR)" $(CARGO) build --locked --manifest-path "$(abs_srcdir)/curl-rust/Cargo.toml" --bin curl
+	mkdir -p "$(abs_builddir)/bin"
 	cp "$(RUST_CURL_BINARY)" "$(RUST_CURL_SIDECAR)"
 
-check-local: rust-test
+check-local: rust-test rust-corpus-test
 
 rust-test:
 	CARGO_TARGET_DIR="$(RUST_CARGO_TARGET_DIR)" $(CARGO) test --locked --manifest-path "$(abs_srcdir)/curl-rust/Cargo.toml"
 
-clean-local:
-	rm -rf "$(RUST_CARGO_TARGET_DIR)" "$(RUST_CURL_SIDECAR)"
+rust-corpus-test: rust-curl
+	@(cd "$(abs_top_builddir)/tests" && \
+	  srcdir="$(abs_top_srcdir)/tests" $(PERL) "$(abs_top_srcdir)/tests/runtests.pl" \
+	    -n -a -s -c "$(RUST_CURL_SIDECAR)" \
+	    $(RUST_CURL_CORPUS_TESTS) $(TFLAGS))
 
-.PHONY: rust-curl rust-test
+clean-local:
+	rm -rf "$(RUST_CARGO_TARGET_DIR)" "$(abs_builddir)/bin"
+
+.PHONY: rust-curl rust-test rust-corpus-test

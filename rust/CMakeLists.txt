@@ -34,6 +34,18 @@ add_custom_command(
 
 add_custom_target(curl-rust ALL DEPENDS "${_curl_rust_sidecar}")
 
+set(_curl_rust_corpus_tests
+  200
+  231
+  1016
+  1017
+  1018
+  1019
+  1020
+  1220
+  2072
+)
+
 add_custom_target(curl-rust-test
   COMMAND ${CMAKE_COMMAND} -E env
     "CARGO_TARGET_DIR=${_curl_rust_target_dir}"
@@ -44,3 +56,19 @@ add_custom_target(curl-rust-test
   COMMENT "Testing experimental Rust curl sidecar"
   VERBATIM
 )
+
+if(CURL_BUILD_TESTING AND PERL_EXECUTABLE)
+  add_custom_target(curl-rust-corpus-test
+    COMMAND ${CMAKE_COMMAND} -E env
+      "srcdir=${PROJECT_SOURCE_DIR}/tests"
+      "${PERL_EXECUTABLE}" "${PROJECT_SOURCE_DIR}/tests/runtests.pl"
+        -n -a -s
+        -c "${_curl_rust_sidecar}"
+        ${_curl_rust_corpus_tests}
+        "\$TFLAGS"
+    DEPENDS curl-rust testdeps
+    WORKING_DIRECTORY "${PROJECT_BINARY_DIR}/tests"
+    COMMENT "Running curl file:// corpus smoke tests with Rust sidecar"
+    VERBATIM USES_TERMINAL
+  )
+endif()

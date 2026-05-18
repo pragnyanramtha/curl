@@ -38,9 +38,11 @@ CARGO_TARGET_DIR=/tmp/curl-rust-target cargo run -q -p curl-rust --locked -- --v
 cmake -S . -B build-rust-sidecar -DBUILD_RUST_CURL_EXE=ON
 cmake --build build-rust-sidecar
 cmake --build build-rust-sidecar --target curl-rust-test
+cmake --build build-rust-sidecar --target curl-rust-corpus-test
 autoreconf -fi
-./configure --enable-rust-curl
+./configure --enable-rust-curl --with-openssl
 make -j"$(nproc)"
+make -C rust rust-corpus-test
 make check
 ```
 

@@ -1946,10 +1946,6 @@ if(BUILD_CURL_EXE)
   add_subdirectory(src)
 endif()
 
-if(BUILD_RUST_CURL_EXE)
-  add_subdirectory(rust)
-endif()
-
 option(BUILD_EXAMPLES "Build libcurl examples" ON)
 if(BUILD_EXAMPLES)
   add_subdirectory(docs/examples)
@@ -1957,6 +1953,10 @@ endif()
 
 if(CURL_BUILD_TESTING)
   add_subdirectory(tests)
+endif()
+
+if(BUILD_RUST_CURL_EXE)
+  add_subdirectory(rust)
 endif()
 
 # Helper to populate a list (_items) with a label when conditions
