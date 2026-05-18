@@ -2989,6 +2989,37 @@ fn imap_custom_fetch_outputs_envelope_and_literal() {
 }
 
 #[test]
+fn imap_custom_fetch_suppresses_literal_trailer_and_ignores_quoted_braces() {
+    let (url, rx) = spawn_imap_server(
+        "/mailbox/",
+        vec![(
+            "FETCH 456 (\"fake {50}\" BODY[TEXT])",
+            b"* 456 FETCH ((\"fake {50}\" BODY[TEXT]) {5}\r\nhello)\r\n{tag} OK FETCH completed\r\n",
+        )],
+    );
+
+    let mut command = Command::cargo_bin("curl").unwrap();
+    command.args([
+        "-q",
+        "-sS",
+        "-u",
+        "user:secret",
+        "-X",
+        "FETCH 456 (\"fake {50}\" BODY[TEXT])",
+        &url,
+    ]);
+    command
+        .assert()
+        .success()
+        .stdout("* 456 FETCH ((\"fake {50}\" BODY[TEXT]) {5}\r\nhello");
+
+    assert_eq!(
+        rx.recv().unwrap(),
+        b"A001 CAPABILITY\r\nA002 LOGIN user secret\r\nA003 SELECT mailbox\r\nA004 FETCH 456 (\"fake {50}\" BODY[TEXT])\r\nA005 LOGOUT\r\n"
+    );
+}
+
+#[test]
 fn imap_custom_command_failure_exits_quote_error() {
     let (url, rx) = spawn_imap_server("/", vec![("NOOP", b"{tag} NO command rejected\r\n")]);
 

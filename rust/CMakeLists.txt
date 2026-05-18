@@ -119,8 +119,10 @@ set(_curl_rust_corpus_tests
   1548
   1673
   1714
+  1847
   1848
   2072
+  3206
 )
 
 add_custom_target(curl-rust-test

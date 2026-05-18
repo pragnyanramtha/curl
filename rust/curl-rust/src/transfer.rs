@@ -4583,6 +4583,7 @@ enum ImapStatus {
 enum ImapReadMode {
     Quiet,
     Lines,
+    FetchLines,
     FetchBody,
 }
 
@@ -4624,6 +4625,8 @@ async fn imap_run_selected_command(
     if let Some(custom) = &request.custom {
         let mode = if imap_custom_fetch_listing(custom) {
             ImapReadMode::Quiet
+        } else if imap_custom_fetch_command(custom) {
+            ImapReadMode::FetchLines
         } else {
             ImapReadMode::Lines
         };
@@ -4963,6 +4966,20 @@ async fn imap_read_response(
                     response.saw_literal = true;
                 }
             }
+            ImapReadMode::FetchLines => {
+                if response.saw_literal {
+                    if let Some(size) = literal_size {
+                        let _ = imap_read_literal(stream, size).await?;
+                    }
+                    continue;
+                }
+                response.output.extend_from_slice(&line);
+                if let Some(size) = literal_size {
+                    let literal = imap_read_literal(stream, size).await?;
+                    response.output.extend_from_slice(&literal);
+                    response.saw_literal = true;
+                }
+            }
             ImapReadMode::Lines => {
                 response.output.extend_from_slice(&line);
                 if let Some(size) = literal_size {
@@ -5085,6 +5102,11 @@ fn imap_literal_size(line: &[u8]) -> Result<Option<usize>> {
         index += 1;
     }
     Ok(None)
+}
+
+fn imap_custom_fetch_command(command: &[u8]) -> bool {
+    let upper = command.to_ascii_uppercase();
+    upper.starts_with(b"FETCH ") || upper.starts_with(b"UID FETCH ")
 }
 
 fn imap_custom_fetch_listing(command: &[u8]) -> bool {
