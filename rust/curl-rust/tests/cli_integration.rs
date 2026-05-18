@@ -53,6 +53,12 @@ struct TftpRecord {
     acknowledgements: Vec<Vec<u8>>,
 }
 
+#[derive(Debug)]
+struct TftpUploadRecord {
+    request: Vec<u8>,
+    data_blocks: Vec<(u16, Vec<u8>)>,
+}
+
 fn spawn_server(response: &'static [u8]) -> (String, Receiver<RequestRecord>) {
     spawn_sequence_server(vec![response])
 }
@@ -338,6 +344,71 @@ fn tftp_oack(options: &[(&str, &str)]) -> Vec<u8> {
         packet.push(0);
     }
     packet
+}
+
+fn tftp_ack(block: u16) -> Vec<u8> {
+    let mut packet = Vec::from(&4_u16.to_be_bytes()[..]);
+    packet.extend_from_slice(&block.to_be_bytes());
+    packet
+}
+
+fn spawn_tftp_upload_server(
+    first_response: Vec<u8>,
+    block_size: usize,
+) -> (String, Receiver<TftpUploadRecord>) {
+    let socket = UdpSocket::bind("127.0.0.1:0").unwrap();
+    let addr = socket.local_addr().unwrap();
+    let (tx, rx) = mpsc::channel();
+
+    thread::spawn(move || {
+        let mut buffer = vec![0; 70_000];
+        let (read, peer) = socket.recv_from(&mut buffer).unwrap();
+        let request = buffer[..read].to_vec();
+        socket.send_to(&first_response, peer).unwrap();
+
+        let mut data_blocks = Vec::new();
+        loop {
+            let (read, data_peer) = socket.recv_from(&mut buffer).unwrap();
+            assert_eq!(data_peer, peer);
+            assert!(read >= 4);
+            assert_eq!(&buffer[..2], &3_u16.to_be_bytes());
+            let block = u16::from_be_bytes([buffer[2], buffer[3]]);
+            let data = buffer[4..read].to_vec();
+            socket.send_to(&tftp_ack(block), peer).unwrap();
+            let done = data.len() < block_size;
+            data_blocks.push((block, data));
+            if done {
+                break;
+            }
+        }
+
+        tx.send(TftpUploadRecord {
+            request,
+            data_blocks,
+        })
+        .unwrap();
+    });
+
+    (format!("tftp://{addr}/upload.bin"), rx)
+}
+
+fn spawn_tftp_upload_error_server(code: u16) -> (String, Receiver<Vec<u8>>) {
+    let socket = UdpSocket::bind("127.0.0.1:0").unwrap();
+    let addr = socket.local_addr().unwrap();
+    let (tx, rx) = mpsc::channel();
+
+    thread::spawn(move || {
+        let mut buffer = vec![0; 2048];
+        let (read, peer) = socket.recv_from(&mut buffer).unwrap();
+        tx.send(buffer[..read].to_vec()).unwrap();
+        let mut packet = Vec::from(&5_u16.to_be_bytes()[..]);
+        packet.extend_from_slice(&code.to_be_bytes());
+        packet.extend_from_slice(b"upload denied");
+        packet.push(0);
+        socket.send_to(&packet, peer).unwrap();
+    });
+
+    (format!("tftp://{addr}/upload.bin"), rx)
 }
 
 fn spawn_telnet_server(
@@ -1592,6 +1663,141 @@ fn tftp_rejects_decoded_nul_path() {
 }
 
 #[test]
+fn tftp_upload_file_sends_wrq_and_data() {
+    let (url, rx) = spawn_tftp_upload_server(tftp_ack(0), 512);
+    let url = url.replace("/upload.bin", "//");
+    let temp = tempdir().unwrap();
+    let upload = temp.path().join("payload.bin");
+    let body = b"a chunk\nof upload\n";
+    std::fs::write(&upload, body).unwrap();
+
+    let mut command = Command::cargo_bin("curl").unwrap();
+    command.args(["-q", "-sS", "-T", upload.to_str().unwrap(), &url]);
+    command.assert().success().stdout("");
+
+    let record = rx.recv().unwrap();
+    let mut expected = b"\x00\x02/payload.bin\x00octet\x00tsize\x00".to_vec();
+    expected.extend_from_slice(body.len().to_string().as_bytes());
+    expected.extend_from_slice(b"\x00blksize\x00512\x00timeout\x005\x00");
+    assert_eq!(record.request, expected);
+    assert_eq!(record.data_blocks, [(1, body.to_vec())]);
+}
+
+#[test]
+fn tftp_upload_oack_exact_block_sends_final_empty_block() {
+    let body = b"12345678";
+    let (url, rx) = spawn_tftp_upload_server(tftp_oack(&[("blksize", "8")]), 8);
+    let temp = tempdir().unwrap();
+    let upload = temp.path().join("exact.bin");
+    std::fs::write(&upload, body).unwrap();
+
+    let mut command = Command::cargo_bin("curl").unwrap();
+    command.args([
+        "-q",
+        "-sS",
+        "--tftp-blksize",
+        "8",
+        "-T",
+        upload.to_str().unwrap(),
+        &url,
+    ]);
+    command.assert().success().stdout("");
+
+    let record = rx.recv().unwrap();
+    let mut expected = b"\x00\x02upload.bin\x00octet\x00tsize\x00".to_vec();
+    expected.extend_from_slice(body.len().to_string().as_bytes());
+    expected.extend_from_slice(b"\x00blksize\x008\x00timeout\x005\x00");
+    assert_eq!(record.request, expected);
+    assert_eq!(record.data_blocks, [(1, body.to_vec()), (2, Vec::new())]);
+}
+
+#[test]
+fn tftp_upload_no_options_sends_plain_wrq() {
+    let (url, rx) = spawn_tftp_upload_server(tftp_ack(0), 512);
+    let temp = tempdir().unwrap();
+    let upload = temp.path().join("plain.bin");
+    std::fs::write(&upload, b"plain").unwrap();
+
+    let mut command = Command::cargo_bin("curl").unwrap();
+    command.args([
+        "-q",
+        "-sS",
+        "--tftp-no-options",
+        "-T",
+        upload.to_str().unwrap(),
+        &url,
+    ]);
+    command.assert().success().stdout("");
+
+    let record = rx.recv().unwrap();
+    assert_eq!(record.request, b"\0\x02upload.bin\0octet\0");
+    assert_eq!(record.data_blocks, [(1, b"plain".to_vec())]);
+}
+
+#[test]
+fn tftp_upload_no_options_ignores_requested_block_size() {
+    let (url, rx) = spawn_tftp_upload_server(tftp_ack(0), 512);
+    let temp = tempdir().unwrap();
+    let upload = temp.path().join("default-blocks.bin");
+    let body = vec![b'x'; 600];
+    std::fs::write(&upload, &body).unwrap();
+
+    let mut command = Command::cargo_bin("curl").unwrap();
+    command.args([
+        "-q",
+        "-sS",
+        "--max-time",
+        "2",
+        "--tftp-no-options",
+        "--tftp-blksize",
+        "8",
+        "-T",
+        upload.to_str().unwrap(),
+        &url,
+    ]);
+    command.assert().success().stdout("");
+
+    let record = rx.recv().unwrap();
+    assert_eq!(record.request, b"\0\x02upload.bin\0octet\0");
+    assert_eq!(
+        record.data_blocks,
+        [(1, body[..512].to_vec()), (2, body[512..].to_vec())]
+    );
+}
+
+#[test]
+fn tftp_upload_stdin_uses_zero_tsize() {
+    let (url, rx) = spawn_tftp_upload_server(tftp_ack(0), 512);
+
+    let mut command = Command::cargo_bin("curl").unwrap();
+    command
+        .args(["-q", "-sS", "-T", "-", &url])
+        .write_stdin("from stdin");
+    command.assert().success().stdout("");
+
+    let record = rx.recv().unwrap();
+    assert_eq!(
+        record.request,
+        b"\x00\x02upload.bin\x00octet\x00tsize\x000\x00blksize\x00512\x00timeout\x005\x00"
+    );
+    assert_eq!(record.data_blocks, [(1, b"from stdin".to_vec())]);
+}
+
+#[test]
+fn tftp_upload_error_packet_maps_permission() {
+    let (url, rx) = spawn_tftp_upload_error_server(2);
+    let temp = tempdir().unwrap();
+    let upload = temp.path().join("denied.bin");
+    std::fs::write(&upload, b"do not send").unwrap();
+
+    let mut command = Command::cargo_bin("curl").unwrap();
+    command.args(["-q", "-sS", "-T", upload.to_str().unwrap(), &url]);
+    command.assert().failure().code(69).stdout("");
+
+    assert!(rx.recv().unwrap().starts_with(b"\0\x02upload.bin\0octet\0"));
+}
+
+#[test]
 fn version_lists_tftp_protocol() {
     let mut command = Command::cargo_bin("curl").unwrap();
     let output = command.args(["-q", "-V"]).output().unwrap();
@@ -2653,6 +2859,37 @@ fn libcurl_writes_tftp_options() {
     let text = std::fs::read_to_string(source).unwrap();
     assert!(text.contains("CURLOPT_TFTP_BLKSIZE, 1024"));
     assert!(text.contains("CURLOPT_TFTP_NO_OPTIONS, 1"));
+}
+
+#[test]
+fn libcurl_writes_tftp_upload_directory_url() {
+    let (url, rx) = spawn_tftp_upload_server(tftp_ack(0), 512);
+    let url = url.replace("/upload.bin", "//");
+    let temp = tempdir().unwrap();
+    let upload = temp.path().join("client.bin");
+    let source = temp.path().join("tftp-upload-client.c");
+    std::fs::write(&upload, b"upload").unwrap();
+
+    let mut command = Command::cargo_bin("curl").unwrap();
+    command.args([
+        "-q",
+        "-sS",
+        "--libcurl",
+        source.to_str().unwrap(),
+        "-T",
+        upload.to_str().unwrap(),
+        &url,
+    ]);
+    command.assert().success().stdout("");
+
+    assert!(
+        rx.recv()
+            .unwrap()
+            .request
+            .starts_with(b"\0\x02/client.bin\0octet\0")
+    );
+    let text = std::fs::read_to_string(source).unwrap();
+    assert!(text.contains(&format!("CURLOPT_URL, \"{}client.bin\"", url)));
 }
 
 #[test]

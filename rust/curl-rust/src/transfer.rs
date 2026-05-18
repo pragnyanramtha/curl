@@ -687,12 +687,17 @@ async fn run_tftp_transfer(
     method: &str,
     metrics: &mut writeout::Metrics,
 ) -> Result<()> {
-    if method != "GET" && method != "HEAD" {
+    if transfer.upload_file.is_some() {
+        if method == "HEAD" || (transfer.method.is_some() && method != "GET") {
+            return Err(CurlError::Unsupported(format!(
+                "{method} requests for tftp:// uploads"
+            )));
+        }
+    } else if method != "GET" && method != "HEAD" {
         return Err(CurlError::Unsupported(format!(
             "{method} requests for tftp:// URLs"
         )));
     }
-    reject_upload_file_for_scheme(transfer, "tftp://")?;
 
     if let Some(timeout) = transfer.max_time {
         tokio::time::timeout(
@@ -712,7 +717,15 @@ async fn run_tftp_exchange(
     method: &str,
     metrics: &mut writeout::Metrics,
 ) -> Result<()> {
-    let url = Url::parse(&expanded.url).map_err(|error| CurlError::Url(error.to_string()))?;
+    let upload = transfer
+        .upload_file
+        .as_deref()
+        .map(data::read_upload_body)
+        .transpose()?;
+    let mut url = Url::parse(&expanded.url).map_err(|error| CurlError::Url(error.to_string()))?;
+    if upload.is_some() {
+        data::append_upload_filename_to_url(&mut url, transfer.upload_file.as_deref());
+    }
     output::validate_output_target(transfer, &url)?;
     let host = url
         .host_str()
@@ -720,7 +733,26 @@ async fn run_tftp_exchange(
     let port = url.port().unwrap_or(69);
     let (filename, mode) = tftp_filename_and_mode(&url)?;
     let requested_blksize = transfer.tftp_blksize.unwrap_or(TFTP_DEFAULT_BLKSIZE);
-    let request = tftp_rrq_packet(&filename, mode, requested_blksize, transfer.tftp_no_options);
+    let initial_blksize = if transfer.tftp_no_options {
+        TFTP_DEFAULT_BLKSIZE
+    } else {
+        requested_blksize
+    };
+    let upload_tsize = match (upload.as_ref(), transfer.upload_file.as_deref()) {
+        (Some(bytes), Some(path)) if path != "-" => bytes.len() as u64,
+        _ => 0,
+    };
+    let request = if upload.is_some() {
+        tftp_wrq_packet(
+            &filename,
+            mode,
+            requested_blksize,
+            transfer.tftp_no_options,
+            upload_tsize,
+        )
+    } else {
+        tftp_rrq_packet(&filename, mode, requested_blksize, transfer.tftp_no_options)
+    };
 
     let bind_addr = if url.has_host()
         && url
@@ -737,9 +769,19 @@ async fn run_tftp_exchange(
         .await
         .map_err(tcp_io_error)?;
 
+    if let Some(upload) = upload {
+        run_tftp_upload(&socket, &upload, initial_blksize).await?;
+        metrics.url_effective = url.to_string();
+        metrics.size_download = 0;
+        if let Some(path) = &transfer.dump_header {
+            output::dump_headers(path, &[], transfer.create_dirs)?;
+        }
+        return Ok(());
+    }
+
     let mut body = Vec::new();
     let mut expected_block = 1_u16;
-    let mut block_size = usize::from(requested_blksize);
+    let mut block_size = usize::from(initial_blksize);
     let mut peer = None;
     let mut packet = vec![0; TFTP_MAX_PACKET_SIZE];
 
@@ -812,6 +854,83 @@ async fn run_tftp_exchange(
     if max_filesize_exceeded {
         return Err(CurlError::FileSizeExceeded);
     }
+    Ok(())
+}
+
+async fn run_tftp_upload(socket: &UdpSocket, body: &[u8], requested_blksize: u16) -> Result<()> {
+    let mut block_size = usize::from(requested_blksize);
+    let mut peer = None;
+    let mut packet = vec![0; TFTP_MAX_PACKET_SIZE];
+    let mut offset = 0_usize;
+    let mut next_block = 1_u16;
+    let mut last_packet = Vec::new();
+    let mut last_sent_block: Option<u16> = None;
+    let mut last_sent_len = 0_usize;
+
+    loop {
+        let (read, addr) = socket.recv_from(&mut packet).await.map_err(tcp_io_error)?;
+        if let Some(peer) = peer {
+            if addr != peer {
+                let error = tftp_error_packet(5, b"Unknown transfer ID");
+                let _ = socket.send_to(&error, addr).await;
+                continue;
+            }
+        } else {
+            peer = Some(addr);
+        }
+
+        let received = &packet[..read];
+        match tftp_opcode(received)? {
+            4 => {
+                let ack = tftp_block_number(received)?;
+                if let Some(block) = last_sent_block {
+                    if ack != block {
+                        if ack == block.wrapping_sub(1) && !last_packet.is_empty() {
+                            socket
+                                .send_to(&last_packet, addr)
+                                .await
+                                .map_err(tcp_io_error)?;
+                            continue;
+                        }
+                        return Err(CurlError::SendError);
+                    }
+                    if last_sent_len < block_size {
+                        break;
+                    }
+                } else if ack != 0 {
+                    return Err(CurlError::SendError);
+                }
+
+                let (data_packet, block, data_len) =
+                    tftp_next_data_packet(body, block_size, &mut offset, &mut next_block);
+                socket
+                    .send_to(&data_packet, addr)
+                    .await
+                    .map_err(tcp_io_error)?;
+                last_packet = data_packet;
+                last_sent_block = Some(block);
+                last_sent_len = data_len;
+            }
+            5 => return Err(tftp_error_response(received)),
+            6 => {
+                if last_sent_block.is_some() {
+                    return Err(CurlError::TftpIllegal);
+                }
+                block_size = tftp_oack_blksize(received).unwrap_or(block_size);
+                let (data_packet, block, data_len) =
+                    tftp_next_data_packet(body, block_size, &mut offset, &mut next_block);
+                socket
+                    .send_to(&data_packet, addr)
+                    .await
+                    .map_err(tcp_io_error)?;
+                last_packet = data_packet;
+                last_sent_block = Some(block);
+                last_sent_len = data_len;
+            }
+            _ => return Err(CurlError::TftpIllegal),
+        }
+    }
+
     Ok(())
 }
 
@@ -1437,21 +1556,67 @@ fn strip_tftp_mode_suffix(value: &mut Vec<u8>, suffix: &[u8]) -> bool {
 }
 
 fn tftp_rrq_packet(filename: &[u8], mode: &str, blksize: u16, no_options: bool) -> Vec<u8> {
+    tftp_request_packet(1, filename, mode, blksize, no_options, 0)
+}
+
+fn tftp_wrq_packet(
+    filename: &[u8],
+    mode: &str,
+    blksize: u16,
+    no_options: bool,
+    upload_size: u64,
+) -> Vec<u8> {
+    tftp_request_packet(2, filename, mode, blksize, no_options, upload_size)
+}
+
+fn tftp_request_packet(
+    opcode: u16,
+    filename: &[u8],
+    mode: &str,
+    blksize: u16,
+    no_options: bool,
+    transfer_size: u64,
+) -> Vec<u8> {
     let mut packet = Vec::new();
-    packet.extend_from_slice(&1_u16.to_be_bytes());
+    packet.extend_from_slice(&opcode.to_be_bytes());
     packet.extend_from_slice(filename);
     packet.push(0);
     packet.extend_from_slice(mode.as_bytes());
     packet.push(0);
     if !no_options {
         packet.extend_from_slice(b"tsize\0");
-        packet.extend_from_slice(b"0\0");
+        packet.extend_from_slice(transfer_size.to_string().as_bytes());
+        packet.push(0);
         packet.extend_from_slice(b"blksize\0");
         packet.extend_from_slice(blksize.to_string().as_bytes());
         packet.push(0);
         packet.extend_from_slice(b"timeout\0");
         packet.extend_from_slice(b"5\0");
     }
+    packet
+}
+
+fn tftp_next_data_packet(
+    body: &[u8],
+    block_size: usize,
+    offset: &mut usize,
+    block: &mut u16,
+) -> (Vec<u8>, u16, usize) {
+    let block_number = *block;
+    let remaining = body.len().saturating_sub(*offset);
+    let data_len = remaining.min(block_size);
+    let end = *offset + data_len;
+    let packet = tftp_data_packet(block_number, &body[*offset..end]);
+    *offset = end;
+    *block = block.wrapping_add(1);
+    (packet, block_number, data_len)
+}
+
+fn tftp_data_packet(block: u16, data: &[u8]) -> Vec<u8> {
+    let mut packet = Vec::with_capacity(data.len() + 4);
+    packet.extend_from_slice(&3_u16.to_be_bytes());
+    packet.extend_from_slice(&block.to_be_bytes());
+    packet.extend_from_slice(data);
     packet
 }
 
@@ -1494,6 +1659,7 @@ fn tftp_oack_blksize(packet: &[u8]) -> Option<usize> {
         if option.eq_ignore_ascii_case(b"blksize")
             && let Ok(text) = std::str::from_utf8(value)
             && let Ok(blksize) = text.parse::<usize>()
+            && blksize > 0
         {
             return Some(blksize);
         }
