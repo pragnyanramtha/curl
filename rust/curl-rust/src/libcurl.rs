@@ -384,7 +384,7 @@ fn effective_urls(
                     .unwrap_or(expanded.url);
             let mut url =
                 Url::parse(&effective_url).map_err(|error| CurlError::Url(error.to_string()))?;
-            if matches!(url.scheme(), "http" | "https" | "tftp") {
+            if matches!(url.scheme(), "http" | "https" | "sftp" | "tftp") {
                 data::append_upload_filename_to_url(&mut url, transfer.upload_file.as_deref());
             }
             if let Some(query) = query.filter(|query| !query.is_empty()) {

@@ -1,4 +1,4 @@
-use std::io::{self, Read};
+use std::io::{self, Read, Write};
 use std::net::{TcpStream as StdTcpStream, ToSocketAddrs};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -1166,6 +1166,11 @@ struct SshDownload {
     headers: reqwest::header::HeaderMap,
 }
 
+enum SshTransferResult {
+    Download(SshDownload),
+    Upload,
+}
+
 async fn run_scp_transfer(
     transfer: &TransferConfig,
     expanded: &glob::ExpandedUrl,
@@ -1193,11 +1198,20 @@ async fn run_ssh_transfer(
 ) -> Result<()> {
     validate_ssh_transfer(transfer, method, protocol)?;
 
-    let url = Url::parse(&expanded.url).map_err(|error| CurlError::Url(error.to_string()))?;
-    output::validate_output_target(transfer, &url)?;
+    let mut url = Url::parse(&expanded.url).map_err(|error| CurlError::Url(error.to_string()))?;
+    if transfer.upload_file.is_some() {
+        data::append_upload_filename_to_url(&mut url, transfer.upload_file.as_deref());
+    } else {
+        output::validate_output_target(transfer, &url)?;
+    }
+    let upload_body = transfer
+        .upload_file
+        .as_deref()
+        .map(data::read_upload_body)
+        .transpose()?;
 
     let transfer_for_task = transfer.clone();
-    let url_for_task = expanded.url.clone();
+    let url_for_task = url.to_string();
     let method_for_task = method.to_string();
     let task = tokio::task::spawn_blocking(move || {
         run_ssh_blocking(
@@ -1205,6 +1219,7 @@ async fn run_ssh_transfer(
             &url_for_task,
             &method_for_task,
             protocol,
+            upload_body,
         )
     });
     let download = if let Some(timeout) = transfer.max_time {
@@ -1215,6 +1230,20 @@ async fn run_ssh_transfer(
         task.await
     }
     .map_err(|error| CurlError::Transfer(format!("SSH transfer task failed: {error}")))??;
+
+    if matches!(download, SshTransferResult::Upload) {
+        if let Some(path) = &transfer.dump_header {
+            output::dump_headers(path, &[], transfer.create_dirs)?;
+        }
+        metrics.url_effective = url.to_string();
+        metrics.size_download = 0;
+        metrics.headers = reqwest::header::HeaderMap::new();
+        return Ok(());
+    }
+
+    let SshTransferResult::Download(download) = download else {
+        unreachable!();
+    };
 
     let is_head = method == "HEAD" || transfer.head;
     let (body_bytes, max_filesize_exceeded) = if is_head {
@@ -1272,7 +1301,23 @@ fn validate_ssh_transfer(
             "custom requests for {scheme} URLs"
         )));
     }
-    if method != "GET" && method != "HEAD" {
+    if transfer.upload_file.is_some() {
+        if protocol == SshProtocol::Scp {
+            return Err(CurlError::Unsupported(
+                "SCP uploads in the Rust sidecar".to_string(),
+            ));
+        }
+        if method != "GET" {
+            return Err(CurlError::Unsupported(format!(
+                "{method} requests for {scheme} uploads"
+            )));
+        }
+        if transfer.head {
+            return Err(CurlError::Unsupported(format!(
+                "--upload-file combined with --head for {scheme} URLs"
+            )));
+        }
+    } else if method != "GET" && method != "HEAD" {
         return Err(CurlError::Unsupported(format!(
             "{method} requests for {scheme} URLs"
         )));
@@ -1282,7 +1327,6 @@ fn validate_ssh_transfer(
             "data/form/query request bodies for {scheme} URLs"
         )));
     }
-    reject_upload_file_for_scheme(transfer, scheme)?;
     if transfer.oauth2_bearer.is_some() {
         return Err(CurlError::Unsupported(format!(
             "--oauth2-bearer for {scheme} URLs"
@@ -1306,14 +1350,29 @@ fn run_ssh_blocking(
     url: &str,
     method: &str,
     protocol: SshProtocol,
-) -> Result<SshDownload> {
+    upload_body: Option<Vec<u8>>,
+) -> Result<SshTransferResult> {
     let url = Url::parse(url).map_err(|error| CurlError::Url(error.to_string()))?;
     let path = ssh_url_path(&url, protocol)?;
     let session = ssh_connect(transfer, &url)?;
 
+    if let Some(upload_body) = upload_body {
+        if protocol == SshProtocol::Sftp {
+            ssh_sftp_upload(&session, &path, &upload_body)?;
+            return Ok(SshTransferResult::Upload);
+        }
+        return Err(CurlError::Unsupported(
+            "SCP uploads in the Rust sidecar".to_string(),
+        ));
+    }
+
     match protocol {
-        SshProtocol::Scp => ssh_scp_download(&session, &path, method),
-        SshProtocol::Sftp => ssh_sftp_download(transfer, &session, &path, method),
+        SshProtocol::Scp => {
+            ssh_scp_download(&session, &path, method).map(SshTransferResult::Download)
+        }
+        SshProtocol::Sftp => {
+            ssh_sftp_download(transfer, &session, &path, method).map(SshTransferResult::Download)
+        }
     }
 }
 
@@ -1364,6 +1423,14 @@ fn ssh_sftp_download(
             .map_err(|error| CurlError::Transfer(error.to_string()))?;
     }
     Ok(SshDownload { body, headers })
+}
+
+fn ssh_sftp_upload(session: &Session, path: &str, body: &[u8]) -> Result<()> {
+    let sftp = session.sftp().map_err(ssh_error_to_curl)?;
+    let mut file = sftp.create(Path::new(path)).map_err(ssh_error_to_curl)?;
+    file.write_all(body).map_err(|_| CurlError::SendError)?;
+    file.close().map_err(ssh_error_to_curl)?;
+    Ok(())
 }
 
 fn ssh_connect(transfer: &TransferConfig, url: &Url) -> Result<Session> {
