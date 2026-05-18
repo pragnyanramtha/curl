@@ -502,13 +502,21 @@ fn ftp_passive_listener() -> (TcpListener, u16) {
 }
 
 fn spawn_pop3_server(path: &str, command_response: &'static [u8]) -> (String, Receiver<Vec<u8>>) {
+    spawn_pop3_server_with_greeting(path, b"+OK curl POP3 test server\r\n", command_response)
+}
+
+fn spawn_pop3_server_with_greeting(
+    path: &str,
+    greeting: &'static [u8],
+    command_response: &'static [u8],
+) -> (String, Receiver<Vec<u8>>) {
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let addr = listener.local_addr().unwrap();
     let (tx, rx) = mpsc::channel();
 
     thread::spawn(move || {
         let (mut stream, _) = listener.accept().unwrap();
-        stream.write_all(b"+OK curl POP3 test server\r\n").unwrap();
+        stream.write_all(greeting).unwrap();
 
         let mut commands = Vec::new();
         while let Some(line) = read_pop3_client_line(&mut stream) {
@@ -569,6 +577,18 @@ fn spawn_imap_server(
     path: &str,
     command_responses: Vec<(&'static str, &'static [u8])>,
 ) -> (String, Receiver<Vec<u8>>) {
+    spawn_imap_server_with_greeting(
+        path,
+        b"* OK curl IMAP test server ready\r\n",
+        command_responses,
+    )
+}
+
+fn spawn_imap_server_with_greeting(
+    path: &str,
+    greeting: &'static [u8],
+    command_responses: Vec<(&'static str, &'static [u8])>,
+) -> (String, Receiver<Vec<u8>>) {
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let addr = listener.local_addr().unwrap();
     let (tx, rx) = mpsc::channel();
@@ -576,9 +596,7 @@ fn spawn_imap_server(
 
     thread::spawn(move || {
         let (mut stream, _) = listener.accept().unwrap();
-        stream
-            .write_all(b"* OK curl IMAP test server ready\r\n")
-            .unwrap();
+        stream.write_all(greeting).unwrap();
         let mut commands = Vec::new();
         while let Some(line) = read_pop3_client_line(&mut stream) {
             commands.extend_from_slice(&line);
@@ -2632,6 +2650,22 @@ fn pop3_retr_downloads_message_and_unstuffs_dot_lines() {
 }
 
 #[test]
+fn pop3_skips_initial_banner_before_greeting() {
+    let greeting = b"        _   _ ____  _\r\n    ___| | | |  _ \\| |\r\n   / __| | | | |_) | |\r\n  | (__| |_| |  _ {| |___\r\n   \\___|\\___/|_| \\_\\_____|\r\n+OK curl POP3 server ready to serve\r\n";
+    let (url, rx) =
+        spawn_pop3_server_with_greeting("/850", greeting, b"+OK message follows\r\nhello\r\n.\r\n");
+
+    let mut command = Command::cargo_bin("curl").unwrap();
+    command.args(["-q", "-sS", "-u", "user:secret", &url]);
+    command.assert().success().stdout("hello\r\n");
+
+    assert_eq!(
+        rx.recv().unwrap(),
+        b"CAPA\r\nUSER user\r\nPASS secret\r\nRETR 850\r\nQUIT\r\n"
+    );
+}
+
+#[test]
 fn pop3_uses_url_userinfo_when_user_option_is_absent() {
     let (url, rx) = spawn_pop3_server("/42", b"+OK message follows\r\nhello\r\n.\r\n");
     let url = url.replacen("pop3://", "pop3://alice:secret@", 1);
@@ -2815,6 +2849,31 @@ fn imap_lists_mailbox_without_select() {
     assert_eq!(
         rx.recv().unwrap(),
         b"A001 CAPABILITY\r\nA002 LOGIN user secret\r\nA003 LIST \"mailbox\" *\r\nA004 LOGOUT\r\n"
+    );
+}
+
+#[test]
+fn imap_skips_initial_banner_before_greeting() {
+    let greeting = b"        _   _ ____  _\r\n    ___| | | |  _ \\| |\r\n   / __| | | | |_) | |\r\n  | (__| |_| |  _ {| |___\r\n   \\___|\\___/|_| \\_\\_____|\r\n* OK curl IMAP server ready to serve\r\n";
+    let (url, rx) = spawn_imap_server_with_greeting(
+        "/806",
+        greeting,
+        vec![(
+            "LIST \"806\" *",
+            b"* LIST () \"/\" /806/blurdybloop\r\n{tag} OK LIST completed\r\n",
+        )],
+    );
+
+    let mut command = Command::cargo_bin("curl").unwrap();
+    command.args(["-q", "-sS", "-u", "user:secret", &url]);
+    command
+        .assert()
+        .success()
+        .stdout("* LIST () \"/\" /806/blurdybloop\r\n");
+
+    assert_eq!(
+        rx.recv().unwrap(),
+        b"A001 CAPABILITY\r\nA002 LOGIN user secret\r\nA003 LIST \"806\" *\r\nA004 LOGOUT\r\n"
     );
 }
 

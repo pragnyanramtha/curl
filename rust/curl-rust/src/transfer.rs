@@ -1806,7 +1806,7 @@ async fn run_pop3_exchange(
     let command_has_body = pop3_command_has_body(&command);
 
     let mut stream = connect_tcp(host, port, transfer).await?;
-    pop3_expect_ok(pop3_read_line(&mut stream).await?, false)?;
+    pop3_expect_ok(pop3_read_greeting(&mut stream).await?, false)?;
 
     pop3_send_line(&mut stream, b"CAPA").await?;
     pop3_read_capa(&mut stream).await?;
@@ -4385,6 +4385,18 @@ async fn pop3_read_line(stream: &mut TcpStream) -> Result<Vec<u8>> {
     Ok(line)
 }
 
+async fn pop3_read_greeting(stream: &mut TcpStream) -> Result<Vec<u8>> {
+    const INITIAL_GREETING_SCAN_LIMIT: usize = 8;
+
+    for _ in 0..INITIAL_GREETING_SCAN_LIMIT {
+        let line = pop3_read_line(stream).await?;
+        if line.starts_with(b"+OK") || line.starts_with(b"-ERR") {
+            return Ok(line);
+        }
+    }
+    Err(CurlError::WeirdServerReply)
+}
+
 async fn pop3_read_capa(stream: &mut TcpStream) -> Result<()> {
     let line = pop3_read_line(stream).await?;
     if line.starts_with(b"+OK") {
@@ -4869,12 +4881,17 @@ fn imap_method_label(request: &ImapRequest) -> String {
 }
 
 async fn imap_read_greeting(stream: &mut TcpStream) -> Result<bool> {
-    let line = pop3_read_line(stream).await?;
-    match imap_untagged_status(&line) {
-        ImapStatus::Ok => Ok(false),
-        ImapStatus::Preauth => Ok(true),
-        _ => Err(CurlError::WeirdServerReply),
+    const INITIAL_GREETING_SCAN_LIMIT: usize = 8;
+
+    for _ in 0..INITIAL_GREETING_SCAN_LIMIT {
+        let line = pop3_read_line(stream).await?;
+        match imap_untagged_status(&line) {
+            ImapStatus::Ok => return Ok(false),
+            ImapStatus::Preauth => return Ok(true),
+            _ => {}
+        }
     }
+    Err(CurlError::WeirdServerReply)
 }
 
 async fn imap_logout(stream: &mut TcpStream, tag_id: &mut u16) -> Result<()> {
