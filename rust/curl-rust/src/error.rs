@@ -14,6 +14,8 @@ pub enum CurlError {
     Io(#[from] io::Error),
     #[error("transfer failed: {0}")]
     Transfer(String),
+    #[error("Maximum ({max}) redirects followed")]
+    TooManyRedirects { max: usize },
     #[error("HTTP response code said error: {status}")]
     HttpStatus { status: u16 },
 }
@@ -24,6 +26,7 @@ impl CurlError {
             Self::Usage(_) | Self::Unsupported(_) => 2,
             Self::Url(_) => 3,
             Self::Transfer(_) => 7,
+            Self::TooManyRedirects { .. } => 47,
             Self::HttpStatus { .. } => 22,
             Self::Io(_) => 23,
         }

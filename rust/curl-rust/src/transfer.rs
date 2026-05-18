@@ -418,10 +418,20 @@ async fn run_http_transfer(
 
         if transfer.auto_referer
             && transfer.follow_location
-            && redirects < transfer.max_redirs
             && is_followed_redirect(status)
             && let Some(next_url) = redirect_location(&final_url, &headers)?
         {
+            if redirects >= transfer.max_redirs {
+                metrics.url_effective = final_url.to_string();
+                metrics.response_code = Some(status.as_u16());
+                metrics.referer = custom_referer.clone().or_else(|| current_referer.clone());
+                metrics.redirect_url = Some(next_url.to_string());
+                metrics.headers = headers;
+                return Err(CurlError::TooManyRedirects {
+                    max: transfer.max_redirs,
+                });
+            }
+
             response.bytes().await.transfer_err()?;
             if custom_referer.is_none() {
                 current_referer = Some(auto_referer_value(&final_url));

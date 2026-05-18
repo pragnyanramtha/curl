@@ -948,6 +948,20 @@ fn auto_referer_tracks_immediately_previous_redirect_url() {
 }
 
 #[test]
+fn auto_referer_respects_max_redirs_limit() {
+    let (url, rx) = spawn_sequence_server(vec![
+        b"HTTP/1.1 302 Found\r\nLocation: /next\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+    ]);
+
+    let mut command = Command::cargo_bin("curl").unwrap();
+    command.args(["-q", "-sS", "-L", "--max-redirs", "0", "-e", ";auto", &url]);
+    command.assert().failure().code(47).stdout("");
+
+    let request = rx.recv().unwrap();
+    assert_eq!(header(&request, "referer"), None);
+}
+
+#[test]
 fn initial_referer_auto_replaces_referer_after_redirect() {
     let (url, rx) = spawn_sequence_server(vec![
         b"HTTP/1.1 302 Found\r\nLocation: /next\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
