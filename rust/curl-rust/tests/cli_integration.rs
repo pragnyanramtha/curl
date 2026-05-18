@@ -6017,6 +6017,34 @@ fn file_missing_source_returns_file_read_error() {
 }
 
 #[test]
+fn file_upload_writes_local_target() {
+    let temp = tempdir().unwrap();
+    let upload = temp.path().join("upload.txt");
+    let target = temp.path().join("written.txt");
+    std::fs::write(&upload, "data\nin\nfile\n").unwrap();
+    let url = Url::from_file_path(&target).unwrap().to_string();
+
+    let mut command = Command::cargo_bin("curl").unwrap();
+    command.args(["-q", "-sS", "-T", upload.to_str().unwrap(), &url]);
+    command.assert().success().stdout("");
+
+    assert_eq!(std::fs::read_to_string(target).unwrap(), "data\nin\nfile\n");
+}
+
+#[test]
+fn file_upload_missing_parent_returns_write_error() {
+    let temp = tempdir().unwrap();
+    let upload = temp.path().join("upload.txt");
+    let target = temp.path().join("missing").join("written.txt");
+    std::fs::write(&upload, "data").unwrap();
+    let url = Url::from_file_path(&target).unwrap().to_string();
+
+    let mut command = Command::cargo_bin("curl").unwrap();
+    command.args(["-q", "-sS", "-T", upload.to_str().unwrap(), &url]);
+    command.assert().failure().code(23).stdout("");
+}
+
+#[test]
 fn file_urls_accept_uppercase_scheme_and_single_slash() {
     let temp = tempdir().unwrap();
     let file = temp.path().join("plain.txt");

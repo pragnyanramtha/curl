@@ -422,12 +422,24 @@ async fn run_file_transfer(
             "{method} requests for file:// URLs"
         )));
     }
-    reject_upload_file_for_scheme(transfer, "file://")?;
 
     let url = Url::parse(&expanded.url).map_err(|error| CurlError::Url(error.to_string()))?;
     let path = url
         .to_file_path()
         .map_err(|_| CurlError::Url("file URL cannot be converted to a local path".to_string()))?;
+    if let Some(upload_file) = transfer.upload_file.as_deref() {
+        if method == "HEAD" {
+            return Err(CurlError::Unsupported(
+                "HEAD requests with --upload-file for file:// URLs".to_string(),
+            ));
+        }
+        let body = data::read_upload_body(upload_file)?;
+        std::fs::write(&path, &body)?;
+        metrics.url_effective = expanded.url.clone();
+        metrics.response_code = Some(200);
+        return Ok(());
+    }
+
     let metadata = std::fs::metadata(&path).map_err(file_read_error)?;
     let metadata_size = metadata.len();
     let output_url =
