@@ -236,6 +236,8 @@ async fn run_expanded_url(
 
     let result = if expanded.url.starts_with("file://") {
         run_file_transfer(transfer, &expanded, method.as_str(), &mut metrics).await
+    } else if expanded.url.starts_with("dict://") {
+        run_dict_transfer(transfer, &expanded, method.as_str(), &mut metrics).await
     } else if expanded.url.starts_with("gopher://") {
         run_gopher_transfer(transfer, &expanded, method.as_str(), &mut metrics).await
     } else if expanded.url.starts_with("gophers://") {
@@ -338,6 +340,57 @@ async fn run_file_transfer(
     Ok(())
 }
 
+async fn run_dict_transfer(
+    transfer: &TransferConfig,
+    expanded: &glob::ExpandedUrl,
+    method: &str,
+    metrics: &mut writeout::Metrics,
+) -> Result<()> {
+    if method != "GET" && method != "HEAD" {
+        return Err(CurlError::Unsupported(format!(
+            "{method} requests for dict:// URLs"
+        )));
+    }
+
+    let url = Url::parse(&expanded.url).map_err(|error| CurlError::Url(error.to_string()))?;
+    output::validate_output_target(transfer, &url)?;
+    let host = url
+        .host_str()
+        .ok_or_else(|| CurlError::Url("DICT URL is missing a host".to_string()))?;
+    let port = url.port().unwrap_or(2628);
+    let request = dict_request(&url)?;
+
+    let mut stream = connect_tcp(host, port, transfer).await?;
+    stream.write_all(&request).await.map_err(tcp_io_error)?;
+
+    let mut body = Vec::new();
+    if method != "HEAD" {
+        stream.read_to_end(&mut body).await.map_err(tcp_io_error)?;
+    }
+    metrics.url_effective = url.to_string();
+    metrics.size_download = body.len() as u64;
+
+    if let Some(path) = &transfer.dump_header {
+        output::dump_headers(path, &[], transfer.create_dirs)?;
+    }
+
+    let mut bytes = Vec::new();
+    if method != "HEAD" {
+        bytes.extend_from_slice(&body);
+    }
+
+    let filename = output::write_response(
+        transfer,
+        &url,
+        &reqwest::header::HeaderMap::new(),
+        &expanded.variables,
+        &bytes,
+        false,
+    )?;
+    metrics.filename_effective = filename.map(|path| path.display().to_string());
+    Ok(())
+}
+
 async fn run_gopher_transfer(
     transfer: &TransferConfig,
     expanded: &glob::ExpandedUrl,
@@ -360,17 +413,14 @@ async fn run_gopher_transfer(
     let mut header_bytes = selector.clone();
     header_bytes.extend_from_slice(b"\r\n");
 
-    let mut stream = connect_gopher(host, port, transfer).await?;
+    let mut stream = connect_tcp(host, port, transfer).await?;
     stream
         .write_all(&header_bytes)
         .await
-        .map_err(gopher_io_error)?;
+        .map_err(tcp_io_error)?;
 
     let mut body = Vec::new();
-    stream
-        .read_to_end(&mut body)
-        .await
-        .map_err(gopher_io_error)?;
+    stream.read_to_end(&mut body).await.map_err(tcp_io_error)?;
     metrics.url_effective = url.to_string();
 
     if method == "HEAD" {
@@ -399,20 +449,110 @@ async fn run_gopher_transfer(
     Ok(())
 }
 
-async fn connect_gopher(host: &str, port: u16, transfer: &TransferConfig) -> Result<TcpStream> {
+async fn connect_tcp(host: &str, port: u16, transfer: &TransferConfig) -> Result<TcpStream> {
     let connect = TcpStream::connect((host, port));
     if let Some(timeout) = transfer.connect_timeout {
         tokio::time::timeout(timeout, connect)
             .await
             .map_err(|_| CurlError::Transfer("connection timed out".to_string()))?
-            .map_err(gopher_io_error)
+            .map_err(tcp_io_error)
     } else {
-        connect.await.map_err(gopher_io_error)
+        connect.await.map_err(tcp_io_error)
     }
 }
 
-fn gopher_io_error(error: io::Error) -> CurlError {
+fn tcp_io_error(error: io::Error) -> CurlError {
     CurlError::Transfer(error.to_string())
+}
+
+fn dict_request(url: &Url) -> Result<Vec<u8>> {
+    let path = if url.path().is_empty() {
+        "/"
+    } else {
+        url.path()
+    };
+    let path = percent_decode(path.as_bytes()).collect::<Vec<_>>();
+    if path.iter().any(|byte| *byte < 32) {
+        return Err(CurlError::Url(
+            "DICT path contains a decoded control byte".to_string(),
+        ));
+    }
+
+    let command = if let Some(rest) = strip_dict_prefix(&path, &[b"/MATCH:", b"/M:", b"/FIND:"]) {
+        dict_match_command(rest)
+    } else if let Some(rest) = strip_dict_prefix(&path, &[b"/DEFINE:", b"/D:", b"/LOOKUP:"]) {
+        dict_define_command(rest)
+    } else {
+        dict_generic_command(&path)
+    };
+
+    let mut request = Vec::new();
+    request.extend_from_slice(
+        format!("CLIENT curl-rust {}\r\n", env!("CARGO_PKG_VERSION")).as_bytes(),
+    );
+    request.extend_from_slice(&command);
+    request.extend_from_slice(b"\r\nQUIT\r\n");
+    Ok(request)
+}
+
+fn strip_dict_prefix<'a>(path: &'a [u8], prefixes: &[&[u8]]) -> Option<&'a [u8]> {
+    prefixes.iter().find_map(|prefix| {
+        path.get(..prefix.len())
+            .is_some_and(|start| start.eq_ignore_ascii_case(prefix))
+            .then_some(&path[prefix.len()..])
+    })
+}
+
+fn dict_match_command(rest: &[u8]) -> Vec<u8> {
+    let mut parts = rest.split(|byte| *byte == b':');
+    let word = default_if_empty(parts.next(), b"default");
+    let database = default_if_empty(parts.next(), b"!");
+    let strategy = default_if_empty(parts.next(), b".");
+
+    let mut command = Vec::from(&b"MATCH "[..]);
+    command.extend_from_slice(database);
+    command.push(b' ');
+    command.extend_from_slice(strategy);
+    command.push(b' ');
+    command.extend_from_slice(&dict_escape_word(word));
+    command
+}
+
+fn dict_define_command(rest: &[u8]) -> Vec<u8> {
+    let mut parts = rest.split(|byte| *byte == b':');
+    let word = default_if_empty(parts.next(), b"default");
+    let database = default_if_empty(parts.next(), b"!");
+
+    let mut command = Vec::from(&b"DEFINE "[..]);
+    command.extend_from_slice(database);
+    command.push(b' ');
+    command.extend_from_slice(&dict_escape_word(word));
+    command
+}
+
+fn dict_generic_command(path: &[u8]) -> Vec<u8> {
+    let mut command = path.strip_prefix(b"/").unwrap_or(path).to_vec();
+    for byte in &mut command {
+        if *byte == b':' {
+            *byte = b' ';
+        }
+    }
+    command
+}
+
+fn default_if_empty<'a>(value: Option<&'a [u8]>, default: &'a [u8]) -> &'a [u8] {
+    value.filter(|value| !value.is_empty()).unwrap_or(default)
+}
+
+fn dict_escape_word(word: &[u8]) -> Vec<u8> {
+    let mut escaped = Vec::with_capacity(word.len());
+    for byte in word {
+        if *byte <= 32 || *byte == 127 || matches!(*byte, b'\'' | b'"' | b'\\') {
+            escaped.push(b'\\');
+        }
+        escaped.push(*byte);
+    }
+    escaped
 }
 
 fn gopher_selector(url: &Url) -> Result<Vec<u8>> {

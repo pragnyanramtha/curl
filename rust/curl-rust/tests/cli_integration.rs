@@ -8,6 +8,8 @@ use assert_cmd::Command;
 use tempfile::tempdir;
 use url::Url;
 
+const DICT_GREETING: &[u8] = b"220 dictserver <xnooptions> <msgid@msgid>\n";
+
 #[derive(Debug)]
 struct RequestRecord {
     start_line: String,
@@ -33,6 +35,36 @@ fn spawn_sequence_server(responses: Vec<&'static [u8]>) -> (String, Receiver<Req
     });
 
     (format!("http://{addr}/resource"), rx)
+}
+
+fn spawn_dict_server(response: &'static [u8]) -> (String, Receiver<Vec<u8>>) {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = listener.local_addr().unwrap();
+    let (tx, rx) = mpsc::channel();
+
+    thread::spawn(move || {
+        let (mut stream, _) = listener.accept().unwrap();
+        stream.write_all(DICT_GREETING).unwrap();
+
+        let mut bytes = Vec::new();
+        let mut buffer = [0; 1024];
+
+        loop {
+            let read = stream.read(&mut buffer).unwrap();
+            if read == 0 {
+                break;
+            }
+            bytes.extend_from_slice(&buffer[..read]);
+            if bytes.ends_with(b"QUIT\r\n") {
+                break;
+            }
+        }
+
+        tx.send(bytes).unwrap();
+        let _ = stream.write_all(response);
+    });
+
+    (format!("dict://{addr}/d:basic"), rx)
 }
 
 fn spawn_timed_server(
@@ -139,6 +171,16 @@ fn header<'a>(request: &'a RequestRecord, name: &str) -> Option<&'a str> {
         .iter()
         .find(|(header_name, _)| header_name == name)
         .map(|(_, value)| value.as_str())
+}
+
+fn expected_dict_request(command: &[u8]) -> Vec<u8> {
+    let mut request = Vec::new();
+    request.extend_from_slice(
+        format!("CLIENT curl-rust {}\r\n", env!("CARGO_PKG_VERSION")).as_bytes(),
+    );
+    request.extend_from_slice(command);
+    request.extend_from_slice(b"\r\nQUIT\r\n");
+    request
 }
 
 #[test]
@@ -272,6 +314,222 @@ fn http2_does_not_force_prior_knowledge() {
 
     let request = rx.recv().unwrap();
     assert!(request.start_line.starts_with("GET /resource HTTP/1.1"));
+}
+
+#[test]
+fn dict_define_outputs_server_lines_and_sends_request() {
+    let (url, rx) = spawn_dict_server(b"552 No matches\n");
+
+    let mut command = Command::cargo_bin("curl").unwrap();
+    command.args(["-q", "-sS", &url]);
+    command
+        .assert()
+        .success()
+        .stdout("220 dictserver <xnooptions> <msgid@msgid>\n552 No matches\n");
+
+    assert_eq!(rx.recv().unwrap(), expected_dict_request(b"DEFINE ! basic"));
+}
+
+#[test]
+fn dict_aliases_preserve_case_and_ignore_extra_fields() {
+    let (url, rx) = spawn_dict_server(b"552 No matches\n");
+    let url = url.replace("/d:basic", "/Lookup:Basic:gcide:ignored");
+
+    let mut command = Command::cargo_bin("curl").unwrap();
+    command.args(["-q", "-sS", &url]);
+    command.assert().success();
+
+    assert_eq!(
+        rx.recv().unwrap(),
+        expected_dict_request(b"DEFINE gcide Basic")
+    );
+}
+
+#[test]
+fn dict_match_alias_sends_database_strategy_and_word() {
+    let (url, rx) = spawn_dict_server(b"552 No matches\n");
+    let url = url.replace("/d:basic", "/find:curl:db:strat:ignored");
+
+    let mut command = Command::cargo_bin("curl").unwrap();
+    command.args(["-q", "-sS", &url]);
+    command.assert().success();
+
+    assert_eq!(
+        rx.recv().unwrap(),
+        expected_dict_request(b"MATCH db strat curl")
+    );
+}
+
+#[test]
+fn dict_empty_fields_use_curl_defaults() {
+    let (url, rx) = spawn_dict_server(b"552 No matches\n");
+    let url = url.replace("/d:basic", "/m:word::");
+
+    let mut command = Command::cargo_bin("curl").unwrap();
+    command.args(["-q", "-sS", &url]);
+    command.assert().success();
+
+    assert_eq!(rx.recv().unwrap(), expected_dict_request(b"MATCH ! . word"));
+}
+
+#[test]
+fn dict_generic_command_replaces_colons_with_spaces() {
+    let (url, rx) = spawn_dict_server(b"552 No matches\n");
+    let url = url.replace("/d:basic", "/show:db:extra");
+
+    let mut command = Command::cargo_bin("curl").unwrap();
+    command.args(["-q", "-sS", &url]);
+    command.assert().success();
+
+    assert_eq!(rx.recv().unwrap(), expected_dict_request(b"show db extra"));
+}
+
+#[test]
+fn dict_percent_decodes_and_escapes_words() {
+    let (url, rx) = spawn_dict_server(b"552 No matches\n");
+    let url = url.replace("/d:basic", "/d:hello%20%22%27%5C%7F");
+
+    let mut command = Command::cargo_bin("curl").unwrap();
+    command.args(["-q", "-sS", &url]);
+    command.assert().success();
+
+    let mut expected = b"DEFINE ! hello\\ \\\"\\'".to_vec();
+    expected.extend_from_slice(b"\\\\");
+    expected.extend_from_slice(&[b'\\', 0x7f]);
+    assert_eq!(rx.recv().unwrap(), expected_dict_request(&expected));
+}
+
+#[test]
+fn dict_query_is_ignored_when_building_request() {
+    let (url, rx) = spawn_dict_server(b"552 No matches\n");
+    let url = format!("{url}?ignored");
+
+    let mut command = Command::cargo_bin("curl").unwrap();
+    command.args(["-q", "-sS", &url]);
+    command.assert().success();
+
+    assert_eq!(rx.recv().unwrap(), expected_dict_request(b"DEFINE ! basic"));
+}
+
+#[test]
+fn dict_head_sends_request_without_output_body() {
+    let (url, rx) = spawn_dict_server(b"552 No matches\n");
+
+    let mut command = Command::cargo_bin("curl").unwrap();
+    command.args([
+        "-q",
+        "-sS",
+        "-I",
+        "-w",
+        "%{size_download} %{http_code}",
+        &url,
+    ]);
+    command.assert().success().stdout("0 000");
+
+    assert_eq!(rx.recv().unwrap(), expected_dict_request(b"DEFINE ! basic"));
+}
+
+#[test]
+fn dict_dump_header_creates_empty_file() {
+    let temp = tempdir().unwrap();
+    let dump = temp.path().join("dict.headers");
+    let (url, rx) = spawn_dict_server(b"552 No matches\n");
+
+    let mut command = Command::cargo_bin("curl").unwrap();
+    command.args(["-q", "-sS", "-D", dump.to_str().unwrap(), &url]);
+    command
+        .assert()
+        .success()
+        .stdout("220 dictserver <xnooptions> <msgid@msgid>\n552 No matches\n");
+
+    assert_eq!(rx.recv().unwrap(), expected_dict_request(b"DEFINE ! basic"));
+    assert_eq!(std::fs::read(dump).unwrap(), b"");
+}
+
+#[test]
+fn dict_dump_header_dash_writes_no_extra_output() {
+    let (url, rx) = spawn_dict_server(b"552 No matches\n");
+
+    let mut command = Command::cargo_bin("curl").unwrap();
+    command.args(["-q", "-sS", "-D", "-", &url]);
+    command
+        .assert()
+        .success()
+        .stdout("220 dictserver <xnooptions> <msgid@msgid>\n552 No matches\n");
+
+    assert_eq!(rx.recv().unwrap(), expected_dict_request(b"DEFINE ! basic"));
+}
+
+#[test]
+fn dict_include_does_not_add_header_bytes() {
+    let (url, rx) = spawn_dict_server(b"552 No matches\n");
+
+    let mut command = Command::cargo_bin("curl").unwrap();
+    command.args(["-q", "-sS", "-i", &url]);
+    command
+        .assert()
+        .success()
+        .stdout("220 dictserver <xnooptions> <msgid@msgid>\n552 No matches\n");
+
+    assert_eq!(rx.recv().unwrap(), expected_dict_request(b"DEFINE ! basic"));
+}
+
+#[test]
+fn dict_writeout_reports_zero_http_code_and_download_size() {
+    let (url, rx) = spawn_dict_server(b"552 No matches\n");
+    let expected_size = DICT_GREETING.len() + b"552 No matches\n".len();
+
+    let mut command = Command::cargo_bin("curl").unwrap();
+    command.args([
+        "-q",
+        "-sS",
+        "-w",
+        " %{http_code} %{size_download} %{header_json}",
+        &url,
+    ]);
+    command.assert().success().stdout(format!(
+        "220 dictserver <xnooptions> <msgid@msgid>\n552 No matches\n 000 {expected_size} {{}}"
+    ));
+
+    assert_eq!(rx.recv().unwrap(), expected_dict_request(b"DEFINE ! basic"));
+}
+
+#[test]
+fn dict_remote_name_writes_url_filename() {
+    let temp = tempdir().unwrap();
+    let (url, rx) = spawn_dict_server(b"552 No matches\n");
+    let url = url.replace("/d:basic", "/d:result.txt");
+
+    let mut command = Command::cargo_bin("curl").unwrap();
+    command
+        .current_dir(temp.path())
+        .args(["-q", "-sS", "-O", &url]);
+    command.assert().success().stdout("");
+
+    assert_eq!(
+        rx.recv().unwrap(),
+        expected_dict_request(b"DEFINE ! result.txt")
+    );
+    assert_eq!(
+        std::fs::read_to_string(temp.path().join("d:result.txt")).unwrap(),
+        "220 dictserver <xnooptions> <msgid@msgid>\n552 No matches\n"
+    );
+}
+
+#[test]
+fn dict_rejects_decoded_control_path() {
+    let mut command = Command::cargo_bin("curl").unwrap();
+    command.args(["-q", "-sS", "dict://example.invalid/d:%0A"]);
+    command.assert().failure().code(3).stdout("");
+}
+
+#[test]
+fn version_lists_dict_protocol() {
+    let mut command = Command::cargo_bin("curl").unwrap();
+    let output = command.args(["-q", "-V"]).output().unwrap();
+
+    assert!(output.status.success());
+    assert!(String::from_utf8(output.stdout).unwrap().contains("DICT"));
 }
 
 #[test]
