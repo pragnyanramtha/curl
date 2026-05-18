@@ -3,6 +3,8 @@ use std::path::Path;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+use tokio::task::JoinSet;
+
 use reqwest::header::{
     ACCEPT, ACCEPT_ENCODING, AUTHORIZATION, CONTENT_LENGTH, CONTENT_TYPE, COOKIE, ETAG, HeaderName,
     HeaderValue, IF_MODIFIED_SINCE, IF_NONE_MATCH, IF_UNMODIFIED_SINCE, LOCATION, RANGE, REFERER,
@@ -27,6 +29,10 @@ struct HttpAttempt {
 }
 
 pub async fn run(config: Config) -> Result<i32> {
+    if config.parallel {
+        return run_parallel(config).await;
+    }
+
     let mut final_code = 0;
 
     for transfer in &config.transfers {
@@ -50,6 +56,97 @@ pub async fn run(config: Config) -> Result<i32> {
     }
 
     Ok(final_code)
+}
+
+struct ParallelJob {
+    index: usize,
+    transfer: TransferConfig,
+    client: Client,
+    expanded: glob::ExpandedUrl,
+}
+
+struct CookieSave {
+    path: std::path::PathBuf,
+    jar: Arc<CookieJar>,
+    create_dirs: bool,
+    verbose: bool,
+}
+
+async fn run_parallel(config: Config) -> Result<i32> {
+    let (jobs, cookie_saves) = parallel_jobs(&config)?;
+    let mut results = vec![0; jobs.len()];
+    let mut pending = jobs.into_iter();
+    let mut active = JoinSet::new();
+
+    while active.len() < config.parallel_max {
+        let Some(job) = pending.next() else {
+            break;
+        };
+        spawn_parallel_job(&mut active, job);
+    }
+
+    while let Some(joined) = active.join_next().await {
+        let (index, code) = joined.map_err(|error| {
+            CurlError::Transfer(format!("parallel transfer task failed: {error}"))
+        })??;
+        results[index] = code;
+
+        if let Some(job) = pending.next() {
+            spawn_parallel_job(&mut active, job);
+        }
+    }
+
+    for save in cookie_saves {
+        save.jar
+            .save_to_path(&save.path, save.create_dirs, save.verbose);
+    }
+
+    Ok(results
+        .into_iter()
+        .rev()
+        .find(|code| *code != 0)
+        .unwrap_or(0))
+}
+
+fn parallel_jobs(config: &Config) -> Result<(Vec<ParallelJob>, Vec<CookieSave>)> {
+    let mut jobs = Vec::new();
+    let mut cookie_saves = Vec::new();
+
+    for transfer in &config.transfers {
+        let cookie_jar = transfer
+            .cookie_jar
+            .as_ref()
+            .map(|_| Arc::new(CookieJar::default()));
+        let client = build_client(transfer, cookie_jar.clone())?;
+        let expanded_urls = expand_urls(transfer)?;
+
+        if let (Some(path), Some(cookie_jar)) = (&transfer.cookie_jar, &cookie_jar) {
+            cookie_saves.push(CookieSave {
+                path: path.clone(),
+                jar: cookie_jar.clone(),
+                create_dirs: transfer.create_dirs,
+                verbose: transfer.verbose,
+            });
+        }
+
+        for expanded in expanded_urls {
+            jobs.push(ParallelJob {
+                index: jobs.len(),
+                transfer: transfer.clone(),
+                client: client.clone(),
+                expanded,
+            });
+        }
+    }
+
+    Ok((jobs, cookie_saves))
+}
+
+fn spawn_parallel_job(active: &mut JoinSet<Result<(usize, i32)>>, job: ParallelJob) {
+    active.spawn(async move {
+        let code = run_expanded_url(&job.transfer, &job.client, job.expanded).await?;
+        Ok((job.index, code))
+    });
 }
 
 fn expand_urls(transfer: &TransferConfig) -> Result<Vec<glob::ExpandedUrl>> {

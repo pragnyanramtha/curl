@@ -2,7 +2,7 @@ use std::io::{Read, Write};
 use std::net::TcpListener;
 use std::sync::mpsc::{self, Receiver};
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use assert_cmd::Command;
 use tempfile::tempdir;
@@ -30,6 +30,25 @@ fn spawn_sequence_server(responses: Vec<&'static [u8]>) -> (String, Receiver<Req
             tx.send(read_request(&mut stream)).unwrap();
             stream.write_all(response).unwrap();
         }
+    });
+
+    (format!("http://{addr}/resource"), rx)
+}
+
+fn spawn_timed_server(
+    response: &'static [u8],
+    response_delay: Duration,
+) -> (String, Receiver<Instant>) {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = listener.local_addr().unwrap();
+    let (tx, rx) = mpsc::channel();
+
+    thread::spawn(move || {
+        let (mut stream, _) = listener.accept().unwrap();
+        let _request = read_request(&mut stream);
+        tx.send(Instant::now()).unwrap();
+        thread::sleep(response_delay);
+        stream.write_all(response).unwrap();
     });
 
     (format!("http://{addr}/resource"), rx)
@@ -475,6 +494,53 @@ fn libcurl_writes_source_file_for_supported_options() {
     assert!(text.contains("CURLOPT_USERAGENT, \"MyUA\""));
     assert!(text.contains("CURLOPT_HTTP_VERSION, CURL_HTTP_VERSION_1_1"));
     assert!(text.contains("curl_easy_perform(curl);"));
+}
+
+#[test]
+fn parallel_runs_transfers_concurrently_to_files() {
+    let (slow_url, slow_rx) = spawn_timed_server(
+        b"HTTP/1.1 200 OK\r\nContent-Length: 4\r\n\r\nslow",
+        Duration::from_millis(900),
+    );
+    let (fast_url, fast_rx) = spawn_timed_server(
+        b"HTTP/1.1 200 OK\r\nContent-Length: 4\r\n\r\nfast",
+        Duration::ZERO,
+    );
+    let temp = tempdir().unwrap();
+    let slow_out = temp.path().join("slow.txt");
+    let fast_out = temp.path().join("fast.txt");
+
+    let mut command = Command::cargo_bin("curl").unwrap();
+    command.args([
+        "-q",
+        "-sS",
+        "--parallel",
+        "--parallel-max",
+        "2",
+        "-o",
+        slow_out.to_str().unwrap(),
+        &slow_url,
+        "--next",
+        "-o",
+        fast_out.to_str().unwrap(),
+        &fast_url,
+    ]);
+    command.assert().success().stdout("");
+
+    let slow_started = slow_rx.recv().unwrap();
+    let fast_started = fast_rx.recv().unwrap();
+    let delta = if fast_started >= slow_started {
+        fast_started.duration_since(slow_started)
+    } else {
+        slow_started.duration_since(fast_started)
+    };
+
+    assert!(
+        delta < Duration::from_millis(700),
+        "expected concurrent request starts, got {delta:?}"
+    );
+    assert_eq!(std::fs::read_to_string(slow_out).unwrap(), "slow");
+    assert_eq!(std::fs::read_to_string(fast_out).unwrap(), "fast");
 }
 
 #[test]

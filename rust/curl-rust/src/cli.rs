@@ -6,11 +6,19 @@ use std::time::Duration;
 use crate::data::{DataKind, DataSpec, FormKind, FormSpec};
 use crate::error::{CurlError, Result};
 
+pub const PARALLEL_DEFAULT: usize = 50;
+pub const PARALLEL_MAX_LIMIT: usize = 65_535;
+pub const PARALLEL_MAX_HOST_DEFAULT: usize = 0;
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Config {
     pub show_help: bool,
     pub show_version: bool,
     pub libcurl: Option<PathBuf>,
+    pub parallel: bool,
+    pub parallel_immediate: bool,
+    pub parallel_max: usize,
+    pub parallel_max_host: usize,
     pub transfers: Vec<TransferConfig>,
 }
 
@@ -87,6 +95,10 @@ impl Default for Config {
             show_help: false,
             show_version: false,
             libcurl: None,
+            parallel: false,
+            parallel_immediate: false,
+            parallel_max: PARALLEL_DEFAULT,
+            parallel_max_host: PARALLEL_MAX_HOST_DEFAULT,
             transfers: vec![TransferConfig::default()],
         }
     }
@@ -252,6 +264,22 @@ impl Parser {
             }
             "next" => {
                 self.config.transfers.push(TransferConfig::default());
+            }
+            "parallel" => self.config.parallel = true,
+            "parallel-immediate" => self.config.parallel_immediate = true,
+            "parallel-max" => {
+                let value = self.value_for(name, inline_value)?;
+                self.config.parallel_max =
+                    parse_limited_usize(name, &value, PARALLEL_DEFAULT, PARALLEL_MAX_LIMIT)?;
+            }
+            "parallel-max-host" => {
+                let value = self.value_for(name, inline_value)?;
+                self.config.parallel_max_host = parse_limited_usize(
+                    name,
+                    &value,
+                    PARALLEL_MAX_HOST_DEFAULT,
+                    PARALLEL_MAX_LIMIT,
+                )?;
             }
             "request" => {
                 let value = self.value_for(name, inline_value)?;
@@ -460,6 +488,8 @@ impl Parser {
             "head" => self.current().head = false,
             "get" => self.current().get = false,
             "include" => self.current().include_headers = false,
+            "parallel" => self.config.parallel = false,
+            "parallel-immediate" => self.config.parallel_immediate = false,
             "remote-name" => self.current().remote_name = false,
             "remote-header-name" => self.current().remote_header_name = false,
             "location" | "location-trusted" => self.current().follow_location = false,
@@ -503,6 +533,7 @@ impl Parser {
                     self.insert_config_file(&value)?;
                     break;
                 }
+                'Z' => self.config.parallel = true,
                 ':' => self.config.transfers.push(TransferConfig::default()),
                 'X' => {
                     let value = self.short_value('X', rest)?;
@@ -746,6 +777,15 @@ fn parse_usize(name: &str, value: &str) -> Result<usize> {
         .map_err(|_| CurlError::Usage(format!("option --{name} expects an integer")))
 }
 
+fn parse_limited_usize(name: &str, value: &str, default: usize, limit: usize) -> Result<usize> {
+    let value = parse_usize(name, value)?;
+    Ok(if value == 0 {
+        default
+    } else {
+        value.min(limit)
+    })
+}
+
 fn parse_u64(name: &str, value: &str) -> Result<u64> {
     value
         .parse()
@@ -809,6 +849,8 @@ pub fn print_help() {
            -H, --header <header>       Pass custom header\n\
            -I, --head                  Show document information only\n\
            -L, --location              Follow redirects\n\
+           -Z, --parallel              Perform transfers in parallel\n\
+               --parallel-max <num>    Maximum parallel transfer count\n\
                --retry <num>           Retry transient transfer problems\n\
                --retry-delay <seconds> Wait time between retries\n\
                --retry-max-time <sec>  Retry only within this period\n\
@@ -1195,6 +1237,92 @@ mod tests {
             "-q",
             "--libcurl",
             "client.c",
+            "--next",
+            "https://example.com",
+        ])
+        .unwrap();
+
+        assert_eq!(config.transfers.len(), 1);
+        assert_eq!(config.transfers[0].urls, ["https://example.com"]);
+    }
+
+    #[test]
+    fn parses_parallel_options_as_global_state() {
+        let config = parse_args([
+            "-q",
+            "-Z",
+            "--parallel-immediate",
+            "--parallel-max",
+            "2",
+            "--parallel-max-host",
+            "3",
+            "https://example.com",
+        ])
+        .unwrap();
+
+        assert!(config.parallel);
+        assert!(config.parallel_immediate);
+        assert_eq!(config.parallel_max, 2);
+        assert_eq!(config.parallel_max_host, 3);
+
+        let config =
+            parse_args(["-q", "--parallel", "--no-parallel", "https://example.com"]).unwrap();
+        assert!(!config.parallel);
+
+        let config = parse_args([
+            "-q",
+            "--parallel-immediate",
+            "--no-parallel-immediate",
+            "https://example.com",
+        ])
+        .unwrap();
+        assert!(!config.parallel_immediate);
+    }
+
+    #[test]
+    fn clamps_parallel_limits_like_c_curl() {
+        let config = parse_args([
+            "-q",
+            "--parallel-max",
+            "0",
+            "--parallel-max-host",
+            "0",
+            "https://example.com",
+        ])
+        .unwrap();
+        assert_eq!(config.parallel_max, PARALLEL_DEFAULT);
+        assert_eq!(config.parallel_max_host, PARALLEL_MAX_HOST_DEFAULT);
+
+        let config = parse_args([
+            "-q",
+            "--parallel-max",
+            "70000",
+            "--parallel-max-host",
+            "70000",
+            "https://example.com",
+        ])
+        .unwrap();
+        assert_eq!(config.parallel_max, PARALLEL_MAX_LIMIT);
+        assert_eq!(config.parallel_max_host, PARALLEL_MAX_LIMIT);
+    }
+
+    #[test]
+    fn rejects_bad_parallel_limits() {
+        let error = parse_args(["-q", "--parallel-max", "abc", "https://example.com"]).unwrap_err();
+        assert!(error.to_string().contains("expects an integer"));
+
+        let error =
+            parse_args(["-q", "--parallel-max-host", "abc", "https://example.com"]).unwrap_err();
+        assert!(error.to_string().contains("expects an integer"));
+    }
+
+    #[test]
+    fn parallel_options_do_not_retain_empty_groups() {
+        let config = parse_args([
+            "-q",
+            "--parallel",
+            "--parallel-max",
+            "2",
             "--next",
             "https://example.com",
         ])
