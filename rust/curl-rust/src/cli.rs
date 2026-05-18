@@ -438,11 +438,8 @@ impl Parser {
                 let value = self.value_for(name, inline_value)?;
                 self.current().retry_max_time = parse_duration(name, &value)?;
             }
-            "fail" => self.current().fail = true,
-            "fail-with-body" => {
-                self.current().fail = true;
-                self.current().fail_with_body = true;
-            }
+            "fail" => self.set_fail_without_body(),
+            "fail-with-body" => self.set_fail_with_body(),
             "user" => {
                 let value = self.value_for(name, inline_value)?;
                 self.current().user = Some(value);
@@ -524,7 +521,10 @@ impl Parser {
                 self.current().fail = false;
                 self.current().fail_with_body = false;
             }
-            "fail-with-body" => self.current().fail_with_body = false,
+            "fail-with-body" => {
+                self.current().fail = false;
+                self.current().fail_with_body = false;
+            }
             "insecure" => self.current().insecure = false,
             "junk-session-cookies" => self.current().junk_session_cookies = false,
             "compressed" => self.current().compressed = false,
@@ -646,7 +646,7 @@ impl Parser {
                     break;
                 }
                 'L' => self.current().follow_location = true,
-                'f' => self.current().fail = true,
+                'f' => self.set_fail_without_body(),
                 'u' => {
                     let value = self.short_value('u', rest)?;
                     self.current().user = Some(value);
@@ -741,6 +741,24 @@ impl Parser {
         } else {
             self.current().cookie_files.push(value);
         }
+    }
+
+    fn set_fail_without_body(&mut self) {
+        let transfer = self.current();
+        if transfer.fail_with_body {
+            eprintln!("Warning: --fail deselects --fail-with-body here");
+        }
+        transfer.fail = true;
+        transfer.fail_with_body = false;
+    }
+
+    fn set_fail_with_body(&mut self) {
+        let transfer = self.current();
+        if transfer.fail && !transfer.fail_with_body {
+            eprintln!("Warning: --fail-with-body deselects --fail here");
+        }
+        transfer.fail = true;
+        transfer.fail_with_body = true;
     }
 
     fn set_referer(&mut self, value: String) {
@@ -1649,5 +1667,28 @@ mod tests {
         let transfer = &config.transfers[0];
         assert!(!transfer.follow_location);
         assert!(!transfer.compressed);
+    }
+
+    #[test]
+    fn fail_options_are_mutexed_with_last_one_winning() {
+        let config =
+            parse_args(["-q", "--fail-with-body", "--fail", "https://example.com"]).unwrap();
+        assert!(config.transfers[0].fail);
+        assert!(!config.transfers[0].fail_with_body);
+
+        let config =
+            parse_args(["-q", "--fail", "--fail-with-body", "https://example.com"]).unwrap();
+        assert!(config.transfers[0].fail);
+        assert!(config.transfers[0].fail_with_body);
+
+        let config = parse_args([
+            "-q",
+            "--fail-with-body",
+            "--no-fail-with-body",
+            "https://example.com",
+        ])
+        .unwrap();
+        assert!(!config.transfers[0].fail);
+        assert!(!config.transfers[0].fail_with_body);
     }
 }

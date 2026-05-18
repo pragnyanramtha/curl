@@ -398,6 +398,138 @@ fn nontransient_http_status_is_not_retried_without_retry_all_errors() {
 }
 
 #[test]
+fn fail_suppresses_http_error_body() {
+    let (url, rx) = spawn_server(b"HTTP/1.1 404 Not Found\r\nContent-Length: 7\r\n\r\nmissing");
+
+    let mut command = Command::cargo_bin("curl").unwrap();
+    command.args(["-q", "-sS", "--fail", &url]);
+    command.assert().failure().code(22).stdout("");
+
+    rx.recv().unwrap();
+}
+
+#[test]
+fn fail_with_body_outputs_http_error_body_and_fails() {
+    let (url, rx) = spawn_server(b"HTTP/1.1 404 Not Found\r\nContent-Length: 7\r\n\r\nmissing");
+
+    let mut command = Command::cargo_bin("curl").unwrap();
+    command.args(["-q", "-sS", "--fail-with-body", &url]);
+    command.assert().failure().code(22).stdout("missing");
+
+    rx.recv().unwrap();
+}
+
+#[test]
+fn fail_after_fail_with_body_suppresses_error_body() {
+    let (url, rx) = spawn_server(b"HTTP/1.1 404 Not Found\r\nContent-Length: 7\r\n\r\nmissing");
+
+    let mut command = Command::cargo_bin("curl").unwrap();
+    let output = command
+        .args(["-q", "-sS", "--fail-with-body", "--fail", &url])
+        .output()
+        .unwrap();
+
+    assert_eq!(output.status.code(), Some(22));
+    assert_eq!(output.stdout, b"");
+    assert!(
+        String::from_utf8_lossy(&output.stderr)
+            .contains("Warning: --fail deselects --fail-with-body here")
+    );
+    rx.recv().unwrap();
+}
+
+#[test]
+fn fail_with_body_after_fail_outputs_error_body() {
+    let (url, rx) = spawn_server(b"HTTP/1.1 404 Not Found\r\nContent-Length: 7\r\n\r\nmissing");
+
+    let mut command = Command::cargo_bin("curl").unwrap();
+    let output = command
+        .args(["-q", "-sS", "--fail", "--fail-with-body", &url])
+        .output()
+        .unwrap();
+
+    assert_eq!(output.status.code(), Some(22));
+    assert_eq!(output.stdout, b"missing");
+    assert!(
+        String::from_utf8_lossy(&output.stderr)
+            .contains("Warning: --fail-with-body deselects --fail here")
+    );
+    rx.recv().unwrap();
+}
+
+#[test]
+fn no_fail_with_body_disables_http_error_failure() {
+    let (url, rx) = spawn_server(b"HTTP/1.1 404 Not Found\r\nContent-Length: 7\r\n\r\nmissing");
+
+    let mut command = Command::cargo_bin("curl").unwrap();
+    command.args(["-q", "-sS", "--fail-with-body", "--no-fail-with-body", &url]);
+    command.assert().success().stdout("missing");
+
+    rx.recv().unwrap();
+}
+
+#[test]
+fn fail_include_outputs_headers_without_error_body() {
+    let (url, rx) =
+        spawn_server(b"HTTP/1.1 404 Not Found\r\nX-Test: yes\r\nContent-Length: 7\r\n\r\nmissing");
+
+    let mut command = Command::cargo_bin("curl").unwrap();
+    let output = command
+        .args(["-q", "-sS", "--fail", "-i", &url])
+        .output()
+        .unwrap();
+
+    assert_eq!(output.status.code(), Some(22));
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    assert!(stdout.starts_with("HTTP/1.1 404 Not Found\r\n"));
+    assert!(stdout.contains("x-test: yes\r\n"));
+    assert!(!stdout.contains("missing"));
+    rx.recv().unwrap();
+}
+
+#[test]
+fn fail_writeout_reports_zero_delivered_body_bytes() {
+    let (url, rx) = spawn_server(b"HTTP/1.1 404 Not Found\r\nContent-Length: 7\r\n\r\nmissing");
+
+    let mut command = Command::cargo_bin("curl").unwrap();
+    command.args([
+        "-q",
+        "-sS",
+        "--fail",
+        "-w",
+        " %{http_code} %{size_download} %{exitcode}",
+        &url,
+    ]);
+    command.assert().failure().code(22).stdout(" 404 0 22");
+
+    rx.recv().unwrap();
+}
+
+#[test]
+fn fail_with_body_retry_outputs_failed_and_successful_bodies() {
+    let (url, rx) = spawn_sequence_server(vec![
+        b"HTTP/1.1 503 Service Unavailable\r\nContent-Length: 3\r\n\r\nmoo",
+        b"HTTP/1.1 200 OK\r\nContent-Length: 3\r\n\r\nhey",
+    ]);
+
+    let mut command = Command::cargo_bin("curl").unwrap();
+    command.args([
+        "-q",
+        "-sS",
+        "--fail-with-body",
+        "--retry",
+        "1",
+        "--retry-delay",
+        "0.001",
+        &url,
+    ]);
+    command.assert().success().stdout("moohey");
+
+    rx.recv().unwrap();
+    rx.recv().unwrap();
+}
+
+#[test]
 fn retry_after_respects_retry_max_time() {
     let (url, rx) = spawn_server(
         b"HTTP/1.1 503 Service Unavailable\r\nRetry-After: 200\r\nContent-Length: 4\r\n\r\nslow",

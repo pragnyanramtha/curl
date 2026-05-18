@@ -1008,8 +1008,15 @@ async fn run_http_with_retries(
         match run_http_transfer(transfer, client, expanded, method.clone(), metrics).await {
             Ok(attempt) => {
                 if should_retry_http_attempt(transfer, &attempt)
-                    && schedule_retry(transfer, metrics, retry_started, attempt.retry_after).await
+                    && retry_delay_for_next(transfer, metrics, retry_started, attempt.retry_after)
+                        .is_some()
                 {
+                    if transfer.fail_with_body && is_http_error_status(attempt.status) {
+                        write_http_attempt_output(
+                            transfer, expanded, &method, metrics, &attempt, false,
+                        )?;
+                    }
+                    schedule_retry(transfer, metrics, retry_started, attempt.retry_after).await;
                     continue;
                 }
                 return finish_http_transfer(transfer, expanded, method, metrics, attempt);
@@ -1045,25 +1052,49 @@ fn finish_http_transfer(
     metrics: &mut writeout::Metrics,
     attempt: HttpAttempt,
 ) -> Result<()> {
+    write_http_attempt_output(transfer, expanded, &method, metrics, &attempt, true)?;
+
+    if transfer.fail && is_http_error_status(attempt.status) {
+        return Err(CurlError::HttpStatus {
+            status: attempt.status.as_u16(),
+        });
+    }
+
+    Ok(())
+}
+
+fn write_http_attempt_output(
+    transfer: &TransferConfig,
+    expanded: &glob::ExpandedUrl,
+    method: &Method,
+    metrics: &mut writeout::Metrics,
+    attempt: &HttpAttempt,
+    persist_headers: bool,
+) -> Result<()> {
     let header_bytes = output::render_headers(attempt.version, attempt.status, &attempt.headers);
-    if let Some(path) = &transfer.dump_header {
+    if persist_headers && let Some(path) = &transfer.dump_header {
         output::dump_headers(path, &header_bytes, transfer.create_dirs)?;
     }
-    if let Some(path) = &transfer.etag_save {
+    if persist_headers && let Some(path) = &transfer.etag_save {
         save_etag(path, &attempt.headers, transfer.create_dirs)?;
     }
 
-    let should_write_body =
-        !transfer.fail || !attempt.status.is_client_error() && !attempt.status.is_server_error();
-    let should_write_fail_body = transfer.fail_with_body
-        && (attempt.status.is_client_error() || attempt.status.is_server_error());
+    let is_error = is_http_error_status(attempt.status);
+    let write_headers = transfer.include_headers || transfer.head;
+    let write_body =
+        method.as_str() != "HEAD" && (!is_error || !transfer.fail || transfer.fail_with_body);
+    metrics.size_download = if write_body {
+        attempt.body.len() as u64
+    } else {
+        0
+    };
 
-    if should_write_body || should_write_fail_body {
+    if write_headers || write_body {
         let mut bytes = Vec::new();
-        if transfer.include_headers || transfer.head {
+        if write_headers {
             bytes.extend_from_slice(&header_bytes);
         }
-        if method != Method::HEAD {
+        if write_body {
             bytes.extend_from_slice(&attempt.body);
         }
         let filename = output::write_response(
@@ -1077,12 +1108,6 @@ fn finish_http_transfer(
         metrics.filename_effective = filename.map(|path| path.display().to_string());
     }
 
-    if transfer.fail && (attempt.status.is_client_error() || attempt.status.is_server_error()) {
-        return Err(CurlError::HttpStatus {
-            status: attempt.status.as_u16(),
-        });
-    }
-
     Ok(())
 }
 
@@ -1092,21 +1117,36 @@ async fn schedule_retry(
     retry_started: Instant,
     retry_after: Option<Duration>,
 ) -> bool {
-    if metrics.num_retries >= transfer.retry {
+    let Some((next_retry, delay)) =
+        retry_delay_for_next(transfer, metrics, retry_started, retry_after)
+    else {
         return false;
-    }
-
-    let next_retry = metrics.num_retries + 1;
-    let delay = retry_after.unwrap_or_else(|| retry_delay(transfer, next_retry));
-    if !retry_within_max_time(transfer, retry_started, delay) {
-        return false;
-    }
+    };
 
     metrics.num_retries = next_retry;
     if delay > Duration::ZERO {
         tokio::time::sleep(delay).await;
     }
     true
+}
+
+fn retry_delay_for_next(
+    transfer: &TransferConfig,
+    metrics: &writeout::Metrics,
+    retry_started: Instant,
+    retry_after: Option<Duration>,
+) -> Option<(usize, Duration)> {
+    if metrics.num_retries >= transfer.retry {
+        return None;
+    }
+
+    let next_retry = metrics.num_retries + 1;
+    let delay = retry_after.unwrap_or_else(|| retry_delay(transfer, next_retry));
+    retry_within_max_time(transfer, retry_started, delay).then_some((next_retry, delay))
+}
+
+fn is_http_error_status(status: StatusCode) -> bool {
+    status.is_client_error() || status.is_server_error()
 }
 
 fn should_retry_http_attempt(transfer: &TransferConfig, attempt: &HttpAttempt) -> bool {
