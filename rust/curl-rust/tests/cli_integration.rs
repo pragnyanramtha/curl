@@ -231,6 +231,7 @@ impl Drop for SshdFixture {
 
 #[derive(Debug)]
 struct FtpServerOptions {
+    greeting: &'static [u8],
     data: Vec<u8>,
     epsv_fails: bool,
     pasv_denied: bool,
@@ -360,6 +361,7 @@ fn ftp_options(data: impl Into<Vec<u8>>) -> FtpServerOptions {
     let data = data.into();
     let size = Some(data.len() as u64);
     FtpServerOptions {
+        greeting: b"220 curl FTP test server\r\n",
         data,
         epsv_fails: false,
         pasv_denied: false,
@@ -379,7 +381,7 @@ fn spawn_ftp_server(path: &str, options: FtpServerOptions) -> (String, Receiver<
 
     thread::spawn(move || {
         let (mut stream, _) = listener.accept().unwrap();
-        stream.write_all(b"220 curl FTP test server\r\n").unwrap();
+        stream.write_all(options.greeting).unwrap();
 
         let mut commands = Vec::new();
         let mut data_connections = 0_usize;
@@ -2381,6 +2383,23 @@ fn ftp_uses_url_userinfo_and_falls_back_to_pasv() {
     assert_eq!(
         record.commands,
         b"USER alice\r\nPASS secret\r\nPWD\r\nEPSV\r\nPASV\r\nTYPE I\r\nSIZE file.bin\r\nRETR file.bin\r\nQUIT\r\n"
+    );
+}
+
+#[test]
+fn ftp_230_greeting_skips_user_and_password() {
+    let mut options = ftp_options(b"already logged in");
+    options.greeting = b"230 welcome without password\r\n";
+    let (url, rx) = spawn_ftp_server("/file.txt", options);
+
+    let mut command = Command::cargo_bin("curl").unwrap();
+    command.args(["-q", "-sS", &url]);
+    command.assert().success().stdout("already logged in");
+
+    let record = rx.recv().unwrap();
+    assert_eq!(
+        record.commands,
+        b"PWD\r\nEPSV\r\nTYPE I\r\nSIZE file.txt\r\nRETR file.txt\r\nQUIT\r\n"
     );
 }
 

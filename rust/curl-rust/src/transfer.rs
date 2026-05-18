@@ -621,21 +621,24 @@ async fn run_ftp_exchange(
     let greeting = ftp_read_response(&mut stream, metrics, &mut control_headers).await?;
     ftp_require_positive(&greeting, CurlError::WeirdServerReply)?;
 
-    let mut user_command = Vec::from(&b"USER "[..]);
-    user_command.extend_from_slice(&user);
-    let response = ftp_command(&mut stream, &user_command, metrics, &mut control_headers).await?;
-    match response.code {
-        230 => {}
-        331 => {
-            let mut pass_command = Vec::from(&b"PASS "[..]);
-            pass_command.extend_from_slice(&password);
-            let response =
-                ftp_command(&mut stream, &pass_command, metrics, &mut control_headers).await?;
-            if response.code != 230 {
-                return Err(CurlError::LoginDenied);
+    if greeting.code != 230 {
+        let mut user_command = Vec::from(&b"USER "[..]);
+        user_command.extend_from_slice(&user);
+        let response =
+            ftp_command(&mut stream, &user_command, metrics, &mut control_headers).await?;
+        match response.code {
+            230 => {}
+            331 => {
+                let mut pass_command = Vec::from(&b"PASS "[..]);
+                pass_command.extend_from_slice(&password);
+                let response =
+                    ftp_command(&mut stream, &pass_command, metrics, &mut control_headers).await?;
+                if response.code != 230 {
+                    return Err(CurlError::LoginDenied);
+                }
             }
+            _ => return Err(CurlError::LoginDenied),
         }
-        _ => return Err(CurlError::LoginDenied),
     }
 
     let response = ftp_command(&mut stream, b"PWD", metrics, &mut control_headers).await?;
