@@ -231,6 +231,9 @@ fn write_request(out: &mut String, render: &RenderTransfer<'_>, url: &str) -> Re
     if let Some(cookie_jar) = &transfer.cookie_jar {
         emit_string_setopt(out, "CURLOPT_COOKIEJAR", &cookie_jar.to_string_lossy());
     }
+    if transfer.junk_session_cookies {
+        emit_long_setopt(out, "CURLOPT_COOKIESESSION", 1);
+    }
     if transfer.compressed {
         emit_string_setopt(out, "CURLOPT_ACCEPT_ENCODING", "");
     }

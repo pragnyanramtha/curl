@@ -66,6 +66,7 @@ pub struct TransferConfig {
     pub cookie: Option<String>,
     pub cookie_files: Vec<String>,
     pub cookie_jar: Option<PathBuf>,
+    pub junk_session_cookies: bool,
     pub compressed: bool,
     pub verbose: bool,
     pub silent: bool,
@@ -150,6 +151,7 @@ impl Default for TransferConfig {
             cookie: None,
             cookie_files: Vec::new(),
             cookie_jar: None,
+            junk_session_cookies: false,
             compressed: false,
             verbose: false,
             silent: false,
@@ -462,6 +464,7 @@ impl Parser {
                 let value = self.value_for(name, inline_value)?;
                 self.current().cookie_jar = Some(parse_nonempty_path(name, &value)?);
             }
+            "junk-session-cookies" => self.current().junk_session_cookies = true,
             "compressed" => self.current().compressed = true,
             "verbose" => self.current().verbose = true,
             "silent" | "no-progress-meter" => self.current().silent = true,
@@ -503,6 +506,7 @@ impl Parser {
             }
             "fail-with-body" => self.current().fail_with_body = false,
             "insecure" => self.current().insecure = false,
+            "junk-session-cookies" => self.current().junk_session_cookies = false,
             "compressed" => self.current().compressed = false,
             "verbose" => self.current().verbose = false,
             "silent" => self.current().silent = false,
@@ -649,6 +653,7 @@ impl Parser {
                     self.current().cookie_jar = Some(parse_nonempty_path("cookie-jar", &value)?);
                     break;
                 }
+                'j' => self.current().junk_session_cookies = true,
                 's' => self.current().silent = true,
                 'S' => self.current().show_error = true,
                 'v' => self.current().verbose = true,
@@ -772,6 +777,7 @@ impl TransferConfig {
             || self.cookie.is_some()
             || !self.cookie_files.is_empty()
             || self.cookie_jar.is_some()
+            || self.junk_session_cookies
             || self.compressed
             || self.verbose
             || self.silent
@@ -887,6 +893,7 @@ pub fn print_help() {
            -u, --user <user:pass>      Server user and password\n\
            -b, --cookie <data>         Send cookies from string\n\
            -c, --cookie-jar <file>     Save cookies to file\n\
+           -j, --junk-session-cookies  Ignore session cookies from file\n\
                --oauth2-bearer <token> OAuth 2 Bearer token\n\
            -U, --proxy-user <user:pass> Proxy user and password\n\
                --noproxy <list>        List hosts that do not use proxy\n\
@@ -1241,6 +1248,21 @@ mod tests {
             transfer.cookie_files,
             vec!["cookies.txt".to_string(), "".to_string()]
         );
+    }
+
+    #[test]
+    fn parses_junk_session_cookie_options() {
+        let config = parse_args(["-q", "-j", "-b", "cookies.txt", "https://example.com"]).unwrap();
+        assert!(config.transfers[0].junk_session_cookies);
+
+        let config = parse_args([
+            "-q",
+            "--junk-session-cookies",
+            "--no-junk-session-cookies",
+            "https://example.com",
+        ])
+        .unwrap();
+        assert!(!config.transfers[0].junk_session_cookies);
     }
 
     #[test]

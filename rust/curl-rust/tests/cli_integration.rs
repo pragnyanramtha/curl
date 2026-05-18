@@ -527,6 +527,29 @@ fn cookie_file_sends_netscape_cookie() {
 }
 
 #[test]
+fn junk_session_cookies_ignores_file_session_cookies() {
+    let (url, rx) = spawn_server(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok");
+    let host = Url::parse(&url).unwrap().host_str().unwrap().to_string();
+    let temp = tempdir().unwrap();
+    let cookie_file = temp.path().join("cookies.txt");
+    std::fs::write(
+        &cookie_file,
+        format!(
+            "{host}\tFALSE\t/\tFALSE\t2000000000\tpersist\tyes\n\
+             {host}\tFALSE\t/\tFALSE\t0\tsession\tno\n"
+        ),
+    )
+    .unwrap();
+
+    let mut command = Command::cargo_bin("curl").unwrap();
+    command.args(["-q", "-sS", "-j", "-b", cookie_file.to_str().unwrap(), &url]);
+    command.assert().success().stdout("ok");
+
+    let request = rx.recv().unwrap();
+    assert_eq!(header(&request, "cookie"), Some("persist=yes"));
+}
+
+#[test]
 fn cookie_file_and_literal_cookie_are_combined() {
     let (url, rx) = spawn_server(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok");
     let host = Url::parse(&url).unwrap().host_str().unwrap().to_string();
@@ -559,6 +582,13 @@ fn libcurl_writes_source_file_for_supported_options() {
     let (url, rx) = spawn_server(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok");
     let temp = tempdir().unwrap();
     let source = temp.path().join("client.c");
+    let host = Url::parse(&url).unwrap().host_str().unwrap().to_string();
+    let cookie_file = temp.path().join("cookies.txt");
+    std::fs::write(
+        &cookie_file,
+        format!("{host}\tFALSE\t/\tFALSE\t2000000000\tpersist\tyes\n"),
+    )
+    .unwrap();
 
     let mut command = Command::cargo_bin("curl").unwrap();
     command.args([
@@ -577,6 +607,9 @@ fn libcurl_writes_source_file_for_supported_options() {
         "-A",
         "MyUA",
         "--http1.1",
+        "-j",
+        "-b",
+        cookie_file.to_str().unwrap(),
         &url,
     ]);
     command.assert().success().stdout("ok");
@@ -584,6 +617,7 @@ fn libcurl_writes_source_file_for_supported_options() {
     let request = rx.recv().unwrap();
     assert!(request.start_line.starts_with("PUT /resource HTTP/1.1"));
     assert_eq!(header(&request, "x-test"), Some("yes"));
+    assert_eq!(header(&request, "cookie"), Some("persist=yes"));
     assert_eq!(request.body, b"a=b");
 
     let text = std::fs::read_to_string(source).unwrap();
@@ -596,6 +630,11 @@ fn libcurl_writes_source_file_for_supported_options() {
     assert!(text.contains("CURLOPT_USERPWD, \"alice:secret\""));
     assert!(text.contains("CURLOPT_USERAGENT, \"MyUA\""));
     assert!(text.contains("CURLOPT_HTTP_VERSION, CURL_HTTP_VERSION_1_1"));
+    assert!(text.contains(&format!(
+        "CURLOPT_COOKIEFILE, \"{}\"",
+        cookie_file.display()
+    )));
+    assert!(text.contains("CURLOPT_COOKIESESSION, 1"));
     assert!(text.contains("curl_easy_perform(curl);"));
 }
 

@@ -45,14 +45,14 @@ impl CookieJar {
         *self.explicit_cookie.write().expect("cookie jar lock") = value.map(ToString::to_string);
     }
 
-    pub fn load_from_inputs(&self, inputs: &[String]) -> Result<()> {
+    pub fn load_from_inputs(&self, inputs: &[String], skip_session_cookies: bool) -> Result<()> {
         for input in inputs {
-            self.load_from_input(input)?;
+            self.load_from_input(input, skip_session_cookies)?;
         }
         Ok(())
     }
 
-    fn load_from_input(&self, input: &str) -> Result<()> {
+    fn load_from_input(&self, input: &str, skip_session_cookies: bool) -> Result<()> {
         if input.is_empty() {
             return Ok(());
         }
@@ -69,7 +69,7 @@ impl CookieJar {
             std::fs::read_to_string(path)?
         };
 
-        self.load_from_text(&text);
+        self.load_from_text(&text, skip_session_cookies);
         Ok(())
     }
 
@@ -102,13 +102,16 @@ impl CookieJar {
         Ok(())
     }
 
-    fn load_from_text(&self, text: &str) {
+    fn load_from_text(&self, text: &str, skip_session_cookies: bool) {
         let now = unix_now();
         let mut cookies = self.cookies.write().expect("cookie jar lock");
         for line in text.lines() {
             let Some(cookie) = parse_cookie_file_line(line, now) else {
                 continue;
             };
+            if skip_session_cookies && cookie.expires == 0 {
+                continue;
+            }
             cookies.retain(|existing| !existing.same_key(&cookie));
             cookies.push(cookie);
         }
@@ -542,7 +545,7 @@ mod tests {
     fn loads_netscape_cookie_file_lines() {
         let jar = CookieJar::default();
 
-        jar.load_from_text("example.com\tFALSE\t/\tFALSE\t0\tsid\tabc\n");
+        jar.load_from_text("example.com\tFALSE\t/\tFALSE\t0\tsid\tabc\n", false);
 
         assert_eq!(
             jar.cookies(&Url::parse("http://example.com/").unwrap())
@@ -554,12 +557,32 @@ mod tests {
     }
 
     #[test]
+    fn junk_session_cookie_loading_skips_session_cookies() {
+        let jar = CookieJar::default();
+
+        jar.load_from_text(
+            "example.com\tFALSE\t/\tFALSE\t2000000000\tpersist\tyes\n\
+             example.com\tFALSE\t/\tFALSE\t0\tsession\tno\n",
+            true,
+        );
+
+        assert_eq!(
+            jar.cookies(&Url::parse("http://example.com/").unwrap())
+                .unwrap()
+                .to_str()
+                .unwrap(),
+            "persist=yes"
+        );
+    }
+
+    #[test]
     fn loads_set_cookie_file_lines_with_domains() {
         let jar = CookieJar::default();
 
         jar.load_from_text(
             "Set-Cookie: sid=abc; Domain=example.com; Path=/path; HttpOnly\n\
              Set-Cookie: hostless=ignored; Path=/\n",
+            false,
         );
 
         assert_eq!(
@@ -581,7 +604,7 @@ mod tests {
     #[test]
     fn appends_explicit_cookie_after_engine_cookies() {
         let jar = CookieJar::default();
-        jar.load_from_text("example.com\tFALSE\t/\tFALSE\t0\tsid\tabc\n");
+        jar.load_from_text("example.com\tFALSE\t/\tFALSE\t0\tsid\tabc\n", false);
         jar.set_explicit_cookie(Some("tool=curl"));
 
         assert_eq!(

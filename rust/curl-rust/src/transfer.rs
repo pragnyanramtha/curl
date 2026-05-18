@@ -143,7 +143,7 @@ fn build_cookie_jar(transfer: &TransferConfig) -> Result<Option<Arc<CookieJar>>>
 
     let jar = Arc::new(CookieJar::default());
     jar.set_explicit_cookie(transfer.cookie.as_deref());
-    jar.load_from_inputs(&transfer.cookie_files)?;
+    jar.load_from_inputs(&transfer.cookie_files, transfer.junk_session_cookies)?;
     Ok(Some(jar))
 }
 
