@@ -17,6 +17,13 @@ curl rewrite, not a prototype.
 - Cargo invocations from repository build systems must use `--locked`.
 - All applicable test suites must run before completion is claimed.
 
+## Commit Discipline
+
+- Make frequent local commits at coherent checkpoints.
+- Prefer one focused behavior or integration slice per commit.
+- Do not leave passing verification only in the working tree when a commit can
+  safely capture it.
+
 ## Verification Gates
 
 Run every feasible gate and record hard blockers when tools or external
@@ -53,4 +60,3 @@ delegate independent reviews of:
 
 Subagents must not revert unrelated edits. They should report concrete file and
 line findings, commands run, commands blocked, and remaining gaps.
-
