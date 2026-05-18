@@ -59,6 +59,14 @@ struct TftpUploadRecord {
     data_blocks: Vec<(u16, Vec<u8>)>,
 }
 
+#[derive(Debug)]
+struct MqttRecord {
+    connect: Vec<u8>,
+    subscribe: Option<Vec<u8>>,
+    publish: Option<Vec<u8>>,
+    disconnect: Option<Vec<u8>>,
+}
+
 fn spawn_server(response: &'static [u8]) -> (String, Receiver<RequestRecord>) {
     spawn_sequence_server(vec![response])
 }
@@ -350,6 +358,146 @@ fn tftp_ack(block: u16) -> Vec<u8> {
     let mut packet = Vec::from(&4_u16.to_be_bytes()[..]);
     packet.extend_from_slice(&block.to_be_bytes());
     packet
+}
+
+fn mqtt_packet(packet_type: u8, body: &[u8]) -> Vec<u8> {
+    let mut packet = vec![packet_type];
+    mqtt_encode_remaining_len(body.len(), &mut packet);
+    packet.extend_from_slice(body);
+    packet
+}
+
+fn mqtt_encode_remaining_len(mut len: usize, output: &mut Vec<u8>) {
+    loop {
+        let mut encoded = (len % 128) as u8;
+        len /= 128;
+        if len > 0 {
+            encoded |= 128;
+        }
+        output.push(encoded);
+        if len == 0 {
+            break;
+        }
+    }
+}
+
+fn mqtt_connack(code: u8) -> Vec<u8> {
+    mqtt_packet(0x20, &[0, code])
+}
+
+fn mqtt_suback() -> Vec<u8> {
+    mqtt_packet(0x90, &[0, 1, 0])
+}
+
+fn mqtt_publish(topic: &[u8], payload: &[u8]) -> Vec<u8> {
+    let mut body = Vec::new();
+    body.extend_from_slice(&(topic.len() as u16).to_be_bytes());
+    body.extend_from_slice(topic);
+    body.extend_from_slice(payload);
+    mqtt_packet(0x30, &body)
+}
+
+fn mqtt_disconnect() -> Vec<u8> {
+    mqtt_packet(0xe0, &[])
+}
+
+fn read_mqtt_frame(stream: &mut impl Read) -> (u8, Vec<u8>) {
+    let mut first = [0; 1];
+    stream.read_exact(&mut first).unwrap();
+    let mut multiplier = 1_usize;
+    let mut remaining_len = 0_usize;
+    loop {
+        let mut byte = [0; 1];
+        stream.read_exact(&mut byte).unwrap();
+        remaining_len += usize::from(byte[0] & 127) * multiplier;
+        if byte[0] & 128 == 0 {
+            break;
+        }
+        multiplier *= 128;
+    }
+    let mut body = vec![0; remaining_len];
+    stream.read_exact(&mut body).unwrap();
+    (first[0], body)
+}
+
+fn spawn_mqtt_subscribe_server(topic: Vec<u8>, payload: Vec<u8>) -> (String, Receiver<MqttRecord>) {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = listener.local_addr().unwrap();
+    let (tx, rx) = mpsc::channel();
+
+    thread::spawn(move || {
+        let (mut stream, _) = listener.accept().unwrap();
+        let (connect_type, connect) = read_mqtt_frame(&mut stream);
+        assert_eq!(connect_type, 0x10);
+        stream.write_all(&mqtt_connack(0)).unwrap();
+
+        let (subscribe_type, subscribe) = read_mqtt_frame(&mut stream);
+        assert_eq!(subscribe_type, 0x82);
+        stream.write_all(&mqtt_suback()).unwrap();
+        stream.write_all(&mqtt_publish(&topic, &payload)).unwrap();
+        stream.write_all(&mqtt_disconnect()).unwrap();
+
+        tx.send(MqttRecord {
+            connect,
+            subscribe: Some(subscribe),
+            publish: None,
+            disconnect: None,
+        })
+        .unwrap();
+    });
+
+    (format!("mqtt://{addr}/sensor"), rx)
+}
+
+fn spawn_mqtt_publish_server() -> (String, Receiver<MqttRecord>) {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = listener.local_addr().unwrap();
+    let (tx, rx) = mpsc::channel();
+
+    thread::spawn(move || {
+        let (mut stream, _) = listener.accept().unwrap();
+        let (connect_type, connect) = read_mqtt_frame(&mut stream);
+        assert_eq!(connect_type, 0x10);
+        stream.write_all(&mqtt_connack(0)).unwrap();
+
+        let (publish_type, publish) = read_mqtt_frame(&mut stream);
+        assert_eq!(publish_type, 0x30);
+        let (disconnect_type, disconnect) = read_mqtt_frame(&mut stream);
+        assert_eq!(disconnect_type, 0xe0);
+
+        tx.send(MqttRecord {
+            connect,
+            subscribe: None,
+            publish: Some(publish),
+            disconnect: Some(disconnect),
+        })
+        .unwrap();
+    });
+
+    (format!("mqtt://{addr}/sensor"), rx)
+}
+
+fn spawn_mqtt_connack_server(code: u8) -> (String, Receiver<MqttRecord>) {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = listener.local_addr().unwrap();
+    let (tx, rx) = mpsc::channel();
+
+    thread::spawn(move || {
+        let (mut stream, _) = listener.accept().unwrap();
+        let (connect_type, connect) = read_mqtt_frame(&mut stream);
+        assert_eq!(connect_type, 0x10);
+        stream.write_all(&mqtt_connack(code)).unwrap();
+
+        tx.send(MqttRecord {
+            connect,
+            subscribe: None,
+            publish: None,
+            disconnect: None,
+        })
+        .unwrap();
+    });
+
+    (format!("mqtt://{addr}/sensor"), rx)
 }
 
 fn spawn_tftp_upload_server(
@@ -1795,6 +1943,119 @@ fn tftp_upload_error_packet_maps_permission() {
     command.assert().failure().code(69).stdout("");
 
     assert!(rx.recv().unwrap().starts_with(b"\0\x02upload.bin\0octet\0"));
+}
+
+#[test]
+fn mqtt_subscribe_outputs_publish_packet_and_sends_subscribe() {
+    let (url, rx) = spawn_mqtt_subscribe_server(b"sensor".to_vec(), b"hello\n".to_vec());
+
+    let mut command = Command::cargo_bin("curl").unwrap();
+    let output = command.args(["-q", "-sS", &url]).output().unwrap();
+
+    assert!(output.status.success());
+    assert_eq!(output.stdout, b"\0\x06sensorhello\n");
+    let record = rx.recv().unwrap();
+    assert_eq!(
+        record.connect,
+        b"\0\x04MQTT\x04\x02\0\x3c\0\x0ccurlrust0000"
+    );
+    assert_eq!(record.subscribe, Some(b"\0\x01\0\x06sensor\0".to_vec()));
+}
+
+#[test]
+fn mqtt_publish_sends_data_payload_and_disconnects() {
+    let (url, rx) = spawn_mqtt_publish_server();
+
+    let mut command = Command::cargo_bin("curl").unwrap();
+    command.args(["-q", "-sS", "-d", "something", &url]);
+    command.assert().success().stdout("");
+
+    let record = rx.recv().unwrap();
+    assert_eq!(record.publish, Some(b"\0\x06sensorsomething".to_vec()));
+    assert_eq!(record.disconnect, Some(Vec::new()));
+}
+
+#[test]
+fn mqtt_publish_empty_payload_to_space_topic() {
+    let (url, rx) = spawn_mqtt_publish_server();
+    let url = url.replace("/sensor", "/%20");
+
+    let mut command = Command::cargo_bin("curl").unwrap();
+    command.args(["-q", "-sS", "-d", "", &url]);
+    command.assert().success().stdout("");
+
+    let record = rx.recv().unwrap();
+    assert_eq!(record.publish, Some(b"\0\x01 ".to_vec()));
+}
+
+#[test]
+fn mqtt_connect_includes_user_and_password() {
+    let (url, rx) = spawn_mqtt_publish_server();
+
+    let mut command = Command::cargo_bin("curl").unwrap();
+    command.args([
+        "-q",
+        "-sS",
+        "-u",
+        "testuser:testpasswd",
+        "-d",
+        "something",
+        &url,
+    ]);
+    command.assert().success().stdout("");
+
+    let record = rx.recv().unwrap();
+    assert_eq!(
+        record.connect,
+        b"\0\x04MQTT\x04\xc2\0\x3c\0\x0ccurlrust0000\0\x08testuser\0\x0atestpasswd"
+    );
+}
+
+#[test]
+fn mqtt_rejects_missing_topic_after_connack() {
+    let (url, rx) = spawn_mqtt_connack_server(0);
+    let url = url.replace("/sensor", "");
+
+    let mut command = Command::cargo_bin("curl").unwrap();
+    command.args(["-q", "-sS", "-d", "", &url]);
+    command.assert().failure().code(3).stdout("");
+
+    assert_eq!(
+        rx.recv().unwrap().connect,
+        b"\0\x04MQTT\x04\x02\0\x3c\0\x0ccurlrust0000"
+    );
+}
+
+#[test]
+fn mqtt_connack_error_returns_weird_server_reply() {
+    let (url, rx) = spawn_mqtt_connack_server(1);
+
+    let mut command = Command::cargo_bin("curl").unwrap();
+    command.args(["-q", "-sS", &url]);
+    command.assert().failure().code(8).stdout("");
+
+    assert_eq!(
+        rx.recv().unwrap().connect,
+        b"\0\x04MQTT\x04\x02\0\x3c\0\x0ccurlrust0000"
+    );
+}
+
+#[test]
+fn mqtt_max_filesize_rejects_large_publish_before_output() {
+    let (url, _rx) = spawn_mqtt_subscribe_server(b"sensor".to_vec(), b"hello\n".to_vec());
+
+    let mut command = Command::cargo_bin("curl").unwrap();
+    command.args(["-q", "-sS", "--max-filesize", "11", &url]);
+    command.assert().failure().code(63).stdout("");
+}
+
+#[test]
+fn version_lists_mqtt_protocol() {
+    let mut command = Command::cargo_bin("curl").unwrap();
+    let output = command.args(["-q", "-V"]).output().unwrap();
+
+    assert!(output.status.success());
+    assert!(String::from_utf8(output.stdout).unwrap().contains("MQTT"));
 }
 
 #[test]

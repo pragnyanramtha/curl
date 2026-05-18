@@ -30,6 +30,15 @@ const TELNET_SB: u8 = 250;
 const TELNET_SE: u8 = 240;
 const TFTP_DEFAULT_BLKSIZE: u16 = 512;
 const TFTP_MAX_PACKET_SIZE: usize = 65_468;
+const MQTT_DEFAULT_PORT: u16 = 1883;
+const MQTT_CLIENT_ID: &[u8; 12] = b"curlrust0000";
+const MQTT_CONNECT: u8 = 0x10;
+const MQTT_CONNACK: u8 = 0x20;
+const MQTT_PUBLISH: u8 = 0x30;
+const MQTT_SUBSCRIBE: u8 = 0x82;
+const MQTT_SUBACK: u8 = 0x90;
+const MQTT_PINGRESP: u8 = 0xd0;
+const MQTT_DISCONNECT: u8 = 0xe0;
 
 struct HttpAttempt {
     status: StatusCode,
@@ -293,6 +302,12 @@ async fn run_expanded_url(
         ))
     } else if expanded.url.starts_with("tftp://") {
         run_tftp_transfer(transfer, &expanded, &method_label, &mut metrics).await
+    } else if expanded.url.starts_with("mqtt://") {
+        run_mqtt_transfer(transfer, &expanded, &method_label, &mut metrics).await
+    } else if expanded.url.starts_with("mqtts://") {
+        Err(CurlError::Unsupported(
+            "mqtts:// URLs are not implemented in the Rust sidecar".to_string(),
+        ))
     } else {
         let mut method = effective_http_method(transfer)?;
         if method_label == Method::PUT.as_str() && transfer.method.is_none() {
@@ -934,6 +949,143 @@ async fn run_tftp_upload(socket: &UdpSocket, body: &[u8], requested_blksize: u16
     Ok(())
 }
 
+async fn run_mqtt_transfer(
+    transfer: &TransferConfig,
+    expanded: &glob::ExpandedUrl,
+    method: &str,
+    metrics: &mut writeout::Metrics,
+) -> Result<()> {
+    if method != "GET" && method != "POST" {
+        return Err(CurlError::Unsupported(format!(
+            "{method} requests for mqtt:// URLs"
+        )));
+    }
+    if transfer.head {
+        return Err(CurlError::Unsupported(
+            "HEAD requests for mqtt:// URLs".to_string(),
+        ));
+    }
+    if !transfer.forms.is_empty() {
+        return Err(CurlError::Unsupported(
+            "--form for mqtt:// URLs".to_string(),
+        ));
+    }
+    reject_upload_file_for_scheme(transfer, "mqtt://")?;
+    if !transfer.url_query.is_empty() {
+        return Err(CurlError::Unsupported(
+            "--url-query for mqtt:// URLs".to_string(),
+        ));
+    }
+
+    let body = data::prepare_body(&transfer.data)?;
+    let publish = body.is_some() && !transfer.get;
+    let url = Url::parse(&expanded.url).map_err(|error| CurlError::Url(error.to_string()))?;
+    output::validate_output_target(transfer, &url)?;
+    let host = url
+        .host_str()
+        .ok_or_else(|| CurlError::Url("MQTT URL is missing a host".to_string()))?;
+    let port = url.port().unwrap_or(MQTT_DEFAULT_PORT);
+
+    let mut stream = connect_tcp(host, port, transfer).await?;
+    stream
+        .write_all(&mqtt_connect_packet(transfer.user.as_deref())?)
+        .await
+        .map_err(tcp_io_error)?;
+    mqtt_expect_connack(&mut stream).await?;
+    let topic = mqtt_topic_from_url(&url)?;
+
+    metrics.url_effective = url.to_string();
+    if let Some(path) = &transfer.dump_header {
+        output::dump_headers(path, &[], transfer.create_dirs)?;
+    }
+
+    if publish {
+        let body = body.map_or_else(Vec::new, |body| body.bytes);
+        stream
+            .write_all(&mqtt_publish_packet(&topic, &body)?)
+            .await
+            .map_err(tcp_io_error)?;
+        stream
+            .write_all(&[MQTT_DISCONNECT, 0])
+            .await
+            .map_err(tcp_io_error)?;
+        metrics.size_download = 0;
+        return Ok(());
+    }
+
+    stream
+        .write_all(&mqtt_subscribe_packet(&topic)?)
+        .await
+        .map_err(tcp_io_error)?;
+    let body = mqtt_read_subscribe_body(&mut stream, transfer).await?;
+    metrics.size_download = body.len() as u64;
+    let filename = output::write_response(
+        transfer,
+        &url,
+        &reqwest::header::HeaderMap::new(),
+        &expanded.variables,
+        &body,
+        false,
+    )?;
+    metrics.filename_effective = filename.map(|path| path.display().to_string());
+    Ok(())
+}
+
+async fn mqtt_expect_connack(stream: &mut TcpStream) -> Result<()> {
+    let packet = mqtt_read_packet(stream).await?;
+    if packet.packet_type != MQTT_CONNACK || packet.remaining_len != 2 || packet.body != [0, 0] {
+        return Err(CurlError::WeirdServerReply);
+    }
+    Ok(())
+}
+
+async fn mqtt_read_subscribe_body(
+    stream: &mut TcpStream,
+    transfer: &TransferConfig,
+) -> Result<Vec<u8>> {
+    let mut body = Vec::new();
+    let mut saw_suback = false;
+
+    loop {
+        let header = mqtt_read_packet_header(stream).await?;
+        match header.packet_type & 0xf0 {
+            MQTT_SUBACK => {
+                let packet_body = mqtt_read_packet_body(stream, header.remaining_len).await?;
+                if header.remaining_len != 3 || packet_body != [0, 1, 0] {
+                    return Err(CurlError::WeirdServerReply);
+                }
+                saw_suback = true;
+            }
+            MQTT_PUBLISH => {
+                if let Some(limit) = max_filesize_limit(transfer)
+                    && header.remaining_len as u64 > limit
+                {
+                    return Err(CurlError::FileSizeExceeded);
+                }
+                let packet_body = mqtt_read_packet_body(stream, header.remaining_len).await?;
+                body.extend_from_slice(&packet_body);
+            }
+            MQTT_DISCONNECT => {
+                if header.remaining_len != 0 || (header.packet_type & 0x0f) != 0 {
+                    return Err(CurlError::WeirdServerReply);
+                }
+                break;
+            }
+            MQTT_PINGRESP => {
+                if header.remaining_len != 0 || (header.packet_type & 0x0f) != 0 {
+                    return Err(CurlError::WeirdServerReply);
+                }
+            }
+            _ => return Err(CurlError::WeirdServerReply),
+        }
+    }
+
+    if !saw_suback {
+        return Err(CurlError::WeirdServerReply);
+    }
+    Ok(body)
+}
+
 async fn run_telnet_transfer(
     transfer: &TransferConfig,
     expanded: &glob::ExpandedUrl,
@@ -1553,6 +1705,150 @@ fn strip_tftp_mode_suffix(value: &mut Vec<u8>, suffix: &[u8]) -> bool {
     } else {
         false
     }
+}
+
+struct MqttPacket {
+    packet_type: u8,
+    remaining_len: usize,
+    body: Vec<u8>,
+}
+
+struct MqttPacketHeader {
+    packet_type: u8,
+    remaining_len: usize,
+}
+
+fn mqtt_connect_packet(user: Option<&str>) -> Result<Vec<u8>> {
+    let (username, password) = user.map(split_user_password).unwrap_or(("", ""));
+    if username.len() > u16::MAX as usize || password.len() > u16::MAX as usize {
+        return Err(CurlError::WeirdServerReply);
+    }
+
+    let mut body = Vec::new();
+    mqtt_append_string(&mut body, b"MQTT")?;
+    body.push(4);
+    let mut flags = 0x02;
+    if !username.is_empty() {
+        flags |= 0x80;
+    }
+    if !password.is_empty() {
+        flags |= 0x40;
+    }
+    body.push(flags);
+    body.extend_from_slice(&60_u16.to_be_bytes());
+    mqtt_append_string(&mut body, MQTT_CLIENT_ID)?;
+    if !username.is_empty() {
+        mqtt_append_string(&mut body, username.as_bytes())?;
+    }
+    if !password.is_empty() {
+        mqtt_append_string(&mut body, password.as_bytes())?;
+    }
+
+    mqtt_packet(MQTT_CONNECT, &body)
+}
+
+fn mqtt_subscribe_packet(topic: &[u8]) -> Result<Vec<u8>> {
+    let mut body = Vec::new();
+    body.extend_from_slice(&1_u16.to_be_bytes());
+    mqtt_append_string(&mut body, topic)?;
+    body.push(0);
+    mqtt_packet(MQTT_SUBSCRIBE, &body)
+}
+
+fn mqtt_publish_packet(topic: &[u8], payload: &[u8]) -> Result<Vec<u8>> {
+    let mut body = Vec::with_capacity(topic.len() + payload.len() + 2);
+    mqtt_append_string(&mut body, topic)?;
+    body.extend_from_slice(payload);
+    mqtt_packet(MQTT_PUBLISH, &body)
+}
+
+fn mqtt_packet(packet_type: u8, body: &[u8]) -> Result<Vec<u8>> {
+    let mut packet = Vec::with_capacity(body.len() + 5);
+    packet.push(packet_type);
+    mqtt_encode_remaining_len(body.len(), &mut packet)?;
+    packet.extend_from_slice(body);
+    Ok(packet)
+}
+
+fn mqtt_append_string(output: &mut Vec<u8>, value: &[u8]) -> Result<()> {
+    let len = u16::try_from(value.len())
+        .map_err(|_| CurlError::Url("MQTT topic or field exceeds 65535 bytes".to_string()))?;
+    output.extend_from_slice(&len.to_be_bytes());
+    output.extend_from_slice(value);
+    Ok(())
+}
+
+fn mqtt_encode_remaining_len(mut len: usize, output: &mut Vec<u8>) -> Result<()> {
+    if len > 0x0fff_ffff {
+        return Err(CurlError::WeirdServerReply);
+    }
+
+    loop {
+        let mut encoded = (len % 128) as u8;
+        len /= 128;
+        if len > 0 {
+            encoded |= 128;
+        }
+        output.push(encoded);
+        if len == 0 {
+            return Ok(());
+        }
+    }
+}
+
+async fn mqtt_read_packet(stream: &mut TcpStream) -> Result<MqttPacket> {
+    let header = mqtt_read_packet_header(stream).await?;
+    let body = mqtt_read_packet_body(stream, header.remaining_len).await?;
+    Ok(MqttPacket {
+        packet_type: header.packet_type,
+        remaining_len: header.remaining_len,
+        body,
+    })
+}
+
+async fn mqtt_read_packet_header(stream: &mut TcpStream) -> Result<MqttPacketHeader> {
+    let mut first = [0; 1];
+    stream.read_exact(&mut first).await.map_err(tcp_io_error)?;
+
+    let mut multiplier = 1_usize;
+    let mut remaining_len = 0_usize;
+    for _ in 0..4 {
+        let mut byte = [0; 1];
+        stream.read_exact(&mut byte).await.map_err(tcp_io_error)?;
+        remaining_len += usize::from(byte[0] & 127) * multiplier;
+        if byte[0] & 128 == 0 {
+            return Ok(MqttPacketHeader {
+                packet_type: first[0],
+                remaining_len,
+            });
+        }
+        multiplier *= 128;
+    }
+
+    Err(CurlError::WeirdServerReply)
+}
+
+async fn mqtt_read_packet_body(stream: &mut TcpStream, remaining_len: usize) -> Result<Vec<u8>> {
+    let mut body = vec![0; remaining_len];
+    if remaining_len > 0 {
+        stream.read_exact(&mut body).await.map_err(tcp_io_error)?;
+    }
+    Ok(body)
+}
+
+fn mqtt_topic_from_url(url: &Url) -> Result<Vec<u8>> {
+    let path = url.path();
+    if path.len() <= 1 {
+        return Err(CurlError::Url(
+            "No MQTT topic found. Forgot to URL encode it?".to_string(),
+        ));
+    }
+
+    let topic = percent_decode(&path.as_bytes()[1..]).collect::<Vec<_>>();
+    if topic.len() > u16::MAX as usize {
+        return Err(CurlError::Url("Too long MQTT topic".to_string()));
+    }
+    Ok(topic)
 }
 
 fn tftp_rrq_packet(filename: &[u8], mode: &str, blksize: u16, no_options: bool) -> Vec<u8> {
