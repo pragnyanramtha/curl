@@ -1,4 +1,4 @@
-use std::io::{self, Write};
+use std::io::{self, Read, Write};
 use std::path::Path;
 use std::sync::RwLock;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -16,6 +16,7 @@ const COOKIE_FILE_HEADER: &str = "# Netscape HTTP Cookie File\n\
 #[derive(Debug, Default)]
 pub struct CookieJar {
     cookies: RwLock<Vec<StoredCookie>>,
+    explicit_cookie: RwLock<Option<String>>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -40,6 +41,38 @@ enum CookieUpdate {
 }
 
 impl CookieJar {
+    pub fn set_explicit_cookie(&self, value: Option<&str>) {
+        *self.explicit_cookie.write().expect("cookie jar lock") = value.map(ToString::to_string);
+    }
+
+    pub fn load_from_inputs(&self, inputs: &[String]) -> Result<()> {
+        for input in inputs {
+            self.load_from_input(input)?;
+        }
+        Ok(())
+    }
+
+    fn load_from_input(&self, input: &str) -> Result<()> {
+        if input.is_empty() {
+            return Ok(());
+        }
+
+        let text = if input == "-" {
+            let mut text = String::new();
+            io::stdin().read_to_string(&mut text)?;
+            text
+        } else {
+            let path = Path::new(input);
+            if !path.is_file() {
+                return Ok(());
+            }
+            std::fs::read_to_string(path)?
+        };
+
+        self.load_from_text(&text);
+        Ok(())
+    }
+
     pub fn save_to_path(&self, path: &Path, create_dirs: bool, verbose: bool) {
         if let Err(error) = self.try_save_to_path(path, create_dirs)
             && verbose
@@ -69,6 +102,18 @@ impl CookieJar {
         Ok(())
     }
 
+    fn load_from_text(&self, text: &str) {
+        let now = unix_now();
+        let mut cookies = self.cookies.write().expect("cookie jar lock");
+        for line in text.lines() {
+            let Some(cookie) = parse_cookie_file_line(line, now) else {
+                continue;
+            };
+            cookies.retain(|existing| !existing.same_key(&cookie));
+            cookies.push(cookie);
+        }
+    }
+
     fn to_netscape_file(&self) -> String {
         let now = unix_now();
         let mut output = COOKIE_FILE_HEADER.to_string();
@@ -80,6 +125,138 @@ impl CookieJar {
             output.push_str(&cookie.netscape_line());
         }
         output
+    }
+}
+
+fn parse_cookie_file_line(line: &str, now: u64) -> Option<StoredCookie> {
+    let line = line.trim_end_matches('\r').trim_start();
+    if line.trim_end().is_empty() {
+        return None;
+    }
+    if let Some(line) = line.strip_prefix("#HttpOnly_") {
+        return parse_netscape_cookie_line(line, true, now);
+    }
+    if line.starts_with('#') {
+        return None;
+    }
+    if let Some(cookie) = parse_netscape_cookie_line(line, false, now) {
+        return Some(cookie);
+    }
+
+    let value = line
+        .split_once(':')
+        .and_then(|(name, value)| name.eq_ignore_ascii_case("set-cookie").then_some(value))
+        .unwrap_or(line);
+    parse_set_cookie_file(value.trim(), now)
+}
+
+fn parse_netscape_cookie_line(line: &str, http_only: bool, now: u64) -> Option<StoredCookie> {
+    let mut fields = line.split('\t');
+    let domain = fields.next()?.trim().to_ascii_lowercase();
+    let include_subdomains = parse_cookie_bool(fields.next()?.trim())?;
+    let path = fields.next()?.trim().to_string();
+    let secure = parse_cookie_bool(fields.next()?.trim())?;
+    let expires = fields.next()?.trim().parse::<u64>().ok()?;
+    let name = fields.next()?.trim().to_string();
+    let value = fields.next()?.trim().to_string();
+
+    if domain.is_empty() || name.is_empty() || !path.starts_with('/') {
+        return None;
+    }
+    if expires != 0 && expires <= now {
+        return None;
+    }
+
+    Some(StoredCookie {
+        domain,
+        include_subdomains,
+        path,
+        secure,
+        expires,
+        name,
+        value,
+        http_only,
+    })
+}
+
+fn parse_set_cookie_file(value: &str, now: u64) -> Option<StoredCookie> {
+    let mut parts = value.split(';').map(str::trim);
+    let (name, cookie_value) = parts.next()?.split_once('=')?;
+    let name = name.trim();
+    if name.is_empty() {
+        return None;
+    }
+
+    let mut domain = None;
+    let mut path = "/".to_string();
+    let mut secure = false;
+    let mut expires = 0;
+    let mut http_only = false;
+    let mut expired = false;
+
+    for part in parts {
+        let (attribute, raw_value) = part.split_once('=').unwrap_or((part, ""));
+        match attribute.trim().to_ascii_lowercase().as_str() {
+            "domain" => {
+                let value = raw_value
+                    .trim()
+                    .trim_start_matches('.')
+                    .to_ascii_lowercase();
+                if !value.is_empty() {
+                    domain = Some(format!(".{value}"));
+                }
+            }
+            "path" => {
+                let value = raw_value.trim().trim_matches('"');
+                if value.starts_with('/') {
+                    path = value.to_string();
+                }
+            }
+            "max-age" => {
+                if let Ok(value) = raw_value.trim().parse::<i64>() {
+                    if value <= 0 {
+                        expired = true;
+                    } else {
+                        expires = now.saturating_add(value as u64);
+                    }
+                }
+            }
+            "expires" => {
+                if let Some(timestamp) = parse_expires(raw_value.trim()) {
+                    if timestamp <= now {
+                        expired = true;
+                    } else {
+                        expires = timestamp;
+                    }
+                }
+            }
+            "secure" => secure = true,
+            "httponly" => http_only = true,
+            _ => {}
+        }
+    }
+
+    if expired {
+        return None;
+    }
+
+    Some(StoredCookie {
+        domain: domain?,
+        include_subdomains: true,
+        path,
+        secure,
+        expires,
+        name: name.to_string(),
+        value: cookie_value.trim().to_string(),
+        http_only,
+    })
+}
+
+fn parse_cookie_bool(value: &str) -> Option<bool> {
+    match value.to_ascii_uppercase().as_str() {
+        "TRUE" => Some(true),
+        "FALSE" => Some(false),
+        _ => None,
     }
 }
 
@@ -113,12 +290,24 @@ impl CookieStore for CookieJar {
         let mut cookies = self.cookies.write().expect("cookie jar lock");
         cookies.retain(|cookie| cookie.expires == 0 || cookie.expires > now);
 
-        let header = cookies
+        let mut header = cookies
             .iter()
             .filter(|cookie| cookie.matches(url))
             .map(|cookie| format!("{}={}", cookie.name, cookie.value))
             .collect::<Vec<_>>()
             .join("; ");
+        if let Some(explicit) = self
+            .explicit_cookie
+            .read()
+            .expect("cookie jar lock")
+            .as_deref()
+            .filter(|explicit| !explicit.is_empty())
+        {
+            if !header.is_empty() {
+                header.push_str("; ");
+            }
+            header.push_str(explicit);
+        }
         if header.is_empty() {
             None
         } else {
@@ -347,5 +536,60 @@ mod tests {
         jar.set_cookies(&mut headers.iter(), &url);
 
         assert_eq!(jar.to_netscape_file(), COOKIE_FILE_HEADER);
+    }
+
+    #[test]
+    fn loads_netscape_cookie_file_lines() {
+        let jar = CookieJar::default();
+
+        jar.load_from_text("example.com\tFALSE\t/\tFALSE\t0\tsid\tabc\n");
+
+        assert_eq!(
+            jar.cookies(&Url::parse("http://example.com/").unwrap())
+                .unwrap()
+                .to_str()
+                .unwrap(),
+            "sid=abc"
+        );
+    }
+
+    #[test]
+    fn loads_set_cookie_file_lines_with_domains() {
+        let jar = CookieJar::default();
+
+        jar.load_from_text(
+            "Set-Cookie: sid=abc; Domain=example.com; Path=/path; HttpOnly\n\
+             Set-Cookie: hostless=ignored; Path=/\n",
+        );
+
+        assert_eq!(
+            jar.cookies(&Url::parse("http://www.example.com/path/next").unwrap())
+                .unwrap()
+                .to_str()
+                .unwrap(),
+            "sid=abc"
+        );
+        assert_eq!(
+            jar.to_netscape_file(),
+            "# Netscape HTTP Cookie File\n\
+             # https://curl.se/docs/http-cookies.html\n\
+             # This file was generated by libcurl! Edit at your own risk.\n\n\
+             #HttpOnly_.example.com\tTRUE\t/path\tFALSE\t0\tsid\tabc\n"
+        );
+    }
+
+    #[test]
+    fn appends_explicit_cookie_after_engine_cookies() {
+        let jar = CookieJar::default();
+        jar.load_from_text("example.com\tFALSE\t/\tFALSE\t0\tsid\tabc\n");
+        jar.set_explicit_cookie(Some("tool=curl"));
+
+        assert_eq!(
+            jar.cookies(&Url::parse("http://example.com/").unwrap())
+                .unwrap()
+                .to_str()
+                .unwrap(),
+            "sid=abc; tool=curl"
+        );
     }
 }

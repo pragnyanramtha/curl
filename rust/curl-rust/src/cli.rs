@@ -64,6 +64,7 @@ pub struct TransferConfig {
     pub range: Option<String>,
     pub continue_at: Option<ContinueAt>,
     pub cookie: Option<String>,
+    pub cookie_files: Vec<String>,
     pub cookie_jar: Option<PathBuf>,
     pub compressed: bool,
     pub verbose: bool,
@@ -147,6 +148,7 @@ impl Default for TransferConfig {
             range: None,
             continue_at: None,
             cookie: None,
+            cookie_files: Vec::new(),
             cookie_jar: None,
             compressed: false,
             verbose: false,
@@ -454,7 +456,7 @@ impl Parser {
             }
             "cookie" => {
                 let value = self.value_for(name, inline_value)?;
-                self.current().cookie = Some(value);
+                self.add_cookie_input(value);
             }
             "cookie-jar" => {
                 let value = self.value_for(name, inline_value)?;
@@ -639,7 +641,7 @@ impl Parser {
                 }
                 'b' => {
                     let value = self.short_value('b', rest)?;
-                    self.current().cookie = Some(value);
+                    self.add_cookie_input(value);
                     break;
                 }
                 'c' => {
@@ -696,6 +698,14 @@ impl Parser {
             .transfers
             .last_mut()
             .expect("parser always has a current transfer")
+    }
+
+    fn add_cookie_input(&mut self, value: String) {
+        if value.contains('=') {
+            append_cookie_header(&mut self.current().cookie, value);
+        } else {
+            self.current().cookie_files.push(value);
+        }
     }
 
     fn insert_config_file(&mut self, path: &str) -> Result<()> {
@@ -760,6 +770,7 @@ impl TransferConfig {
             || self.range.is_some()
             || self.continue_at.is_some()
             || self.cookie.is_some()
+            || !self.cookie_files.is_empty()
             || self.cookie_jar.is_some()
             || self.compressed
             || self.verbose
@@ -807,6 +818,17 @@ fn parse_nonempty_path(name: &str, value: &str) -> Result<PathBuf> {
         )))
     } else {
         Ok(PathBuf::from(value))
+    }
+}
+
+fn append_cookie_header(cookie: &mut Option<String>, value: String) {
+    if let Some(existing) = cookie {
+        if !existing.is_empty() && !value.is_empty() {
+            existing.push_str("; ");
+        }
+        existing.push_str(&value);
+    } else {
+        *cookie = Some(value);
     }
 }
 
@@ -1195,6 +1217,29 @@ mod tests {
         assert_eq!(
             config.transfers[0].cookie_jar.as_deref(),
             Some(std::path::Path::new("jar.txt"))
+        );
+    }
+
+    #[test]
+    fn parses_cookie_headers_and_file_inputs() {
+        let config = parse_args([
+            "-q",
+            "-b",
+            "sid=abc",
+            "--cookie",
+            "theme=light",
+            "--cookie",
+            "cookies.txt",
+            "--cookie=",
+            "https://example.com",
+        ])
+        .unwrap();
+
+        let transfer = &config.transfers[0];
+        assert_eq!(transfer.cookie.as_deref(), Some("sid=abc; theme=light"));
+        assert_eq!(
+            transfer.cookie_files,
+            vec!["cookies.txt".to_string(), "".to_string()]
         );
     }
 

@@ -452,6 +452,109 @@ fn cookie_jar_sends_cookie_on_later_url_in_group() {
 }
 
 #[test]
+fn empty_cookie_input_activates_cookie_engine() {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = listener.local_addr().unwrap();
+    let (tx, rx) = mpsc::channel();
+    thread::spawn(move || {
+        let (mut stream, _) = listener.accept().unwrap();
+        tx.send(read_request(&mut stream)).unwrap();
+        stream
+            .write_all(
+                b"HTTP/1.1 200 OK\r\nSet-Cookie: sid=abc; Path=/\r\nConnection: close\r\nContent-Length: 3\r\n\r\none",
+            )
+            .unwrap();
+
+        let (mut stream, _) = listener.accept().unwrap();
+        tx.send(read_request(&mut stream)).unwrap();
+        stream
+            .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 3\r\n\r\ntwo")
+            .unwrap();
+    });
+    let first = format!("http://{addr}/one");
+    let second = format!("http://{addr}/two");
+
+    let mut command = Command::cargo_bin("curl").unwrap();
+    command.args(["-q", "-sS", "-b", "", &first, &second]);
+    command.assert().success().stdout("onetwo");
+
+    rx.recv().unwrap();
+    let second_request = rx.recv().unwrap();
+    assert_eq!(header(&second_request, "cookie"), Some("sid=abc"));
+}
+
+#[test]
+fn cookie_header_appends_repeated_literals() {
+    let (url, rx) = spawn_server(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok");
+
+    let mut command = Command::cargo_bin("curl").unwrap();
+    command.args([
+        "-q",
+        "-sS",
+        "-b",
+        "name=contents;name2=content2",
+        "-b",
+        "name3=content3",
+        &url,
+    ]);
+    command.assert().success().stdout("ok");
+
+    let request = rx.recv().unwrap();
+    assert_eq!(
+        header(&request, "cookie"),
+        Some("name=contents;name2=content2; name3=content3")
+    );
+}
+
+#[test]
+fn cookie_file_sends_netscape_cookie() {
+    let (url, rx) = spawn_server(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok");
+    let host = Url::parse(&url).unwrap().host_str().unwrap().to_string();
+    let temp = tempdir().unwrap();
+    let cookie_file = temp.path().join("cookies.txt");
+    std::fs::write(
+        &cookie_file,
+        format!("{host}\tFALSE\t/\tFALSE\t0\tsid\tfrom-file\n"),
+    )
+    .unwrap();
+
+    let mut command = Command::cargo_bin("curl").unwrap();
+    command.args(["-q", "-sS", "-b", cookie_file.to_str().unwrap(), &url]);
+    command.assert().success().stdout("ok");
+
+    let request = rx.recv().unwrap();
+    assert_eq!(header(&request, "cookie"), Some("sid=from-file"));
+}
+
+#[test]
+fn cookie_file_and_literal_cookie_are_combined() {
+    let (url, rx) = spawn_server(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok");
+    let host = Url::parse(&url).unwrap().host_str().unwrap().to_string();
+    let temp = tempdir().unwrap();
+    let cookie_file = temp.path().join("cookies.txt");
+    std::fs::write(
+        &cookie_file,
+        format!("{host}\tFALSE\t/\tFALSE\t0\tsid\tfrom-file\n"),
+    )
+    .unwrap();
+
+    let mut command = Command::cargo_bin("curl").unwrap();
+    command.args([
+        "-q",
+        "-sS",
+        "-b",
+        cookie_file.to_str().unwrap(),
+        "-b",
+        "tool=curl",
+        &url,
+    ]);
+    command.assert().success().stdout("ok");
+
+    let request = rx.recv().unwrap();
+    assert_eq!(header(&request, "cookie"), Some("sid=from-file; tool=curl"));
+}
+
+#[test]
 fn libcurl_writes_source_file_for_supported_options() {
     let (url, rx) = spawn_server(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok");
     let temp = tempdir().unwrap();

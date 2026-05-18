@@ -36,10 +36,7 @@ pub async fn run(config: Config) -> Result<i32> {
     let mut final_code = 0;
 
     for transfer in &config.transfers {
-        let cookie_jar = transfer
-            .cookie_jar
-            .as_ref()
-            .map(|_| Arc::new(CookieJar::default()));
+        let cookie_jar = build_cookie_jar(transfer)?;
         let client = build_client(transfer, cookie_jar.clone())?;
         let expanded_urls = expand_urls(transfer)?;
 
@@ -113,10 +110,7 @@ fn parallel_jobs(config: &Config) -> Result<(Vec<ParallelJob>, Vec<CookieSave>)>
     let mut cookie_saves = Vec::new();
 
     for transfer in &config.transfers {
-        let cookie_jar = transfer
-            .cookie_jar
-            .as_ref()
-            .map(|_| Arc::new(CookieJar::default()));
+        let cookie_jar = build_cookie_jar(transfer)?;
         let client = build_client(transfer, cookie_jar.clone())?;
         let expanded_urls = expand_urls(transfer)?;
 
@@ -140,6 +134,21 @@ fn parallel_jobs(config: &Config) -> Result<(Vec<ParallelJob>, Vec<CookieSave>)>
     }
 
     Ok((jobs, cookie_saves))
+}
+
+fn build_cookie_jar(transfer: &TransferConfig) -> Result<Option<Arc<CookieJar>>> {
+    if !cookie_engine_active(transfer) {
+        return Ok(None);
+    }
+
+    let jar = Arc::new(CookieJar::default());
+    jar.set_explicit_cookie(transfer.cookie.as_deref());
+    jar.load_from_inputs(&transfer.cookie_files)?;
+    Ok(Some(jar))
+}
+
+fn cookie_engine_active(transfer: &TransferConfig) -> bool {
+    transfer.cookie_jar.is_some() || !transfer.cookie_files.is_empty()
 }
 
 fn spawn_parallel_job(active: &mut JoinSet<Result<(usize, i32)>>, job: ParallelJob) {
@@ -668,7 +677,9 @@ fn apply_headers(
         request = request.header(ACCEPT_ENCODING, "deflate, gzip, br");
     }
 
-    if let Some(cookie) = &transfer.cookie {
+    if let Some(cookie) = &transfer.cookie
+        && !cookie_engine_active(transfer)
+    {
         request = request.header(COOKIE, cookie);
     }
 

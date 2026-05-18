@@ -225,6 +225,9 @@ fn write_request(out: &mut String, render: &RenderTransfer<'_>, url: &str) -> Re
     if let Some(cookie) = &transfer.cookie {
         emit_string_setopt(out, "CURLOPT_COOKIE", cookie);
     }
+    for cookie_file in &transfer.cookie_files {
+        emit_string_setopt(out, "CURLOPT_COOKIEFILE", cookie_file);
+    }
     if let Some(cookie_jar) = &transfer.cookie_jar {
         emit_string_setopt(out, "CURLOPT_COOKIEJAR", &cookie_jar.to_string_lossy());
     }
