@@ -54,6 +54,34 @@ fn spawn_timed_server(
     (format!("http://{addr}/resource"), rx)
 }
 
+fn spawn_gopher_server(response: &'static [u8]) -> (String, Receiver<Vec<u8>>) {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = listener.local_addr().unwrap();
+    let (tx, rx) = mpsc::channel();
+
+    thread::spawn(move || {
+        let (mut stream, _) = listener.accept().unwrap();
+        let mut bytes = Vec::new();
+        let mut buffer = [0; 1024];
+
+        loop {
+            let read = stream.read(&mut buffer).unwrap();
+            if read == 0 {
+                break;
+            }
+            bytes.extend_from_slice(&buffer[..read]);
+            if bytes.ends_with(b"\r\n") {
+                break;
+            }
+        }
+
+        tx.send(bytes).unwrap();
+        stream.write_all(response).unwrap();
+    });
+
+    (format!("gopher://{addr}/1/resource"), rx)
+}
+
 fn read_request(stream: &mut impl Read) -> RequestRecord {
     let mut bytes = Vec::new();
     let mut buffer = [0; 1024];
@@ -244,6 +272,100 @@ fn http2_does_not_force_prior_knowledge() {
 
     let request = rx.recv().unwrap();
     assert!(request.start_line.starts_with("GET /resource HTTP/1.1"));
+}
+
+#[test]
+fn downloads_gopher_selector() {
+    let (url, rx) = spawn_gopher_server(b"iMenu results\t\terror.host\t1\r\n.\r\n");
+    let url = url.replace("/1/resource", "/1/selector/SELECTOR/1201");
+
+    let mut command = Command::cargo_bin("curl").unwrap();
+    command.args(["-q", "-sS", &url]);
+    command
+        .assert()
+        .success()
+        .stdout("iMenu results\t\terror.host\t1\r\n.\r\n");
+
+    assert_eq!(rx.recv().unwrap(), b"/selector/SELECTOR/1201\r\n");
+}
+
+#[test]
+fn gopher_decodes_selector_before_sending() {
+    let (url, rx) = spawn_gopher_server(b"search result\r\n");
+    let url = url.replace(
+        "/1/resource",
+        "/7/the/search/engine%09query%20succeeded/1202",
+    );
+
+    let mut command = Command::cargo_bin("curl").unwrap();
+    command.args(["-q", "-sS", &url]);
+    command.assert().success().stdout("search result\r\n");
+
+    assert_eq!(
+        rx.recv().unwrap(),
+        b"/the/search/engine\tquery succeeded/1202\r\n"
+    );
+}
+
+#[test]
+fn gopher_degenerate_selector_sends_only_crlf() {
+    let (url, rx) = spawn_gopher_server(b"root\r\n");
+    let url = url.replace("/1/resource", "/1");
+
+    let mut command = Command::cargo_bin("curl").unwrap();
+    command.args(["-q", "-sS", &url]);
+    command.assert().success().stdout("root\r\n");
+
+    assert_eq!(rx.recv().unwrap(), b"\r\n");
+}
+
+#[test]
+fn gopher_appends_and_decodes_query_component() {
+    let (url, rx) = spawn_gopher_server(b"query\r\n");
+    let url = url.replace("/1/resource", "/7/search?term%20ok");
+
+    let mut command = Command::cargo_bin("curl").unwrap();
+    command.args(["-q", "-sS", &url]);
+    command.assert().success().stdout("query\r\n");
+
+    assert_eq!(rx.recv().unwrap(), b"/search?term ok\r\n");
+}
+
+#[test]
+fn gopher_writeout_reports_zero_http_code_and_download_size() {
+    let (url, rx) = spawn_gopher_server(b"abcdef");
+
+    let mut command = Command::cargo_bin("curl").unwrap();
+    command.args(["-q", "-sS", "-w", " %{http_code} %{size_download}", &url]);
+    command.assert().success().stdout("abcdef 000 6");
+
+    assert_eq!(rx.recv().unwrap(), b"/resource\r\n");
+}
+
+#[test]
+fn gopher_remote_name_writes_url_filename() {
+    let temp = tempdir().unwrap();
+    let (url, rx) = spawn_gopher_server(b"saved");
+    let url = url.replace("/1/resource", "/1/nested/result.txt");
+
+    let mut command = Command::cargo_bin("curl").unwrap();
+    command
+        .current_dir(temp.path())
+        .args(["-q", "-sS", "-O", &url]);
+    command.assert().success().stdout("");
+
+    assert_eq!(rx.recv().unwrap(), b"/nested/result.txt\r\n");
+    assert_eq!(
+        std::fs::read_to_string(temp.path().join("result.txt")).unwrap(),
+        "saved"
+    );
+}
+
+#[test]
+fn gopher_rejects_decoded_nul_selector() {
+    let mut command = Command::cargo_bin("curl").unwrap();
+    command.args(["-q", "-sS", "gopher://example.invalid/1/%00"]);
+    command.assert().failure().code(3).stdout("");
 }
 
 #[test]

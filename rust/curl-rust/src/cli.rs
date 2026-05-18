@@ -920,7 +920,7 @@ pub fn print_help() {
 
 pub fn print_version() {
     println!(
-        "curl-rust {} (Rust rewrite) HTTP HTTPS FILE",
+        "curl-rust {} (Rust rewrite) HTTP HTTPS FILE GOPHER",
         env!("CARGO_PKG_VERSION")
     );
 }

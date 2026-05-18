@@ -3,6 +3,9 @@ use std::path::Path;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+use percent_encoding::percent_decode;
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::net::TcpStream;
 use tokio::task::JoinSet;
 
 use reqwest::header::{
@@ -233,6 +236,12 @@ async fn run_expanded_url(
 
     let result = if expanded.url.starts_with("file://") {
         run_file_transfer(transfer, &expanded, method.as_str(), &mut metrics).await
+    } else if expanded.url.starts_with("gopher://") {
+        run_gopher_transfer(transfer, &expanded, method.as_str(), &mut metrics).await
+    } else if expanded.url.starts_with("gophers://") {
+        Err(CurlError::Unsupported(
+            "gophers:// URLs are not implemented in the Rust sidecar".to_string(),
+        ))
     } else {
         run_http_with_retries(transfer, client, &expanded, method, &mut metrics, started).await
     };
@@ -327,6 +336,95 @@ async fn run_file_transfer(
     )?;
     metrics.filename_effective = filename.map(|path| path.display().to_string());
     Ok(())
+}
+
+async fn run_gopher_transfer(
+    transfer: &TransferConfig,
+    expanded: &glob::ExpandedUrl,
+    method: &str,
+    metrics: &mut writeout::Metrics,
+) -> Result<()> {
+    if method != "GET" && method != "HEAD" {
+        return Err(CurlError::Unsupported(format!(
+            "{method} requests for gopher:// URLs"
+        )));
+    }
+
+    let url = Url::parse(&expanded.url).map_err(|error| CurlError::Url(error.to_string()))?;
+    output::validate_output_target(transfer, &url)?;
+    let host = url
+        .host_str()
+        .ok_or_else(|| CurlError::Url("gopher URL is missing a host".to_string()))?;
+    let port = url.port().unwrap_or(70);
+    let selector = gopher_selector(&url)?;
+
+    let mut stream = connect_gopher(host, port, transfer).await?;
+    stream.write_all(&selector).await.map_err(gopher_io_error)?;
+    stream.write_all(b"\r\n").await.map_err(gopher_io_error)?;
+
+    let mut body = Vec::new();
+    stream
+        .read_to_end(&mut body)
+        .await
+        .map_err(gopher_io_error)?;
+    metrics.url_effective = url.to_string();
+
+    if method == "HEAD" {
+        body.clear();
+    }
+    metrics.size_download = body.len() as u64;
+
+    let filename = output::write_response(
+        transfer,
+        &url,
+        &reqwest::header::HeaderMap::new(),
+        &expanded.variables,
+        &body,
+        false,
+    )?;
+    metrics.filename_effective = filename.map(|path| path.display().to_string());
+    Ok(())
+}
+
+async fn connect_gopher(host: &str, port: u16, transfer: &TransferConfig) -> Result<TcpStream> {
+    let connect = TcpStream::connect((host, port));
+    if let Some(timeout) = transfer.connect_timeout {
+        tokio::time::timeout(timeout, connect)
+            .await
+            .map_err(|_| CurlError::Transfer("connection timed out".to_string()))?
+            .map_err(gopher_io_error)
+    } else {
+        connect.await.map_err(gopher_io_error)
+    }
+}
+
+fn gopher_io_error(error: io::Error) -> CurlError {
+    CurlError::Transfer(error.to_string())
+}
+
+fn gopher_selector(url: &Url) -> Result<Vec<u8>> {
+    let path = if url.path().is_empty() {
+        "/"
+    } else {
+        url.path()
+    };
+    let gopher_path = if let Some(query) = url.query() {
+        format!("{path}?{query}")
+    } else {
+        path.to_string()
+    };
+
+    if gopher_path.len() <= 2 {
+        return Ok(Vec::new());
+    }
+
+    let decoded = percent_decode(&gopher_path.as_bytes()[2..]).collect::<Vec<_>>();
+    if decoded.contains(&0) {
+        return Err(CurlError::Url(
+            "gopher selector contains a decoded NUL byte".to_string(),
+        ));
+    }
+    Ok(decoded)
 }
 
 async fn run_http_transfer(

@@ -27,7 +27,7 @@ behavior, and test mapping is `verified` or explicitly accepted as out of scope.
 | HTTP | partial | `transfer.rs::run_http_transfer` | HTTP test corpus mapping | reqwest-backed subset |
 | HTTPS | partial | `transfer.rs::run_http_transfer` | TLS/proxy/cert tests | rustls-backed subset |
 | FTP/FTPS | missing | none | FTP tests in `tests/data/` | |
-| GOPHER/GOPHERS | missing | none | protocol tests | |
+| GOPHER/GOPHERS | partial | `transfer.rs::run_gopher_transfer` | `downloads_gopher_selector`, `gopher_decodes_selector_before_sending`, `gopher_degenerate_selector_sends_only_crlf`, `gopher_appends_and_decodes_query_component`, `gopher_writeout_reports_zero_http_code_and_download_size`, `gopher_remote_name_writes_url_filename`, `gopher_rejects_decoded_nul_selector` | Plain `gopher://` selector send/read support only; `gophers://`, IPv6 fixture coverage, proxying, redirects, `--include` header echo, timeout parity, and full corpus mapping remain incomplete |
 | IMAP/IMAPS | missing | none | protocol tests | |
 | LDAP/LDAPS | missing | none | protocol tests | |
 | MQTT/MQTTS | missing | none | protocol tests | |

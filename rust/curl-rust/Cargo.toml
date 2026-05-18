@@ -15,7 +15,7 @@ httpdate = "1.0"
 percent-encoding = "2.3"
 reqwest = { version = "0.12", default-features = false, features = ["brotli", "cookies", "deflate", "gzip", "http2", "multipart", "rustls-tls"] }
 thiserror = "2.0"
-tokio = { version = "1.48", features = ["fs", "io-std", "io-util", "macros", "rt-multi-thread", "time"] }
+tokio = { version = "1.48", features = ["fs", "io-std", "io-util", "macros", "net", "rt-multi-thread", "time"] }
 url = "2.5"
 
 [dev-dependencies]
