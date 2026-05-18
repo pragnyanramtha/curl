@@ -72,6 +72,13 @@ struct WsRecord {
 }
 
 #[derive(Debug)]
+struct LdapRecord {
+    bind: Vec<u8>,
+    search: Vec<u8>,
+    unbind: Vec<u8>,
+}
+
+#[derive(Debug)]
 struct FtpServerOptions {
     data: Vec<u8>,
     epsv_fails: bool,
@@ -670,6 +677,172 @@ fn mqtt_publish(topic: &[u8], payload: &[u8]) -> Vec<u8> {
 
 fn mqtt_disconnect() -> Vec<u8> {
     mqtt_packet(0xe0, &[])
+}
+
+fn ldap_tlv(tag: u8, content: &[u8]) -> Vec<u8> {
+    let mut bytes = Vec::new();
+    bytes.push(tag);
+    if content.len() < 128 {
+        bytes.push(content.len() as u8);
+    } else {
+        let mut length = Vec::new();
+        let mut remaining = content.len();
+        while remaining > 0 {
+            length.push((remaining & 0xff) as u8);
+            remaining >>= 8;
+        }
+        length.reverse();
+        bytes.push(0x80 | length.len() as u8);
+        bytes.extend_from_slice(&length);
+    }
+    bytes.extend_from_slice(content);
+    bytes
+}
+
+fn ldap_integer(value: i32) -> Vec<u8> {
+    let mut content = value.to_be_bytes().to_vec();
+    while content.len() > 1
+        && ((content[0] == 0x00 && content[1] & 0x80 == 0)
+            || (content[0] == 0xff && content[1] & 0x80 != 0))
+    {
+        content.remove(0);
+    }
+    ldap_tlv(0x02, &content)
+}
+
+fn ldap_enumerated(value: i32) -> Vec<u8> {
+    let mut content = value.to_be_bytes().to_vec();
+    while content.len() > 1
+        && ((content[0] == 0x00 && content[1] & 0x80 == 0)
+            || (content[0] == 0xff && content[1] & 0x80 != 0))
+    {
+        content.remove(0);
+    }
+    ldap_tlv(0x0a, &content)
+}
+
+fn ldap_octet(value: &[u8]) -> Vec<u8> {
+    ldap_tlv(0x04, value)
+}
+
+fn ldap_sequence(content: &[u8]) -> Vec<u8> {
+    ldap_tlv(0x30, content)
+}
+
+fn ldap_message(id: i32, protocol_op: &[u8]) -> Vec<u8> {
+    let mut body = Vec::new();
+    body.extend_from_slice(&ldap_integer(id));
+    body.extend_from_slice(protocol_op);
+    ldap_sequence(&body)
+}
+
+fn ldap_result_message(id: i32, tag: u8, code: i32) -> Vec<u8> {
+    let mut result = Vec::new();
+    result.extend_from_slice(&ldap_enumerated(code));
+    result.extend_from_slice(&ldap_octet(b""));
+    result.extend_from_slice(&ldap_octet(b""));
+    ldap_message(id, &ldap_tlv(tag, &result))
+}
+
+fn ldap_bind_response(code: i32) -> Vec<u8> {
+    ldap_result_message(1, 0x61, code)
+}
+
+fn ldap_search_done(code: i32) -> Vec<u8> {
+    ldap_result_message(2, 0x65, code)
+}
+
+fn ldap_attribute(name: &[u8], values: &[&[u8]]) -> Vec<u8> {
+    let mut set = Vec::new();
+    for value in values {
+        set.extend_from_slice(&ldap_octet(value));
+    }
+
+    let mut body = Vec::new();
+    body.extend_from_slice(&ldap_octet(name));
+    body.extend_from_slice(&ldap_tlv(0x31, &set));
+    ldap_sequence(&body)
+}
+
+fn ldap_search_entry(dn: &[u8], attributes: &[Vec<u8>]) -> Vec<u8> {
+    let mut attribute_list = Vec::new();
+    for attribute in attributes {
+        attribute_list.extend_from_slice(attribute);
+    }
+
+    let mut body = Vec::new();
+    body.extend_from_slice(&ldap_octet(dn));
+    body.extend_from_slice(&ldap_sequence(&attribute_list));
+    ldap_message(2, &ldap_tlv(0x64, &body))
+}
+
+fn ldap_read_client_message(stream: &mut impl Read) -> Option<Vec<u8>> {
+    let mut tag = [0; 1];
+    stream.read_exact(&mut tag).ok()?;
+    let mut first = [0; 1];
+    stream.read_exact(&mut first).ok()?;
+    let mut message = vec![tag[0], first[0]];
+    let length = if first[0] & 0x80 == 0 {
+        first[0] as usize
+    } else {
+        let count = (first[0] & 0x7f) as usize;
+        let mut length_bytes = vec![0; count];
+        stream.read_exact(&mut length_bytes).ok()?;
+        message.extend_from_slice(&length_bytes);
+        length_bytes
+            .into_iter()
+            .fold(0_usize, |length, byte| (length << 8) | byte as usize)
+    };
+    let mut content = vec![0; length];
+    stream.read_exact(&mut content).ok()?;
+    message.extend_from_slice(&content);
+    Some(message)
+}
+
+fn spawn_ldap_server(
+    path: &'static str,
+    bind_code: i32,
+    entries: Vec<Vec<u8>>,
+    done_code: i32,
+) -> (String, Receiver<LdapRecord>) {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = listener.local_addr().unwrap();
+    let (tx, rx) = mpsc::channel();
+
+    thread::spawn(move || {
+        let (mut stream, _) = listener.accept().unwrap();
+        let bind = ldap_read_client_message(&mut stream).unwrap();
+        stream.write_all(&ldap_bind_response(bind_code)).unwrap();
+
+        let mut search = Vec::new();
+        let mut unbind = Vec::new();
+        if bind_code == 0 {
+            search = ldap_read_client_message(&mut stream).unwrap();
+            for entry in entries {
+                stream.write_all(&entry).unwrap();
+            }
+            stream.write_all(&ldap_search_done(done_code)).unwrap();
+            stream
+                .set_read_timeout(Some(Duration::from_millis(200)))
+                .unwrap();
+            unbind = ldap_read_client_message(&mut stream).unwrap_or_default();
+        }
+
+        tx.send(LdapRecord {
+            bind,
+            search,
+            unbind,
+        })
+        .unwrap();
+    });
+
+    (format!("ldap://{addr}{path}"), rx)
+}
+
+fn contains_bytes(haystack: &[u8], needle: &[u8]) -> bool {
+    haystack
+        .windows(needle.len())
+        .any(|window| window == needle)
 }
 
 fn ws_server_response() -> Vec<u8> {
@@ -3205,6 +3378,141 @@ fn telnet_options_fail_explicitly_until_negotiation_options_are_supported() {
     let mut command = Command::cargo_bin("curl").unwrap();
     command.args(["-q", "-sS", "-tTTYPE=vt100", "telnet://example.invalid"]);
     command.assert().failure().code(2).stdout("");
+}
+
+#[test]
+fn ldap_anonymous_search_outputs_entry() {
+    let entry = ldap_search_entry(
+        b"cn=Alice,dc=example",
+        &[
+            ldap_attribute(b"cn", &[&b"Alice"[..]]),
+            ldap_attribute(b"mail", &[&b"alice@example.com"[..]]),
+        ],
+    );
+    let (url, rx) = spawn_ldap_server("/dc=example", 0, vec![entry], 0);
+
+    let mut command = Command::cargo_bin("curl").unwrap();
+    command.args(["-q", "-sS", &url]);
+    command
+        .assert()
+        .success()
+        .stdout("DN: cn=Alice,dc=example\n\tcn: Alice\n\n\tmail: alice@example.com\n\n\n");
+
+    let record = rx.recv().unwrap();
+    assert!(contains_bytes(&record.bind, &ldap_tlv(0x80, b"")));
+    assert!(contains_bytes(&record.search, &ldap_octet(b"dc=example")));
+    assert!(contains_bytes(
+        &record.search,
+        &ldap_tlv(0x87, b"objectClass")
+    ));
+    assert!(contains_bytes(&record.unbind, &ldap_tlv(0x42, &[])));
+}
+
+#[test]
+fn ldap_url_parses_base_attrs_scope_and_filter() {
+    let (url, rx) = spawn_ldap_server("/dc=example?cn,sn?sub?(uid=alice)", 0, vec![], 0);
+
+    let mut command = Command::cargo_bin("curl").unwrap();
+    command.args(["-q", "-sS", &url]);
+    command.assert().success().stdout("");
+
+    let record = rx.recv().unwrap();
+    let mut equality = Vec::new();
+    equality.extend_from_slice(&ldap_octet(b"uid"));
+    equality.extend_from_slice(&ldap_octet(b"alice"));
+    assert!(contains_bytes(&record.search, &ldap_octet(b"dc=example")));
+    assert!(contains_bytes(&record.search, &ldap_enumerated(2)));
+    assert!(contains_bytes(&record.search, &ldap_tlv(0xa3, &equality)));
+    assert!(contains_bytes(&record.search, &ldap_octet(b"cn")));
+    assert!(contains_bytes(&record.search, &ldap_octet(b"sn")));
+}
+
+#[test]
+fn ldap_simple_bind_uses_user_option() {
+    let (url, rx) = spawn_ldap_server("/dc=example", 0, vec![], 0);
+
+    let mut command = Command::cargo_bin("curl").unwrap();
+    command.args(["-q", "-sS", "-u", "cn=admin:secret", &url]);
+    command.assert().success().stdout("");
+
+    let record = rx.recv().unwrap();
+    assert!(contains_bytes(&record.bind, &ldap_octet(b"cn=admin")));
+    assert!(contains_bytes(&record.bind, &ldap_tlv(0x80, b"secret")));
+}
+
+#[test]
+fn ldap_search_failure_returns_39_and_writeout_code() {
+    let (url, rx) = spawn_ldap_server("/missing", 0, vec![], 32);
+
+    let mut command = Command::cargo_bin("curl").unwrap();
+    command.args(["-q", "-sS", "-w", "%{response_code}", &url]);
+    command.assert().failure().code(39).stdout("032");
+
+    let _ = rx.recv().unwrap();
+}
+
+#[test]
+fn ldap_bind_failure_returns_38() {
+    let (url, rx) = spawn_ldap_server("/dc=example", 1, vec![], 0);
+
+    let mut command = Command::cargo_bin("curl").unwrap();
+    command.args(["-q", "-sS", &url]);
+    command.assert().failure().code(38).stdout("");
+
+    let _ = rx.recv().unwrap();
+}
+
+#[test]
+fn ldap_head_suppresses_body() {
+    let entry = ldap_search_entry(
+        b"cn=Alice,dc=example",
+        &[ldap_attribute(b"cn", &[&b"Alice"[..]])],
+    );
+    let (url, rx) = spawn_ldap_server("/dc=example", 0, vec![entry], 0);
+
+    let mut command = Command::cargo_bin("curl").unwrap();
+    command.args([
+        "-q",
+        "-sS",
+        "-I",
+        "-w",
+        "%{size_download} %{http_code}",
+        &url,
+    ]);
+    command.assert().success().stdout("0 000");
+
+    let record = rx.recv().unwrap();
+    assert!(contains_bytes(&record.search, &ldap_octet(b"dc=example")));
+}
+
+#[test]
+fn ldap_dump_header_is_empty_and_include_adds_no_headers() {
+    let temp = tempdir().unwrap();
+    let dump = temp.path().join("ldap.headers");
+    let entry = ldap_search_entry(
+        b"cn=Alice,dc=example",
+        &[ldap_attribute(b"cn", &[&b"Alice"[..]])],
+    );
+    let (url, rx) = spawn_ldap_server("/dc=example", 0, vec![entry], 0);
+
+    let mut command = Command::cargo_bin("curl").unwrap();
+    command.args(["-q", "-sS", "-i", "-D", dump.to_str().unwrap(), &url]);
+    command
+        .assert()
+        .success()
+        .stdout("DN: cn=Alice,dc=example\n\tcn: Alice\n\n\n");
+
+    let _ = rx.recv().unwrap();
+    assert_eq!(std::fs::read(dump).unwrap(), b"");
+}
+
+#[test]
+fn version_lists_ldap_protocol() {
+    let mut command = Command::cargo_bin("curl").unwrap();
+    let output = command.args(["-q", "-V"]).output().unwrap();
+
+    assert!(output.status.success());
+    assert!(String::from_utf8(output.stdout).unwrap().contains("LDAP"));
 }
 
 #[test]

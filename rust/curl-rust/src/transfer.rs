@@ -35,6 +35,7 @@ const IMAP_DEFAULT_PORT: u16 = 143;
 const MQTT_DEFAULT_PORT: u16 = 1883;
 const RTSP_DEFAULT_PORT: u16 = 554;
 const WS_DEFAULT_PORT: u16 = 80;
+const LDAP_DEFAULT_PORT: u16 = 389;
 const MQTT_CLIENT_ID: &[u8; 12] = b"curlrust0000";
 const WS_KEY: &str = "NDMyMTUzMjE2MzIxNzMyMQ==";
 const WS_ACCEPT: &str = "HkPsVga7+8LuxM4RGQ5p9tZHeYs=";
@@ -315,6 +316,12 @@ async fn run_expanded_url(
     } else if expanded.url.starts_with("imaps://") {
         Err(CurlError::Unsupported(
             "imaps:// URLs are not implemented in the Rust sidecar".to_string(),
+        ))
+    } else if expanded.url.starts_with("ldap://") {
+        run_ldap_transfer(transfer, &expanded, &method_label, &mut metrics).await
+    } else if expanded.url.starts_with("ldaps://") {
+        Err(CurlError::Unsupported(
+            "ldaps:// URLs are not implemented in the Rust sidecar".to_string(),
         ))
     } else if expanded.url.starts_with("smtp://") {
         run_smtp_transfer(transfer, &expanded, &method_label, &mut metrics).await
@@ -2434,6 +2441,547 @@ fn ws_masked_frame(opcode: u8, payload: &[u8]) -> Vec<u8> {
     frame.extend_from_slice(&[0, 0, 0, 0]);
     frame.extend_from_slice(payload);
     frame
+}
+
+async fn run_ldap_transfer(
+    transfer: &TransferConfig,
+    expanded: &glob::ExpandedUrl,
+    method: &str,
+    metrics: &mut writeout::Metrics,
+) -> Result<()> {
+    if method != "GET" && method != "HEAD" {
+        return Err(CurlError::Unsupported(format!(
+            "{method} requests for ldap:// URLs"
+        )));
+    }
+    if !transfer.data.is_empty() || !transfer.url_query.is_empty() || !transfer.forms.is_empty() {
+        return Err(CurlError::Unsupported(
+            "data/form/query request bodies for ldap:// URLs".to_string(),
+        ));
+    }
+    reject_upload_file_for_scheme(transfer, "ldap://")?;
+    if transfer.oauth2_bearer.is_some() {
+        return Err(CurlError::Unsupported(
+            "--oauth2-bearer for ldap:// URLs".to_string(),
+        ));
+    }
+
+    if let Some(timeout) = transfer.max_time {
+        tokio::time::timeout(
+            timeout,
+            run_ldap_exchange(transfer, expanded, method, metrics),
+        )
+        .await
+        .map_err(|_| CurlError::Timeout)?
+    } else {
+        run_ldap_exchange(transfer, expanded, method, metrics).await
+    }
+}
+
+async fn run_ldap_exchange(
+    transfer: &TransferConfig,
+    expanded: &glob::ExpandedUrl,
+    method: &str,
+    metrics: &mut writeout::Metrics,
+) -> Result<()> {
+    let url = Url::parse(&expanded.url).map_err(|error| CurlError::Url(error.to_string()))?;
+    output::validate_output_target(transfer, &url)?;
+    let host = url
+        .host_str()
+        .ok_or_else(|| CurlError::Url("LDAP URL is missing a host".to_string()))?;
+    let port = url.port().unwrap_or(LDAP_DEFAULT_PORT);
+    let request = ldap_url_request(&url)?;
+    let (login, password) = ldap_credentials(transfer, &url)?;
+    let mut stream = connect_tcp(host, port, transfer).await?;
+
+    stream
+        .write_all(&ldap_message(1, &ldap_bind_request(&login, &password)))
+        .await
+        .map_err(tcp_io_error)?;
+    let bind_response = ldap_read_message(&mut stream).await?;
+    let bind_response = ldap_parse_message(&bind_response)?;
+    if bind_response.protocol_tag != 0x61 {
+        return Err(CurlError::WeirdServerReply);
+    }
+    let bind_code = ldap_result_code(bind_response.protocol_value)?;
+    if bind_code != 0 {
+        return Err(ldap_bind_error(bind_code));
+    }
+
+    stream
+        .write_all(&ldap_message(2, &ldap_search_request(&request)))
+        .await
+        .map_err(tcp_io_error)?;
+
+    let mut body = Vec::new();
+    loop {
+        let message = ldap_read_message(&mut stream).await?;
+        let message = ldap_parse_message(&message)?;
+        match message.protocol_tag {
+            0x64 => ldap_append_search_entry(&mut body, message.protocol_value)?,
+            0x65 => {
+                let code = ldap_result_code(message.protocol_value)?;
+                metrics.response_code = Some(u16::try_from(code).unwrap_or(0));
+                if code != 0 && code != 4 {
+                    return Err(CurlError::LdapSearchFailed);
+                }
+                break;
+            }
+            0x73 => {}
+            _ => return Err(CurlError::RecvError),
+        }
+    }
+
+    let _ = stream
+        .write_all(&ldap_message(3, &ldap_tlv(0x42, &[])))
+        .await;
+
+    metrics.url_effective = url.to_string();
+    if method == "HEAD" {
+        body.clear();
+    }
+    let (body_bytes, max_filesize_exceeded) = if method == "HEAD" {
+        (&body[..], false)
+    } else {
+        limit_body_for_max_filesize(transfer, &body)
+    };
+    metrics.size_download = body_bytes.len() as u64;
+
+    if let Some(path) = &transfer.dump_header {
+        output::dump_headers(path, &[], transfer.create_dirs)?;
+    }
+
+    let mut bytes = Vec::new();
+    if method != "HEAD" {
+        bytes.extend_from_slice(body_bytes);
+    }
+    let filename = output::write_response(
+        transfer,
+        &url,
+        &reqwest::header::HeaderMap::new(),
+        &expanded.variables,
+        &bytes,
+        false,
+    )?;
+    metrics.filename_effective = filename.map(|path| path.display().to_string());
+    if max_filesize_exceeded {
+        return Err(CurlError::FileSizeExceeded);
+    }
+    Ok(())
+}
+
+struct LdapUrlRequest {
+    dn: Vec<u8>,
+    attributes: Vec<Vec<u8>>,
+    scope: u8,
+    filter: LdapFilter,
+}
+
+enum LdapFilter {
+    Present(Vec<u8>),
+    Equality(Vec<u8>, Vec<u8>),
+}
+
+struct LdapMessage<'a> {
+    protocol_tag: u8,
+    protocol_value: &'a [u8],
+}
+
+struct BerTlv<'a> {
+    tag: u8,
+    value: &'a [u8],
+}
+
+struct BerReader<'a> {
+    bytes: &'a [u8],
+    position: usize,
+}
+
+impl<'a> BerReader<'a> {
+    fn new(bytes: &'a [u8]) -> Self {
+        Self { bytes, position: 0 }
+    }
+
+    fn read_tlv(&mut self) -> Result<BerTlv<'a>> {
+        if self.position >= self.bytes.len() {
+            return Err(CurlError::RecvError);
+        }
+        let tag = self.bytes[self.position];
+        self.position += 1;
+        let length = ber_read_length(self.bytes, &mut self.position)?;
+        let end = self
+            .position
+            .checked_add(length)
+            .filter(|end| *end <= self.bytes.len())
+            .ok_or(CurlError::RecvError)?;
+        let value = &self.bytes[self.position..end];
+        self.position = end;
+        Ok(BerTlv { tag, value })
+    }
+
+    fn read_tag(&mut self, tag: u8) -> Result<&'a [u8]> {
+        let tlv = self.read_tlv()?;
+        if tlv.tag != tag {
+            return Err(CurlError::RecvError);
+        }
+        Ok(tlv.value)
+    }
+
+    fn is_empty(&self) -> bool {
+        self.position == self.bytes.len()
+    }
+}
+
+fn ldap_url_request(url: &Url) -> Result<LdapUrlRequest> {
+    let dn = ldap_percent_decode(
+        "LDAP DN",
+        url.path().strip_prefix('/').unwrap_or(url.path()),
+    )?;
+    let mut attributes = Vec::new();
+    let mut scope = 0;
+    let mut filter = LdapFilter::Present(b"objectClass".to_vec());
+
+    if let Some(query) = url.query() {
+        let mut fields = query.split('?');
+        if let Some(raw_attributes) = fields.next()
+            && !raw_attributes.is_empty()
+        {
+            for attribute in raw_attributes.split(',') {
+                attributes.push(ldap_percent_decode("LDAP attribute", attribute)?);
+            }
+        }
+        if let Some(raw_scope) = fields.next()
+            && !raw_scope.is_empty()
+        {
+            scope = ldap_scope(raw_scope)?;
+        }
+        if let Some(raw_filter) = fields.next()
+            && !raw_filter.is_empty()
+        {
+            let decoded = ldap_percent_decode("LDAP filter", raw_filter)?;
+            filter = ldap_filter(&decoded)?;
+        }
+        if fields.any(|field| !field.is_empty()) {
+            return Err(CurlError::Unsupported(
+                "LDAP URL extensions in the Rust sidecar".to_string(),
+            ));
+        }
+    }
+
+    Ok(LdapUrlRequest {
+        dn,
+        attributes,
+        scope,
+        filter,
+    })
+}
+
+fn ldap_scope(scope: &str) -> Result<u8> {
+    if scope.eq_ignore_ascii_case("base") {
+        Ok(0)
+    } else if scope.eq_ignore_ascii_case("one") || scope.eq_ignore_ascii_case("onetree") {
+        Ok(1)
+    } else if scope.eq_ignore_ascii_case("sub") || scope.eq_ignore_ascii_case("subtree") {
+        Ok(2)
+    } else {
+        Err(CurlError::Url("bad LDAP URL scope".to_string()))
+    }
+}
+
+fn ldap_filter(filter: &[u8]) -> Result<LdapFilter> {
+    let inner = filter
+        .strip_prefix(b"(")
+        .and_then(|filter| filter.strip_suffix(b")"))
+        .unwrap_or(filter);
+    let Some(index) = inner.iter().position(|byte| *byte == b'=') else {
+        return Err(CurlError::Url("bad LDAP URL filter".to_string()));
+    };
+    let (attribute, value) = inner.split_at(index);
+    let value = &value[1..];
+    if attribute.is_empty() {
+        return Err(CurlError::Url("bad LDAP URL filter".to_string()));
+    }
+    if value == b"*" {
+        Ok(LdapFilter::Present(attribute.to_vec()))
+    } else {
+        Ok(LdapFilter::Equality(attribute.to_vec(), value.to_vec()))
+    }
+}
+
+fn ldap_percent_decode(label: &str, text: &str) -> Result<Vec<u8>> {
+    let decoded = percent_decode(text.as_bytes()).collect::<Vec<_>>();
+    if decoded.contains(&0) {
+        return Err(CurlError::Url(format!(
+            "{label} contains a decoded NUL byte"
+        )));
+    }
+    Ok(decoded)
+}
+
+fn ldap_credentials(transfer: &TransferConfig, url: &Url) -> Result<(Vec<u8>, Vec<u8>)> {
+    if let Some(user) = &transfer.user {
+        let (login, password) = split_user_password(user);
+        return Ok((login.as_bytes().to_vec(), password.as_bytes().to_vec()));
+    }
+
+    if url.username().is_empty() && url.password().is_none() {
+        return Ok((Vec::new(), Vec::new()));
+    }
+
+    let login = percent_decode(url.username().as_bytes()).collect::<Vec<_>>();
+    let password = url
+        .password()
+        .map(|password| percent_decode(password.as_bytes()).collect::<Vec<_>>())
+        .unwrap_or_default();
+    if login.contains(&0) || password.contains(&0) {
+        return Err(CurlError::Url(
+            "LDAP credentials contain a decoded NUL byte".to_string(),
+        ));
+    }
+    Ok((login, password))
+}
+
+fn ldap_bind_request(login: &[u8], password: &[u8]) -> Vec<u8> {
+    let mut body = Vec::new();
+    body.extend_from_slice(&ldap_integer(3));
+    body.extend_from_slice(&ldap_octet_string(login));
+    body.extend_from_slice(&ldap_tlv(0x80, password));
+    ldap_tlv(0x60, &body)
+}
+
+fn ldap_search_request(request: &LdapUrlRequest) -> Vec<u8> {
+    let mut body = Vec::new();
+    body.extend_from_slice(&ldap_octet_string(&request.dn));
+    body.extend_from_slice(&ldap_enumerated(request.scope as i32));
+    body.extend_from_slice(&ldap_enumerated(0));
+    body.extend_from_slice(&ldap_integer(0));
+    body.extend_from_slice(&ldap_integer(0));
+    body.extend_from_slice(&ldap_boolean(false));
+    body.extend_from_slice(&ldap_filter_tlv(&request.filter));
+
+    let mut attributes = Vec::new();
+    for attribute in &request.attributes {
+        attributes.extend_from_slice(&ldap_octet_string(attribute));
+    }
+    body.extend_from_slice(&ldap_sequence(&attributes));
+    ldap_tlv(0x63, &body)
+}
+
+fn ldap_filter_tlv(filter: &LdapFilter) -> Vec<u8> {
+    match filter {
+        LdapFilter::Present(attribute) => ldap_tlv(0x87, attribute),
+        LdapFilter::Equality(attribute, value) => {
+            let mut assertion = Vec::new();
+            assertion.extend_from_slice(&ldap_octet_string(attribute));
+            assertion.extend_from_slice(&ldap_octet_string(value));
+            ldap_tlv(0xa3, &assertion)
+        }
+    }
+}
+
+fn ldap_message(id: i32, protocol_op: &[u8]) -> Vec<u8> {
+    let mut body = Vec::new();
+    body.extend_from_slice(&ldap_integer(id));
+    body.extend_from_slice(protocol_op);
+    ldap_sequence(&body)
+}
+
+fn ldap_sequence(content: &[u8]) -> Vec<u8> {
+    ldap_tlv(0x30, content)
+}
+
+fn ldap_integer(value: i32) -> Vec<u8> {
+    ldap_tlv(0x02, &ber_integer_content(value))
+}
+
+fn ldap_enumerated(value: i32) -> Vec<u8> {
+    ldap_tlv(0x0a, &ber_integer_content(value))
+}
+
+fn ldap_boolean(value: bool) -> Vec<u8> {
+    ldap_tlv(0x01, &[if value { 0xff } else { 0x00 }])
+}
+
+fn ldap_octet_string(value: &[u8]) -> Vec<u8> {
+    ldap_tlv(0x04, value)
+}
+
+fn ldap_tlv(tag: u8, content: &[u8]) -> Vec<u8> {
+    let mut bytes = Vec::new();
+    bytes.push(tag);
+    bytes.extend_from_slice(&ber_length(content.len()));
+    bytes.extend_from_slice(content);
+    bytes
+}
+
+fn ber_integer_content(value: i32) -> Vec<u8> {
+    let mut bytes = value.to_be_bytes().to_vec();
+    while bytes.len() > 1
+        && ((bytes[0] == 0x00 && bytes[1] & 0x80 == 0)
+            || (bytes[0] == 0xff && bytes[1] & 0x80 != 0))
+    {
+        bytes.remove(0);
+    }
+    bytes
+}
+
+fn ber_length(length: usize) -> Vec<u8> {
+    if length < 128 {
+        return vec![length as u8];
+    }
+
+    let mut bytes = Vec::new();
+    let mut remaining = length;
+    while remaining > 0 {
+        bytes.push((remaining & 0xff) as u8);
+        remaining >>= 8;
+    }
+    bytes.reverse();
+
+    let mut encoded = Vec::with_capacity(bytes.len() + 1);
+    encoded.push(0x80 | bytes.len() as u8);
+    encoded.extend_from_slice(&bytes);
+    encoded
+}
+
+async fn ldap_read_message(stream: &mut TcpStream) -> Result<Vec<u8>> {
+    let mut tag = [0; 1];
+    stream.read_exact(&mut tag).await.map_err(ldap_read_error)?;
+    if tag[0] != 0x30 {
+        return Err(CurlError::RecvError);
+    }
+
+    let mut length_first = [0; 1];
+    stream
+        .read_exact(&mut length_first)
+        .await
+        .map_err(ldap_read_error)?;
+    let length = if length_first[0] & 0x80 == 0 {
+        length_first[0] as usize
+    } else {
+        let count = (length_first[0] & 0x7f) as usize;
+        if count == 0 || count > std::mem::size_of::<usize>() {
+            return Err(CurlError::RecvError);
+        }
+        let mut bytes = vec![0; count];
+        stream
+            .read_exact(&mut bytes)
+            .await
+            .map_err(ldap_read_error)?;
+        bytes
+            .into_iter()
+            .fold(0_usize, |length, byte| (length << 8) | byte as usize)
+    };
+
+    let mut content = vec![0; length];
+    stream
+        .read_exact(&mut content)
+        .await
+        .map_err(ldap_read_error)?;
+    Ok(content)
+}
+
+fn ldap_read_error(error: io::Error) -> CurlError {
+    if error.kind() == io::ErrorKind::UnexpectedEof {
+        CurlError::GotNothing
+    } else {
+        tcp_io_error(error)
+    }
+}
+
+fn ldap_parse_message(content: &[u8]) -> Result<LdapMessage<'_>> {
+    let mut reader = BerReader::new(content);
+    let message_id = reader.read_tag(0x02)?;
+    let _ = ber_parse_integer(message_id)?;
+    let protocol = reader.read_tlv()?;
+    if !reader.is_empty() {
+        return Err(CurlError::RecvError);
+    }
+    Ok(LdapMessage {
+        protocol_tag: protocol.tag,
+        protocol_value: protocol.value,
+    })
+}
+
+fn ldap_result_code(content: &[u8]) -> Result<i32> {
+    let mut reader = BerReader::new(content);
+    ber_parse_integer(reader.read_tag(0x0a)?)
+}
+
+fn ldap_bind_error(code: i32) -> CurlError {
+    match code {
+        49 => CurlError::LoginDenied,
+        50 => CurlError::RemoteAccessDenied,
+        _ => CurlError::LdapCannotBind,
+    }
+}
+
+fn ldap_append_search_entry(body: &mut Vec<u8>, content: &[u8]) -> Result<()> {
+    let mut reader = BerReader::new(content);
+    let dn = reader.read_tag(0x04)?;
+    let attributes = reader.read_tag(0x30)?;
+    body.extend_from_slice(b"DN: ");
+    body.extend_from_slice(dn);
+    body.push(b'\n');
+
+    let mut attributes = BerReader::new(attributes);
+    while !attributes.is_empty() {
+        let attribute = attributes.read_tag(0x30)?;
+        let mut attribute = BerReader::new(attribute);
+        let name = attribute.read_tag(0x04)?;
+        let values = attribute.read_tag(0x31)?;
+        let mut values = BerReader::new(values);
+        if values.is_empty() {
+            body.push(b'\t');
+            body.extend_from_slice(name);
+            body.extend_from_slice(b":\n\n");
+            continue;
+        }
+        while !values.is_empty() {
+            let value = values.read_tag(0x04)?;
+            body.push(b'\t');
+            body.extend_from_slice(name);
+            body.extend_from_slice(b": ");
+            body.extend_from_slice(value);
+            body.push(b'\n');
+        }
+        body.push(b'\n');
+    }
+    body.push(b'\n');
+    Ok(())
+}
+
+fn ber_read_length(bytes: &[u8], position: &mut usize) -> Result<usize> {
+    if *position >= bytes.len() {
+        return Err(CurlError::RecvError);
+    }
+    let first = bytes[*position];
+    *position += 1;
+    if first & 0x80 == 0 {
+        return Ok(first as usize);
+    }
+
+    let count = (first & 0x7f) as usize;
+    if count == 0 || count > std::mem::size_of::<usize>() || *position + count > bytes.len() {
+        return Err(CurlError::RecvError);
+    }
+    let mut length = 0_usize;
+    for byte in &bytes[*position..*position + count] {
+        length = (length << 8) | *byte as usize;
+    }
+    *position += count;
+    Ok(length)
+}
+
+fn ber_parse_integer(bytes: &[u8]) -> Result<i32> {
+    if bytes.is_empty() || bytes.len() > 4 {
+        return Err(CurlError::RecvError);
+    }
+    let mut value = if bytes[0] & 0x80 != 0 { -1_i32 } else { 0 };
+    for byte in bytes {
+        value = (value << 8) | *byte as i32;
+    }
+    Ok(value)
 }
 
 async fn run_gopher_transfer(

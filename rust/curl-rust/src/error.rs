@@ -44,6 +44,10 @@ pub enum CurlError {
     FileSizeExceeded,
     #[error("Login denied")]
     LoginDenied,
+    #[error("LDAP cannot bind")]
+    LdapCannotBind,
+    #[error("LDAP search failed")]
+    LdapSearchFailed,
     #[error("Remote file not found")]
     RemoteFileNotFound,
     #[error("failed sending data to the peer")]
@@ -86,6 +90,8 @@ impl CurlError {
             Self::HttpStatus { .. } => 22,
             Self::FileSizeExceeded => 63,
             Self::LoginDenied => 67,
+            Self::LdapCannotBind => 38,
+            Self::LdapSearchFailed => 39,
             Self::RemoteFileNotFound => 78,
             Self::SendError => 55,
             Self::TftpNotFound => 68,
