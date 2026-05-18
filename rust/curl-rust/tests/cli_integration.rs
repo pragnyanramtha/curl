@@ -6265,6 +6265,33 @@ fn remote_header_name_with_remote_name_refuses_to_overwrite_header_filename() {
 }
 
 #[test]
+fn remote_header_name_with_remote_name_strips_header_filename_path() {
+    let (url, rx) = spawn_server(
+        b"HTTP/1.1 200 OK\r\nContent-Disposition: filename=log/server/server.bin\r\nContent-Length: 2\r\n\r\nok",
+    );
+    let temp = tempdir().unwrap();
+
+    let mut command = Command::cargo_bin("curl").unwrap();
+    command.args([
+        "-q",
+        "-sS",
+        "-J",
+        "-O",
+        "--output-dir",
+        temp.path().to_str().unwrap(),
+        &url,
+    ]);
+    command.assert().success().stdout("");
+
+    rx.recv().unwrap();
+    assert_eq!(
+        std::fs::read_to_string(temp.path().join("server.bin")).unwrap(),
+        "ok"
+    );
+    assert!(!temp.path().join("log").exists());
+}
+
+#[test]
 fn writes_file_urls_with_globbed_output_markers() {
     let temp = tempdir().unwrap();
     std::fs::write(temp.path().join("file01.txt"), "one").unwrap();

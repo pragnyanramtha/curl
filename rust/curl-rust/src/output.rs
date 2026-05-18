@@ -214,8 +214,9 @@ fn parse_content_disposition_filename(value: &str) -> Option<String> {
             continue;
         };
         let trimmed = raw.trim_matches('"');
-        if !trimmed.is_empty() && !trimmed.contains('/') && !trimmed.contains('\\') {
-            return Some(trimmed.to_string());
+        let filename = trimmed.rsplit(['/', '\\']).next().unwrap_or_default();
+        if !matches!(filename, "" | "." | "..") {
+            return Some(filename.to_string());
         }
     }
     None
@@ -256,7 +257,11 @@ mod tests {
         );
         assert_eq!(
             parse_content_disposition_filename("attachment; filename=\"../bad\""),
-            None
+            Some("bad".to_string())
+        );
+        assert_eq!(
+            parse_content_disposition_filename("attachment; filename=log\\server\\archive.bin"),
+            Some("archive.bin".to_string())
         );
     }
 
