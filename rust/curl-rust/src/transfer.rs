@@ -5934,6 +5934,11 @@ async fn run_http_transfer(
             "--form cannot be combined with --data or --json".to_string(),
         ));
     }
+    if prepared_body.is_some() && transfer.continue_at.is_some() {
+        return Err(CurlError::Usage(
+            "--continue-at cannot be combined with --data or --json".to_string(),
+        ));
+    }
     if upload_body.is_some() && prepared_body.is_some() {
         return Err(CurlError::Usage(
             "--upload-file cannot be combined with --data or --json".to_string(),

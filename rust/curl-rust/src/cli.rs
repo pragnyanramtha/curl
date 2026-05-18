@@ -609,6 +609,7 @@ impl Parser {
             "tftp-no-options" => self.current().tftp_no_options = false,
             "compressed" => self.current().compressed = false,
             "verbose" => self.current().verbose = false,
+            "progress-meter" => self.current().silent = true,
             "silent" => self.current().silent = false,
             "show-error" => self.current().show_error = false,
             "globoff" => self.current().globoff = false,
@@ -2041,6 +2042,13 @@ mod tests {
         let transfer = &config.transfers[0];
         assert!(!transfer.follow_location);
         assert!(!transfer.compressed);
+    }
+
+    #[test]
+    fn parses_no_progress_meter_as_silent_progress_suppression() {
+        let config = parse_args(["-q", "--no-progress-meter", "https://example.com"]).unwrap();
+
+        assert!(config.transfers[0].silent);
     }
 
     #[test]

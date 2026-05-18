@@ -4564,6 +4564,21 @@ fn http_upload_rejects_data_body_combination() {
 }
 
 #[test]
+fn http_data_rejects_continue_at_combination() {
+    let mut command = Command::cargo_bin("curl").unwrap();
+    command.args([
+        "-q",
+        "-sS",
+        "-d",
+        "a=b",
+        "--continue-at",
+        "3",
+        "http://example.invalid/",
+    ]);
+    command.assert().failure().code(2).stdout("");
+}
+
+#[test]
 fn http_upload_missing_file_exits_read_error() {
     let temp = tempdir().unwrap();
     let missing = temp.path().join("missing.txt");
