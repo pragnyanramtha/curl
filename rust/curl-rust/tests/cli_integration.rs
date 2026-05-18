@@ -369,6 +369,78 @@ fn gopher_rejects_decoded_nul_selector() {
 }
 
 #[test]
+fn gopher_include_does_not_echo_selector_header_data() {
+    let (url, rx) = spawn_gopher_server(b"body\r\n");
+
+    let mut command = Command::cargo_bin("curl").unwrap();
+    command.args(["-q", "-sS", "-i", &url]);
+    command.assert().success().stdout("body\r\n");
+
+    assert_eq!(rx.recv().unwrap(), b"/resource\r\n");
+}
+
+#[test]
+fn gopher_dump_header_writes_selector_as_header_data() {
+    let temp = tempdir().unwrap();
+    let dump = temp.path().join("gopher.headers");
+    let (url, rx) = spawn_gopher_server(b"body\r\n");
+
+    let mut command = Command::cargo_bin("curl").unwrap();
+    command.args(["-q", "-sS", "-D", dump.to_str().unwrap(), &url]);
+    command.assert().success().stdout("body\r\n");
+
+    assert_eq!(rx.recv().unwrap(), b"/resource\r\n");
+    assert_eq!(std::fs::read(dump).unwrap(), b"/resource\r\n");
+}
+
+#[test]
+fn gopher_dump_header_dash_writes_selector_before_body() {
+    let (url, rx) = spawn_gopher_server(b"body\r\n");
+
+    let mut command = Command::cargo_bin("curl").unwrap();
+    command.args(["-q", "-sS", "-D", "-", &url]);
+    command.assert().success().stdout("/resource\r\nbody\r\n");
+
+    assert_eq!(rx.recv().unwrap(), b"/resource\r\n");
+}
+
+#[test]
+fn gopher_head_sends_selector_without_output_body() {
+    let (url, rx) = spawn_gopher_server(b"body\r\n");
+
+    let mut command = Command::cargo_bin("curl").unwrap();
+    command.args(["-q", "-sS", "-I", &url]);
+    command.assert().success().stdout("");
+
+    assert_eq!(rx.recv().unwrap(), b"/resource\r\n");
+}
+
+#[test]
+fn gopher_head_dump_header_writes_selector_without_body() {
+    let temp = tempdir().unwrap();
+    let dump = temp.path().join("gopher.headers");
+    let (url, rx) = spawn_gopher_server(b"body\r\n");
+
+    let mut command = Command::cargo_bin("curl").unwrap();
+    command.args(["-q", "-sS", "-I", "-D", dump.to_str().unwrap(), &url]);
+    command.assert().success().stdout("");
+
+    assert_eq!(rx.recv().unwrap(), b"/resource\r\n");
+    assert_eq!(std::fs::read(dump).unwrap(), b"/resource\r\n");
+}
+
+#[test]
+fn gopher_header_json_remains_empty() {
+    let (url, rx) = spawn_gopher_server(b"body");
+
+    let mut command = Command::cargo_bin("curl").unwrap();
+    command.args(["-q", "-sS", "-w", " %{header_json}", &url]);
+    command.assert().success().stdout("body {}");
+
+    assert_eq!(rx.recv().unwrap(), b"/resource\r\n");
+}
+
+#[test]
 fn username_only_basic_auth_encodes_empty_password() {
     let (url, rx) = spawn_server(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok");
 

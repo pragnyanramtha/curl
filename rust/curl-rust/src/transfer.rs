@@ -357,10 +357,14 @@ async fn run_gopher_transfer(
         .ok_or_else(|| CurlError::Url("gopher URL is missing a host".to_string()))?;
     let port = url.port().unwrap_or(70);
     let selector = gopher_selector(&url)?;
+    let mut header_bytes = selector.clone();
+    header_bytes.extend_from_slice(b"\r\n");
 
     let mut stream = connect_gopher(host, port, transfer).await?;
-    stream.write_all(&selector).await.map_err(gopher_io_error)?;
-    stream.write_all(b"\r\n").await.map_err(gopher_io_error)?;
+    stream
+        .write_all(&header_bytes)
+        .await
+        .map_err(gopher_io_error)?;
 
     let mut body = Vec::new();
     stream
@@ -374,12 +378,21 @@ async fn run_gopher_transfer(
     }
     metrics.size_download = body.len() as u64;
 
+    if let Some(path) = &transfer.dump_header {
+        output::dump_headers(path, &header_bytes, transfer.create_dirs)?;
+    }
+
+    let mut bytes = Vec::new();
+    if method != "HEAD" {
+        bytes.extend_from_slice(&body);
+    }
+
     let filename = output::write_response(
         transfer,
         &url,
         &reqwest::header::HeaderMap::new(),
         &expanded.variables,
-        &body,
+        &bytes,
         false,
     )?;
     metrics.filename_effective = filename.map(|path| path.display().to_string());
