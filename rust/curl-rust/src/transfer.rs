@@ -2048,6 +2048,7 @@ async fn run_tftp_exchange(
         (Some(bytes), Some(path)) if path != "-" => bytes.len() as u64,
         _ => 0,
     };
+    let request_timeout = tftp_request_timeout_secs(transfer);
     let request = if upload.is_some() {
         tftp_wrq_packet(
             &filename,
@@ -2055,9 +2056,16 @@ async fn run_tftp_exchange(
             requested_blksize,
             transfer.tftp_no_options,
             upload_tsize,
+            request_timeout,
         )
     } else {
-        tftp_rrq_packet(&filename, mode, requested_blksize, transfer.tftp_no_options)
+        tftp_rrq_packet(
+            &filename,
+            mode,
+            requested_blksize,
+            transfer.tftp_no_options,
+            request_timeout,
+        )
     };
 
     let bind_addr = if url.has_host()
@@ -5569,8 +5577,14 @@ fn mqtt_topic_from_url(url: &Url) -> Result<Vec<u8>> {
     Ok(topic)
 }
 
-fn tftp_rrq_packet(filename: &[u8], mode: &str, blksize: u16, no_options: bool) -> Vec<u8> {
-    tftp_request_packet(1, filename, mode, blksize, no_options, 0)
+fn tftp_rrq_packet(
+    filename: &[u8],
+    mode: &str,
+    blksize: u16,
+    no_options: bool,
+    timeout_secs: u64,
+) -> Vec<u8> {
+    tftp_request_packet(1, filename, mode, blksize, no_options, 0, timeout_secs)
 }
 
 fn tftp_wrq_packet(
@@ -5579,8 +5593,17 @@ fn tftp_wrq_packet(
     blksize: u16,
     no_options: bool,
     upload_size: u64,
+    timeout_secs: u64,
 ) -> Vec<u8> {
-    tftp_request_packet(2, filename, mode, blksize, no_options, upload_size)
+    tftp_request_packet(
+        2,
+        filename,
+        mode,
+        blksize,
+        no_options,
+        upload_size,
+        timeout_secs,
+    )
 }
 
 fn tftp_request_packet(
@@ -5590,6 +5613,7 @@ fn tftp_request_packet(
     blksize: u16,
     no_options: bool,
     transfer_size: u64,
+    timeout_secs: u64,
 ) -> Vec<u8> {
     let mut packet = Vec::new();
     packet.extend_from_slice(&opcode.to_be_bytes());
@@ -5605,9 +5629,29 @@ fn tftp_request_packet(
         packet.extend_from_slice(blksize.to_string().as_bytes());
         packet.push(0);
         packet.extend_from_slice(b"timeout\0");
-        packet.extend_from_slice(b"5\0");
+        packet.extend_from_slice(timeout_secs.to_string().as_bytes());
+        packet.push(0);
     }
     packet
+}
+
+fn tftp_request_timeout_secs(transfer: &TransferConfig) -> u64 {
+    let deadline = match (transfer.connect_timeout, transfer.max_time) {
+        (Some(connect), Some(total)) => Some(connect.min(total)),
+        (Some(connect), None) => Some(connect),
+        (None, Some(total)) => Some(total),
+        (None, None) => None,
+    };
+    let timeout = deadline
+        .map(duration_to_c_rounded_secs)
+        .filter(|seconds| *seconds > 0)
+        .unwrap_or(15);
+    let retry_max = (timeout / 5).clamp(3, 50);
+    (timeout / retry_max).max(1)
+}
+
+fn duration_to_c_rounded_secs(duration: Duration) -> u64 {
+    ((duration.as_millis() + 500) / 1000).min(u64::MAX as u128) as u64
 }
 
 fn tftp_next_data_packet(

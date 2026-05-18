@@ -3453,6 +3453,37 @@ fn tftp_upload_file_sends_wrq_and_data() {
 }
 
 #[test]
+fn tftp_upload_timeout_option_uses_connect_deadline() {
+    let (url, rx) = spawn_tftp_upload_server(tftp_ack(0), 512);
+    let url = url.replace("/upload.bin", "//");
+    let temp = tempdir().unwrap();
+    let upload = temp.path().join("test285.txt");
+    let body = b"a chunk of\ndata\nsent\n to server\n";
+    std::fs::write(&upload, body).unwrap();
+
+    let mut command = Command::cargo_bin("curl").unwrap();
+    command.args([
+        "-q",
+        "-sS",
+        "-T",
+        upload.to_str().unwrap(),
+        &url,
+        "--connect-timeout",
+        "549",
+        "--max-time",
+        "599",
+    ]);
+    command.assert().success().stdout("");
+
+    let record = rx.recv().unwrap();
+    let mut expected = b"\x00\x02/test285.txt\x00octet\x00tsize\x00".to_vec();
+    expected.extend_from_slice(body.len().to_string().as_bytes());
+    expected.extend_from_slice(b"\x00blksize\x00512\x00timeout\x0010\x00");
+    assert_eq!(record.request, expected);
+    assert_eq!(record.data_blocks, [(1, body.to_vec())]);
+}
+
+#[test]
 fn tftp_upload_oack_exact_block_sends_final_empty_block() {
     let body = b"12345678";
     let (url, rx) = spawn_tftp_upload_server(tftp_oack(&[("blksize", "8")]), 8);
