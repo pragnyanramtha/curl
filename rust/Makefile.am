@@ -12,10 +12,13 @@ EXTRA_DIST =                                      \
   CMakeLists.txt                                 \
   curl-rust/Cargo.toml                           \
   curl-rust/src/cli.rs                           \
+  curl-rust/src/cookie.rs                        \
   curl-rust/src/data.rs                          \
   curl-rust/src/error.rs                         \
   curl-rust/src/glob.rs                          \
+  curl-rust/src/ipfs.rs                          \
   curl-rust/src/lib.rs                           \
+  curl-rust/src/libcurl.rs                       \
   curl-rust/src/main.rs                          \
   curl-rust/src/output.rs                        \
   curl-rust/src/transfer.rs                      \
