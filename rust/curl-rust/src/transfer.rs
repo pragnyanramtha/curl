@@ -19,7 +19,7 @@ use crate::cli::{Config, ContinueAt, HttpVersionPreference, TransferConfig};
 use crate::cookie::CookieJar;
 use crate::data::{self, PreparedBody};
 use crate::error::{CurlError, Result, ResultExt};
-use crate::{glob, output, writeout};
+use crate::{glob, ipfs, output, writeout};
 
 const TELNET_IAC: u8 = 255;
 const TELNET_DONT: u8 = 254;
@@ -241,6 +241,21 @@ async fn run_expanded_url(
     let method = effective_method(transfer)?;
     let mut metrics = writeout::Metrics::empty(&expanded.url, method.as_str());
     let started = Instant::now();
+    let expanded = match ipfs::maybe_rewrite_url(&expanded.url, transfer.ipfs_gateway.as_deref()) {
+        Ok(Some(url)) => glob::ExpandedUrl {
+            url,
+            variables: expanded.variables,
+        },
+        Ok(None) => expanded,
+        Err(error) => {
+            metrics.time_total = started.elapsed();
+            metrics.exit_code = error.exit_code();
+            metrics.errormsg = error.to_string();
+            report_error(transfer, &error);
+            write_writeout(transfer, &metrics)?;
+            return Ok(metrics.exit_code);
+        }
+    };
 
     let result = if expanded.url.starts_with("file://") {
         run_file_transfer(transfer, &expanded, method.as_str(), &mut metrics).await

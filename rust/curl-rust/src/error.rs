@@ -14,6 +14,10 @@ pub enum CurlError {
     Io(#[from] io::Error),
     #[error("transfer failed: {0}")]
     Transfer(String),
+    #[error("IPFS automatic gateway detection failed")]
+    IpfsGatewayDetection,
+    #[error("{0}")]
+    BadFunctionArgument(String),
     #[error("Maximum ({max}) redirects followed")]
     TooManyRedirects { max: usize },
     #[error("HTTP response code said error: {status}")]
@@ -32,6 +36,8 @@ impl CurlError {
             Self::HttpStatus { .. } => 22,
             Self::Io(_) => 23,
             Self::Timeout => 28,
+            Self::IpfsGatewayDetection => 37,
+            Self::BadFunctionArgument(_) => 43,
         }
     }
 }

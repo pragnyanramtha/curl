@@ -10,6 +10,8 @@ use tempfile::tempdir;
 use url::Url;
 
 const DICT_GREETING: &[u8] = b"220 dictserver <xnooptions> <msgid@msgid>\n";
+const IPFS_RESPONSE: &[u8] = b"HTTP/1.1 200 OK\r\nContent-Length: 21\r\n\r\nHello curl from IPFS\n";
+const IPFS_CID: &str = "bafybeidecnvkrygux6uoukouzps5ofkeevoqland7kopseiod6pzqvjg7u";
 const TELNET_IAC: u8 = 255;
 const TELNET_DONT: u8 = 254;
 const TELNET_DO: u8 = 253;
@@ -41,6 +43,16 @@ struct RequestRecord {
 
 fn spawn_server(response: &'static [u8]) -> (String, Receiver<RequestRecord>) {
     spawn_sequence_server(vec![response])
+}
+
+fn gateway_origin(url: &str) -> String {
+    let url = Url::parse(url).unwrap();
+    let host = url.host_str().unwrap();
+    let port = url
+        .port()
+        .map(|port| format!(":{port}"))
+        .unwrap_or_default();
+    format!("{}://{host}{port}", url.scheme())
 }
 
 fn spawn_sequence_server(responses: Vec<&'static [u8]>) -> (String, Receiver<RequestRecord>) {
@@ -781,6 +793,187 @@ fn version_lists_telnet_protocol() {
 }
 
 #[test]
+fn ipfs_gateway_rewrites_to_http_path() {
+    let (url, rx) = spawn_server(IPFS_RESPONSE);
+    let gateway = gateway_origin(&url);
+
+    let mut command = Command::cargo_bin("curl").unwrap();
+    command.args([
+        "-q",
+        "-sS",
+        "--ipfs-gateway",
+        &gateway,
+        &format!("ipfs://{IPFS_CID}"),
+    ]);
+    command.assert().success().stdout("Hello curl from IPFS\n");
+
+    let request = rx.recv().unwrap();
+    assert_eq!(request.start_line, format!("GET /ipfs/{IPFS_CID} HTTP/1.1"));
+    assert_eq!(
+        header(&request, "host"),
+        Some(gateway.trim_start_matches("http://"))
+    );
+}
+
+#[test]
+fn ipfs_path_and_query_with_gateway_path() {
+    let (url, rx) = spawn_server(IPFS_RESPONSE);
+    let gateway = format!("{}/some/path", gateway_origin(&url));
+
+    let mut command = Command::cargo_bin("curl").unwrap();
+    command.args([
+        "-q",
+        "-sS",
+        "--ipfs-gateway",
+        &gateway,
+        &format!("ipfs://{IPFS_CID}/a/b?foo=bar&aaa=bbb"),
+    ]);
+    command.assert().success().stdout("Hello curl from IPFS\n");
+
+    assert_eq!(
+        rx.recv().unwrap().start_line,
+        format!("GET /some/path/ipfs/{IPFS_CID}/a/b?foo=bar&aaa=bbb HTTP/1.1")
+    );
+}
+
+#[test]
+fn ipns_path_and_query_with_gateway_path() {
+    let (url, rx) = spawn_server(IPFS_RESPONSE);
+    let gateway = format!("{}/some/path", gateway_origin(&url));
+
+    let mut command = Command::cargo_bin("curl").unwrap();
+    command.args([
+        "-q",
+        "-sS",
+        "--ipfs-gateway",
+        &gateway,
+        "ipns://fancy.tld/a/b?foo=bar&aaa=bbb",
+    ]);
+    command.assert().success().stdout("Hello curl from IPFS\n");
+
+    assert_eq!(
+        rx.recv().unwrap().start_line,
+        "GET /some/path/ipns/fancy.tld/a/b?foo=bar&aaa=bbb HTTP/1.1"
+    );
+}
+
+#[test]
+fn ipfs_gateway_env_overrides_gateway_file() {
+    let temp = tempdir().unwrap();
+    let file_dir = temp.path().join(".ipfs");
+    std::fs::create_dir(&file_dir).unwrap();
+    std::fs::write(file_dir.join("gateway"), "http://127.0.0.1:1\n").unwrap();
+    let (url, rx) = spawn_server(IPFS_RESPONSE);
+    let gateway = gateway_origin(&url);
+
+    let mut command = Command::cargo_bin("curl").unwrap();
+    command
+        .env("IPFS_GATEWAY", &gateway)
+        .env("HOME", temp.path())
+        .args(["-q", "-sS", &format!("ipfs://{IPFS_CID}")]);
+    command.assert().success().stdout("Hello curl from IPFS\n");
+
+    assert_eq!(
+        rx.recv().unwrap().start_line,
+        format!("GET /ipfs/{IPFS_CID} HTTP/1.1")
+    );
+}
+
+#[test]
+fn ipfs_gateway_file_discovery_uses_first_line() {
+    let temp = tempdir().unwrap();
+    let ipfs_dir = temp.path().join(".ipfs");
+    std::fs::create_dir(&ipfs_dir).unwrap();
+    let (url, rx) = spawn_server(IPFS_RESPONSE);
+    let gateway = gateway_origin(&url);
+    std::fs::write(ipfs_dir.join("gateway"), format!("{gateway}\nignored\n")).unwrap();
+
+    let mut command = Command::cargo_bin("curl").unwrap();
+    command
+        .env_remove("IPFS_GATEWAY")
+        .env("HOME", temp.path())
+        .args(["-q", "-sS", &format!("ipfs://{IPFS_CID}")]);
+    command.assert().success().stdout("Hello curl from IPFS\n");
+
+    assert_eq!(
+        rx.recv().unwrap().start_line,
+        format!("GET /ipfs/{IPFS_CID} HTTP/1.1")
+    );
+}
+
+#[test]
+fn ipfs_path_env_discovery_accepts_no_trailing_slash() {
+    let temp = tempdir().unwrap();
+    let ipfs_dir = temp.path().join("ipfs-data");
+    std::fs::create_dir(&ipfs_dir).unwrap();
+    let (url, rx) = spawn_server(IPFS_RESPONSE);
+    let gateway = gateway_origin(&url);
+    std::fs::write(ipfs_dir.join("gateway"), format!("{gateway}\n")).unwrap();
+
+    let mut command = Command::cargo_bin("curl").unwrap();
+    command
+        .env_remove("IPFS_GATEWAY")
+        .env("IPFS_PATH", &ipfs_dir)
+        .args(["-q", "-sS", &format!("ipfs://{IPFS_CID}")]);
+    command.assert().success().stdout("Hello curl from IPFS\n");
+
+    assert_eq!(
+        rx.recv().unwrap().start_line,
+        format!("GET /ipfs/{IPFS_CID} HTTP/1.1")
+    );
+}
+
+#[test]
+fn ipfs_gateway_query_is_malformed_exit_3() {
+    let mut command = Command::cargo_bin("curl").unwrap();
+    command.args([
+        "-q",
+        "-sS",
+        "--ipfs-gateway",
+        "http://127.0.0.1:1/some/path?biz=baz",
+        "ipns://fancy.tld/a/b?foo=bar&aaa=bbb",
+    ]);
+    command.assert().failure().code(3).stdout("");
+}
+
+#[test]
+fn ipfs_auto_gateway_missing_exits_37() {
+    let temp = tempdir().unwrap();
+
+    let mut command = Command::cargo_bin("curl").unwrap();
+    command
+        .env_remove("IPFS_GATEWAY")
+        .env_remove("IPFS_PATH")
+        .env("HOME", temp.path())
+        .args(["-q", "-sS", &format!("ipfs://{IPFS_CID}")]);
+    command.assert().failure().code(37).stdout("");
+}
+
+#[test]
+fn ipfs_malformed_explicit_gateway_exits_43() {
+    let mut command = Command::cargo_bin("curl").unwrap();
+    command.args([
+        "-q",
+        "-sS",
+        "--ipfs-gateway",
+        "http://",
+        &format!("ipfs://{IPFS_CID}"),
+    ]);
+    command.assert().failure().code(43).stdout("");
+}
+
+#[test]
+fn version_lists_ipfs_and_ipns_protocols() {
+    let mut command = Command::cargo_bin("curl").unwrap();
+    let output = command.args(["-q", "-V"]).output().unwrap();
+    let stdout = String::from_utf8(output.stdout).unwrap();
+
+    assert!(output.status.success());
+    assert!(stdout.contains("IPFS"));
+    assert!(stdout.contains("IPNS"));
+}
+
+#[test]
 fn downloads_gopher_selector() {
     let (url, rx) = spawn_gopher_server(b"iMenu results\t\terror.host\t1\r\n.\r\n");
     let url = url.replace("/1/resource", "/1/selector/SELECTOR/1201");
@@ -1341,6 +1534,33 @@ fn libcurl_writes_source_file_for_supported_options() {
     )));
     assert!(text.contains("CURLOPT_COOKIESESSION, 1"));
     assert!(text.contains("curl_easy_perform(curl);"));
+}
+
+#[test]
+fn libcurl_rewrites_ipfs_url_to_gateway_url() {
+    let (url, rx) = spawn_server(IPFS_RESPONSE);
+    let gateway = gateway_origin(&url);
+    let temp = tempdir().unwrap();
+    let source = temp.path().join("client.c");
+
+    let mut command = Command::cargo_bin("curl").unwrap();
+    command.args([
+        "-q",
+        "-sS",
+        "--libcurl",
+        source.to_str().unwrap(),
+        "--ipfs-gateway",
+        &gateway,
+        &format!("ipfs://{IPFS_CID}"),
+    ]);
+    command.assert().success().stdout("Hello curl from IPFS\n");
+
+    assert_eq!(
+        rx.recv().unwrap().start_line,
+        format!("GET /ipfs/{IPFS_CID} HTTP/1.1")
+    );
+    let text = std::fs::read_to_string(source).unwrap();
+    assert!(text.contains(&format!("CURLOPT_URL, \"{gateway}/ipfs/{IPFS_CID}\"")));
 }
 
 #[test]

@@ -7,6 +7,7 @@ pub mod transfer;
 pub mod writeout;
 
 mod cookie;
+mod ipfs;
 mod libcurl;
 
 pub use cli::{Config, TransferConfig, parse_args};

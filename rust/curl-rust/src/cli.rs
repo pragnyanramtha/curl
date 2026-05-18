@@ -35,6 +35,7 @@ pub struct TransferConfig {
     pub forms: Vec<FormSpec>,
     pub upload_file: Option<String>,
     pub telnet_options: Vec<String>,
+    pub ipfs_gateway: Option<String>,
     pub output: Option<String>,
     pub output_dir: Option<PathBuf>,
     pub remote_name: bool,
@@ -123,6 +124,7 @@ impl Default for TransferConfig {
             forms: Vec::new(),
             upload_file: None,
             telnet_options: Vec::new(),
+            ipfs_gateway: None,
             output: None,
             output_dir: None,
             remote_name: false,
@@ -382,6 +384,10 @@ impl Parser {
             "telnet-option" => {
                 let value = self.value_for(name, inline_value)?;
                 self.current().telnet_options.push(value);
+            }
+            "ipfs-gateway" => {
+                let value = self.value_for(name, inline_value)?;
+                self.current().ipfs_gateway = Some(parse_nonempty_string(name, value)?);
             }
             "output" => {
                 let value = self.value_for(name, inline_value)?;
@@ -782,6 +788,7 @@ impl TransferConfig {
             || !self.forms.is_empty()
             || self.upload_file.is_some()
             || !self.telnet_options.is_empty()
+            || self.ipfs_gateway.is_some()
             || self.output.is_some()
             || self.output_dir.is_some()
             || self.remote_name
@@ -865,6 +872,16 @@ fn parse_nonempty_path(name: &str, value: &str) -> Result<PathBuf> {
     }
 }
 
+fn parse_nonempty_string(name: &str, value: String) -> Result<String> {
+    if value.is_empty() {
+        Err(CurlError::Usage(format!(
+            "option --{name} requires a non-empty value"
+        )))
+    } else {
+        Ok(value)
+    }
+}
+
 fn append_cookie_header(cookie: &mut Option<String>, value: String) {
     if let Some(existing) = cookie {
         if !existing.is_empty() && !value.is_empty() {
@@ -909,6 +926,7 @@ pub fn print_help() {
            -F, --form <name=content>   Specify multipart form data\n\
            -T, --upload-file <file>    Transfer local file to remote URL\n\
            -t, --telnet-option <opt>   Set telnet option\n\
+               --ipfs-gateway <URL>    Gateway for IPFS/IPNS URLs\n\
                --url-query <data>      Add URL query data\n\
                --json <data>           JSON request body\n\
            -e, --referer <url>         Send Referer header\n\
@@ -946,7 +964,7 @@ pub fn print_help() {
 
 pub fn print_version() {
     println!(
-        "curl-rust {} (Rust rewrite) DICT HTTP HTTPS FILE GOPHER TELNET",
+        "curl-rust {} (Rust rewrite) DICT HTTP HTTPS FILE GOPHER IPFS IPNS TELNET",
         env!("CARGO_PKG_VERSION")
     );
 }
@@ -1134,6 +1152,31 @@ mod tests {
         assert_eq!(transfer.upload_file.as_deref(), Some("input.txt"));
         assert_eq!(transfer.telnet_options, ["TTYPE=vt100", "NEW_ENV=USER,me"]);
         assert_eq!(transfer.urls, ["telnet://example.com"]);
+    }
+
+    #[test]
+    fn parses_ipfs_gateway() {
+        let config = parse_args([
+            "-q",
+            "--ipfs-gateway",
+            "http://localhost:8080",
+            "ipfs://example",
+        ])
+        .unwrap();
+
+        let transfer = &config.transfers[0];
+        assert_eq!(
+            transfer.ipfs_gateway.as_deref(),
+            Some("http://localhost:8080")
+        );
+        assert_eq!(transfer.urls, ["ipfs://example"]);
+    }
+
+    #[test]
+    fn rejects_empty_ipfs_gateway() {
+        let error = parse_args(["-q", "--ipfs-gateway=", "ipfs://example"]).unwrap_err();
+
+        assert!(error.to_string().contains("non-empty"));
     }
 
     #[test]

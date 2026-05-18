@@ -7,7 +7,7 @@ use url::Url;
 use crate::cli::{Config, ContinueAt, HttpVersionPreference, TransferConfig};
 use crate::data::{self, PreparedBody};
 use crate::error::{CurlError, Result};
-use crate::glob;
+use crate::{glob, ipfs};
 
 pub fn write_source(path: &Path, config: &Config) -> Result<()> {
     let source = render_source(config)?;
@@ -288,8 +288,11 @@ fn effective_urls(
     let mut urls = Vec::new();
     for raw in &transfer.urls {
         for expanded in glob::expand_url(raw, transfer.globoff)? {
+            let effective_url =
+                ipfs::maybe_rewrite_url(&expanded.url, transfer.ipfs_gateway.as_deref())?
+                    .unwrap_or(expanded.url);
             let mut url =
-                Url::parse(&expanded.url).map_err(|error| CurlError::Url(error.to_string()))?;
+                Url::parse(&effective_url).map_err(|error| CurlError::Url(error.to_string()))?;
             if let Some(query) = query.filter(|query| !query.is_empty()) {
                 append_query_body(&mut url, &query.bytes);
             }
