@@ -238,7 +238,7 @@ async fn run_expanded_url(
     client: &Client,
     expanded: glob::ExpandedUrl,
 ) -> Result<i32> {
-    let method = effective_method(transfer)?;
+    let mut method = effective_method(transfer)?;
     let mut metrics = writeout::Metrics::empty(&expanded.url, method.as_str());
     let started = Instant::now();
     let expanded = match ipfs::maybe_rewrite_url(&expanded.url, transfer.ipfs_gateway.as_deref()) {
@@ -256,6 +256,14 @@ async fn run_expanded_url(
             return Ok(metrics.exit_code);
         }
     };
+    if transfer.upload_file.is_some()
+        && transfer.method.is_none()
+        && !transfer.head
+        && is_http_url(&expanded.url)
+    {
+        method = Method::PUT;
+        metrics.method = method.as_str().to_string();
+    }
 
     let result = if expanded.url.starts_with("file://") {
         run_file_transfer(transfer, &expanded, method.as_str(), &mut metrics).await
@@ -823,13 +831,27 @@ async fn run_http_transfer(
     method: Method,
     metrics: &mut writeout::Metrics,
 ) -> Result<HttpAttempt> {
-    reject_upload_file_for_scheme(transfer, "HTTP URLs")?;
     let prepared_query = data::prepare_body(&transfer.url_query)?;
     let prepared_body = data::prepare_body(&transfer.data)?;
+    let upload_body = transfer
+        .upload_file
+        .as_deref()
+        .map(data::read_upload_body)
+        .transpose()?;
     let has_multipart = !transfer.forms.is_empty();
     if prepared_body.is_some() && has_multipart {
         return Err(CurlError::Usage(
             "--form cannot be combined with --data or --json".to_string(),
+        ));
+    }
+    if upload_body.is_some() && prepared_body.is_some() {
+        return Err(CurlError::Usage(
+            "--upload-file cannot be combined with --data or --json".to_string(),
+        ));
+    }
+    if upload_body.is_some() && has_multipart {
+        return Err(CurlError::Usage(
+            "--upload-file cannot be combined with --form".to_string(),
         ));
     }
     if transfer.get && has_multipart {
@@ -837,7 +859,13 @@ async fn run_http_transfer(
             "--get cannot be combined with --form".to_string(),
         ));
     }
+    if transfer.get && upload_body.is_some() {
+        return Err(CurlError::Usage(
+            "--get cannot be combined with --upload-file".to_string(),
+        ));
+    }
     let mut url = Url::parse(&expanded.url).map_err(|error| CurlError::Url(error.to_string()))?;
+    data::append_upload_filename_to_url(&mut url, transfer.upload_file.as_deref());
     output::validate_output_target(transfer, &url)?;
     let resume_from = resume_offset(
         transfer,
@@ -879,6 +907,10 @@ async fn run_http_transfer(
 
         if let Some(form) = multipart {
             request = request.multipart(form);
+        } else if let Some(body) = upload_body.as_ref() {
+            request = request
+                .header(CONTENT_LENGTH, body.len())
+                .body(body.clone());
         } else if !transfer.get
             && let Some(body) = prepared_body.as_ref()
         {
@@ -1168,6 +1200,10 @@ fn effective_method(transfer: &TransferConfig) -> Result<Method> {
     }
 
     Ok(Method::GET)
+}
+
+fn is_http_url(url: &str) -> bool {
+    url.starts_with("http://") || url.starts_with("https://")
 }
 
 fn apply_version(

@@ -1,10 +1,23 @@
 use std::io::{self, Read};
+use std::path::Path;
 
-use percent_encoding::percent_decode_str;
+use percent_encoding::{AsciiSet, CONTROLS, percent_decode_str, utf8_percent_encode};
 use reqwest::multipart::{Form, Part};
-use url::form_urlencoded;
+use url::{Url, form_urlencoded};
 
 use crate::error::{CurlError, Result};
+
+const PATH_SEGMENT_ENCODE_SET: &AsciiSet = &CONTROLS
+    .add(b' ')
+    .add(b'"')
+    .add(b'#')
+    .add(b'%')
+    .add(b'<')
+    .add(b'>')
+    .add(b'?')
+    .add(b'`')
+    .add(b'{')
+    .add(b'}');
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DataKind {
@@ -87,6 +100,35 @@ pub fn prepare_multipart(specs: &[FormSpec]) -> Result<Option<Form>> {
         form = add_form_part(form, spec)?;
     }
     Ok(Some(form))
+}
+
+pub fn read_upload_body(path: &str) -> Result<Vec<u8>> {
+    if path == "-" {
+        read_data_argument(path)
+    } else {
+        std::fs::read(path).map_err(|_| CurlError::ReadError(format!("cannot open '{path}'")))
+    }
+}
+
+pub fn append_upload_filename_to_url(url: &mut Url, upload_path: Option<&str>) {
+    let Some(upload_path) = upload_path else {
+        return;
+    };
+    if upload_path == "-" || url.query().is_some() || !url.path().ends_with('/') {
+        return;
+    }
+
+    let Some(filename) = Path::new(upload_path)
+        .file_name()
+        .and_then(|filename| filename.to_str())
+        .filter(|filename| !filename.is_empty())
+    else {
+        return;
+    };
+
+    let mut path = url.path().to_string();
+    path.push_str(&utf8_percent_encode(filename, PATH_SEGMENT_ENCODE_SET).to_string());
+    url.set_path(&path);
 }
 
 fn load_part(spec: &DataSpec) -> Result<Vec<u8>> {

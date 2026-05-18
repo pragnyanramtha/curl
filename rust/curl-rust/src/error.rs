@@ -12,6 +12,8 @@ pub enum CurlError {
     Url(String),
     #[error("failed to read or write local data: {0}")]
     Io(#[from] io::Error),
+    #[error("{0}")]
+    ReadError(String),
     #[error("transfer failed: {0}")]
     Transfer(String),
     #[error("IPFS automatic gateway detection failed")]
@@ -35,6 +37,7 @@ impl CurlError {
             Self::TooManyRedirects { .. } => 47,
             Self::HttpStatus { .. } => 22,
             Self::Io(_) => 23,
+            Self::ReadError(_) => 26,
             Self::Timeout => 28,
             Self::IpfsGatewayDetection => 37,
             Self::BadFunctionArgument(_) => 43,

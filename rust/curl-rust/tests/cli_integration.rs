@@ -767,7 +767,97 @@ fn telnet_options_fail_explicitly_until_negotiation_options_are_supported() {
 }
 
 #[test]
-fn upload_file_for_http_fails_explicitly_until_http_upload_is_supported() {
+fn http_upload_file_sends_put_body() {
+    let temp = tempdir().unwrap();
+    let upload = temp.path().join("upload.txt");
+    std::fs::write(&upload, "body").unwrap();
+    let (url, rx) = spawn_server(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok");
+
+    let mut command = Command::cargo_bin("curl").unwrap();
+    command.args(["-q", "-sS", "-T", upload.to_str().unwrap(), &url]);
+    command.assert().success().stdout("ok");
+
+    let request = rx.recv().unwrap();
+    assert!(request.start_line.starts_with("PUT /resource HTTP/1.1"));
+    assert_eq!(header(&request, "content-length"), Some("4"));
+    assert_eq!(request.body, b"body");
+}
+
+#[test]
+fn http_upload_dash_reads_stdin() {
+    let (url, rx) = spawn_server(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok");
+
+    let mut command = Command::cargo_bin("curl").unwrap();
+    command.args(["-q", "-sS", "-T", "-", &url]);
+    command.write_stdin("from stdin");
+    command.assert().success().stdout("ok");
+
+    let request = rx.recv().unwrap();
+    assert!(request.start_line.starts_with("PUT /resource HTTP/1.1"));
+    assert_eq!(header(&request, "content-length"), Some("10"));
+    assert_eq!(request.body, b"from stdin");
+}
+
+#[test]
+fn http_upload_to_directory_url_appends_local_filename() {
+    let temp = tempdir().unwrap();
+    let upload = temp.path().join("upload.txt");
+    std::fs::write(&upload, "body").unwrap();
+    let (url, rx) = spawn_server(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok");
+    let base_url = format!("{}/", gateway_origin(&url));
+
+    let mut command = Command::cargo_bin("curl").unwrap();
+    command.args(["-q", "-sS", "-T", upload.to_str().unwrap(), &base_url]);
+    command.assert().success().stdout("ok");
+
+    let request = rx.recv().unwrap();
+    assert!(request.start_line.starts_with("PUT /upload.txt HTTP/1.1"));
+    assert_eq!(request.body, b"body");
+}
+
+#[test]
+fn http_upload_to_query_url_does_not_append_local_filename() {
+    let temp = tempdir().unwrap();
+    let upload = temp.path().join("upload.txt");
+    std::fs::write(&upload, "body").unwrap();
+    let (url, rx) = spawn_server(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok");
+    let query_url = format!("{}/?name=server", gateway_origin(&url));
+
+    let mut command = Command::cargo_bin("curl").unwrap();
+    command.args(["-q", "-sS", "-T", upload.to_str().unwrap(), &query_url]);
+    command.assert().success().stdout("ok");
+
+    let request = rx.recv().unwrap();
+    assert!(request.start_line.starts_with("PUT /?name=server HTTP/1.1"));
+    assert_eq!(request.body, b"body");
+}
+
+#[test]
+fn http_upload_respects_custom_request_method() {
+    let temp = tempdir().unwrap();
+    let upload = temp.path().join("upload.txt");
+    std::fs::write(&upload, "body").unwrap();
+    let (url, rx) = spawn_server(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok");
+
+    let mut command = Command::cargo_bin("curl").unwrap();
+    command.args([
+        "-q",
+        "-sS",
+        "-X",
+        "PATCH",
+        "-T",
+        upload.to_str().unwrap(),
+        &url,
+    ]);
+    command.assert().success().stdout("ok");
+
+    let request = rx.recv().unwrap();
+    assert!(request.start_line.starts_with("PATCH /resource HTTP/1.1"));
+    assert_eq!(request.body, b"body");
+}
+
+#[test]
+fn http_upload_rejects_data_body_combination() {
     let temp = tempdir().unwrap();
     let upload = temp.path().join("upload.txt");
     std::fs::write(&upload, "body").unwrap();
@@ -778,9 +868,27 @@ fn upload_file_for_http_fails_explicitly_until_http_upload_is_supported() {
         "-sS",
         "-T",
         upload.to_str().unwrap(),
+        "-d",
+        "a=b",
         "http://example.invalid/",
     ]);
     command.assert().failure().code(2).stdout("");
+}
+
+#[test]
+fn http_upload_missing_file_exits_read_error() {
+    let temp = tempdir().unwrap();
+    let missing = temp.path().join("missing.txt");
+
+    let mut command = Command::cargo_bin("curl").unwrap();
+    command.args([
+        "-q",
+        "-sS",
+        "-T",
+        missing.to_str().unwrap(),
+        "http://example.invalid/",
+    ]);
+    command.assert().failure().code(26).stdout("");
 }
 
 #[test]
@@ -1561,6 +1669,36 @@ fn libcurl_rewrites_ipfs_url_to_gateway_url() {
     );
     let text = std::fs::read_to_string(source).unwrap();
     assert!(text.contains(&format!("CURLOPT_URL, \"{gateway}/ipfs/{IPFS_CID}\"")));
+}
+
+#[test]
+fn libcurl_writes_http_upload_options() {
+    let temp = tempdir().unwrap();
+    let upload = temp.path().join("upload.txt");
+    let source = temp.path().join("upload-client.c");
+    std::fs::write(&upload, "body").unwrap();
+    let (url, rx) = spawn_server(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok");
+    let base_url = format!("{}/", gateway_origin(&url));
+
+    let mut command = Command::cargo_bin("curl").unwrap();
+    command.args([
+        "-q",
+        "-sS",
+        "--libcurl",
+        source.to_str().unwrap(),
+        "-T",
+        upload.to_str().unwrap(),
+        &base_url,
+    ]);
+    command.assert().success().stdout("ok");
+
+    let request = rx.recv().unwrap();
+    assert!(request.start_line.starts_with("PUT /upload.txt HTTP/1.1"));
+
+    let text = std::fs::read_to_string(source).unwrap();
+    assert!(text.contains(&format!("CURLOPT_URL, \"{base_url}upload.txt\"")));
+    assert!(text.contains("CURLOPT_UPLOAD, 1L"));
+    assert!(text.contains("CURLOPT_INFILESIZE_LARGE, (curl_off_t)4"));
 }
 
 #[test]

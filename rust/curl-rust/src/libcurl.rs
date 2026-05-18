@@ -157,6 +157,24 @@ fn write_request(out: &mut String, render: &RenderTransfer<'_>, url: &str) -> Re
             &format!("(curl_off_t){}", body.bytes.len()),
         );
     }
+    if let Some(upload_file) = &transfer.upload_file {
+        emit_long_setopt(out, "CURLOPT_UPLOAD", 1);
+        if upload_file != "-"
+            && let Ok(metadata) = std::fs::metadata(upload_file)
+            && metadata.is_file()
+        {
+            emit_raw_setopt(
+                out,
+                "CURLOPT_INFILESIZE_LARGE",
+                &format!("(curl_off_t){}", metadata.len()),
+            );
+        }
+        writeln!(
+            out,
+            "  /* Upload source wiring is not yet represented by this Rust --libcurl slice. */"
+        )
+        .unwrap();
+    }
     if !transfer.forms.is_empty() {
         writeln!(
             out,
@@ -293,6 +311,7 @@ fn effective_urls(
                     .unwrap_or(expanded.url);
             let mut url =
                 Url::parse(&effective_url).map_err(|error| CurlError::Url(error.to_string()))?;
+            data::append_upload_filename_to_url(&mut url, transfer.upload_file.as_deref());
             if let Some(query) = query.filter(|query| !query.is_empty()) {
                 append_query_body(&mut url, &query.bytes);
             }
