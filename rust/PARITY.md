@@ -33,7 +33,7 @@ behavior, and test mapping is `verified` or explicitly accepted as out of scope.
 | IMAP/IMAPS | missing | none | protocol tests | |
 | LDAP/LDAPS | missing | none | protocol tests | |
 | MQTT/MQTTS | missing | none | protocol tests | |
-| POP3/POP3S | missing | none | protocol tests | |
+| POP3/POP3S | partial | `transfer.rs::run_pop3_transfer` | `pop3_retr_downloads_message_and_unstuffs_dot_lines`, `pop3_uses_url_userinfo_when_user_option_is_absent`, `pop3_empty_path_lists_messages`, `pop3_list_only_sends_list_for_message_id_without_body`, `pop3_command_error_returns_weird_server_reply`, `pop3_custom_top_outputs_multiline_body`, `pop3_head_custom_stat_suppresses_body_and_keeps_zero_http_code`, `pop3_rejects_decoded_control_path`, `pop3_login_failure_returns_login_denied`, `version_lists_pop3_protocol` | Plain `pop3://` TCP support only; sends CAPA, USER/PASS cleartext auth, LIST/RETR/default and custom `-X` commands, handles multiline terminators and dot-stuffing, keeps POP3 protocol replies out of headers and `%{http_code}`, supports URL userinfo, `--list-only`, `--max-filesize`, and exit codes 8/67 for command/login failures. `pop3s://`, STLS, SASL/APOP/OAuth, URL `;AUTH=`, proxying, connection reuse, exact command-reply diagnostics, and full corpus mapping remain incomplete |
 | RTSP | missing | none | protocol tests | |
 | SCP/SFTP | missing | none | protocol tests | |
 | SMB/SMBS | missing | none | protocol tests | |
@@ -52,6 +52,7 @@ companion data before this rewrite can be called complete.
 | `--config`, default `.curlrc`, `-q` | partial | `cli.rs::insert_config_file` | `tokenizes_curl_config_lines` | Limited tokenizer and recursion handling |
 | `--next` | partial | `TransferConfig` groups | `splits_transfer_groups_on_next` | Needs full option reset audit |
 | `--no-*` boolean negation | partial | `cli.rs::parse_no_long` | `no_prefixed_boolean_options_disable_previous_values` | Only supported booleans are recognized |
+| `--list-only` | partial | `TransferConfig::list_only` | `parses_list_only_option`, `pop3_list_only_sends_list_for_message_id_without_body`, `libcurl_writes_source_file_for_supported_options` | Implemented for POP3 message-specific LIST and emitted in `--libcurl`; FTP/SFTP/FILE behavior and full corpus mapping remain incomplete |
 | `--data`, `--data-binary`, `--data-raw`, `--data-urlencode` | partial | `TransferConfig::data` | unit body tests | Needs full corpus mapping |
 | `--json` | partial | `TransferConfig::data` | `sends_json_body_and_default_json_headers` | Basic defaults only |
 | `--url-query` | partial | `TransferConfig::url_query` | `sends_referer_range_and_url_query` | Basic encoding and `+` passthrough only |

@@ -28,6 +28,7 @@ pub struct TransferConfig {
     pub method: Option<String>,
     pub head: bool,
     pub get: bool,
+    pub list_only: bool,
     pub include_headers: bool,
     pub headers: Vec<String>,
     pub data: Vec<DataSpec>,
@@ -118,6 +119,7 @@ impl Default for TransferConfig {
             method: None,
             head: false,
             get: false,
+            list_only: false,
             include_headers: false,
             headers: Vec::new(),
             data: Vec::new(),
@@ -301,6 +303,7 @@ impl Parser {
             }
             "head" => self.current().head = true,
             "get" => self.current().get = true,
+            "list-only" => self.current().list_only = true,
             "include" => self.current().include_headers = true,
             "header" => {
                 let value = self.value_for(name, inline_value)?;
@@ -515,6 +518,7 @@ impl Parser {
         match name {
             "head" => self.current().head = false,
             "get" => self.current().get = false,
+            "list-only" => self.current().list_only = false,
             "include" => self.current().include_headers = false,
             "parallel" => self.config.parallel = false,
             "parallel-immediate" => self.config.parallel_immediate = false,
@@ -574,6 +578,7 @@ impl Parser {
                 }
                 'I' => self.current().head = true,
                 'G' => self.current().get = true,
+                'l' => self.current().list_only = true,
                 'i' => self.current().include_headers = true,
                 'H' => {
                     let value = self.short_value('H', rest)?;
@@ -805,6 +810,7 @@ impl TransferConfig {
             || self.method.is_some()
             || self.head
             || self.get
+            || self.list_only
             || self.include_headers
             || !self.headers.is_empty()
             || !self.data.is_empty()
@@ -1035,6 +1041,7 @@ pub fn print_help() {
            -C, --continue-at <offset>  Resume transfer at offset\n\
            -H, --header <header>       Pass custom header\n\
            -I, --head                  Show document information only\n\
+           -l, --list-only             List only mode\n\
            -L, --location              Follow redirects\n\
            -Z, --parallel              Perform transfers in parallel\n\
                --parallel-max <num>    Maximum parallel transfer count\n\
@@ -1066,7 +1073,7 @@ pub fn print_help() {
 
 pub fn print_version() {
     println!(
-        "curl-rust {} (Rust rewrite) DICT HTTP HTTPS FILE GOPHER IPFS IPNS TELNET",
+        "curl-rust {} (Rust rewrite) DICT HTTP HTTPS FILE GOPHER IPFS IPNS POP3 TELNET",
         env!("CARGO_PKG_VERSION")
     );
 }
@@ -1254,6 +1261,21 @@ mod tests {
         assert_eq!(transfer.upload_file.as_deref(), Some("input.txt"));
         assert_eq!(transfer.telnet_options, ["TTYPE=vt100", "NEW_ENV=USER,me"]);
         assert_eq!(transfer.urls, ["telnet://example.com"]);
+    }
+
+    #[test]
+    fn parses_list_only_option() {
+        let config = parse_args(["-q", "-l", "pop3://example.com/1"]).unwrap();
+        assert!(config.transfers[0].list_only);
+
+        let config = parse_args([
+            "-q",
+            "--list-only",
+            "--no-list-only",
+            "pop3://example.com/1",
+        ])
+        .unwrap();
+        assert!(!config.transfers[0].list_only);
     }
 
     #[test]

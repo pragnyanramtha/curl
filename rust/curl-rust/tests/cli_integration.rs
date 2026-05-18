@@ -101,6 +101,88 @@ fn spawn_dict_server(response: &'static [u8]) -> (String, Receiver<Vec<u8>>) {
     (format!("dict://{addr}/d:basic"), rx)
 }
 
+fn spawn_pop3_server(path: &str, command_response: &'static [u8]) -> (String, Receiver<Vec<u8>>) {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = listener.local_addr().unwrap();
+    let (tx, rx) = mpsc::channel();
+
+    thread::spawn(move || {
+        let (mut stream, _) = listener.accept().unwrap();
+        stream.write_all(b"+OK curl POP3 test server\r\n").unwrap();
+
+        let mut commands = Vec::new();
+        while let Some(line) = read_pop3_client_line(&mut stream) {
+            commands.extend_from_slice(&line);
+            let command = String::from_utf8_lossy(&line);
+            let command = command.trim_end_matches(['\r', '\n']);
+            let response = if command == "CAPA" {
+                b"+OK capabilities\r\nUSER\r\n.\r\n".as_slice()
+            } else if command.starts_with("USER ") || command.starts_with("PASS ") {
+                b"+OK\r\n".as_slice()
+            } else if command == "QUIT" {
+                let _ = stream.write_all(b"+OK bye\r\n");
+                break;
+            } else {
+                command_response
+            };
+            stream.write_all(response).unwrap();
+        }
+
+        tx.send(commands).unwrap();
+    });
+
+    (format!("pop3://{addr}{path}"), rx)
+}
+
+fn spawn_pop3_login_denied_server(path: &str) -> (String, Receiver<Vec<u8>>) {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = listener.local_addr().unwrap();
+    let (tx, rx) = mpsc::channel();
+
+    thread::spawn(move || {
+        let (mut stream, _) = listener.accept().unwrap();
+        stream.write_all(b"+OK curl POP3 test server\r\n").unwrap();
+        let mut commands = Vec::new();
+        while let Some(line) = read_pop3_client_line(&mut stream) {
+            commands.extend_from_slice(&line);
+            let command = String::from_utf8_lossy(&line);
+            let command = command.trim_end_matches(['\r', '\n']);
+            if command == "CAPA" {
+                stream
+                    .write_all(b"+OK capabilities\r\nUSER\r\n.\r\n")
+                    .unwrap();
+            } else if command.starts_with("USER ") {
+                stream.write_all(b"+OK\r\n").unwrap();
+            } else if command.starts_with("PASS ") {
+                stream.write_all(b"-ERR Login failure\r\n").unwrap();
+                break;
+            }
+        }
+
+        tx.send(commands).unwrap();
+    });
+
+    (format!("pop3://{addr}{path}"), rx)
+}
+
+fn read_pop3_client_line(stream: &mut impl Read) -> Option<Vec<u8>> {
+    let mut line = Vec::new();
+    let mut byte = [0; 1];
+    loop {
+        match stream.read(&mut byte) {
+            Ok(0) if line.is_empty() => return None,
+            Ok(0) => return Some(line),
+            Ok(_) => {
+                line.push(byte[0]);
+                if byte[0] == b'\n' {
+                    return Some(line);
+                }
+            }
+            Err(error) => panic!("failed to read POP3 client bytes: {error}"),
+        }
+    }
+}
+
 fn spawn_telnet_server(
     response: &'static [u8],
     greeting: &'static [u8],
@@ -880,6 +962,143 @@ fn version_lists_dict_protocol() {
 
     assert!(output.status.success());
     assert!(String::from_utf8(output.stdout).unwrap().contains("DICT"));
+}
+
+#[test]
+fn pop3_retr_downloads_message_and_unstuffs_dot_lines() {
+    let (url, rx) = spawn_pop3_server("/42", b"+OK message follows\r\nFrom: me\r\n..body\r\n.\r\n");
+
+    let mut command = Command::cargo_bin("curl").unwrap();
+    command.args(["-q", "-sS", "-u", "user:secret", &url]);
+    command.assert().success().stdout("From: me\r\n.body\r\n");
+
+    assert_eq!(
+        rx.recv().unwrap(),
+        b"CAPA\r\nUSER user\r\nPASS secret\r\nRETR 42\r\nQUIT\r\n"
+    );
+}
+
+#[test]
+fn pop3_uses_url_userinfo_when_user_option_is_absent() {
+    let (url, rx) = spawn_pop3_server("/42", b"+OK message follows\r\nhello\r\n.\r\n");
+    let url = url.replacen("pop3://", "pop3://alice:secret@", 1);
+
+    let mut command = Command::cargo_bin("curl").unwrap();
+    command.args(["-q", "-sS", &url]);
+    command.assert().success().stdout("hello\r\n");
+
+    assert_eq!(
+        rx.recv().unwrap(),
+        b"CAPA\r\nUSER alice\r\nPASS secret\r\nRETR 42\r\nQUIT\r\n"
+    );
+}
+
+#[test]
+fn pop3_empty_path_lists_messages() {
+    let (url, rx) = spawn_pop3_server("/", b"+OK scan listing follows\r\n1 100\r\n.\r\n");
+
+    let mut command = Command::cargo_bin("curl").unwrap();
+    command.args(["-q", "-sS", "-u", "user:secret", &url]);
+    command.assert().success().stdout("1 100\r\n");
+
+    assert_eq!(
+        rx.recv().unwrap(),
+        b"CAPA\r\nUSER user\r\nPASS secret\r\nLIST\r\nQUIT\r\n"
+    );
+}
+
+#[test]
+fn pop3_list_only_sends_list_for_message_id_without_body() {
+    let (url, rx) = spawn_pop3_server("/42", b"+OK 42 100\r\n");
+
+    let mut command = Command::cargo_bin("curl").unwrap();
+    command.args(["-q", "-sS", "-l", "-u", "user:secret", &url]);
+    command.assert().success().stdout("");
+
+    assert_eq!(
+        rx.recv().unwrap(),
+        b"CAPA\r\nUSER user\r\nPASS secret\r\nLIST 42\r\nQUIT\r\n"
+    );
+}
+
+#[test]
+fn pop3_command_error_returns_weird_server_reply() {
+    let (url, rx) = spawn_pop3_server("/42", b"-ERR no such message\r\n");
+
+    let mut command = Command::cargo_bin("curl").unwrap();
+    command.args(["-q", "-sS", "-l", "-u", "user:secret", &url]);
+    command.assert().failure().code(8).stdout("");
+
+    assert_eq!(
+        rx.recv().unwrap(),
+        b"CAPA\r\nUSER user\r\nPASS secret\r\nLIST 42\r\n"
+    );
+}
+
+#[test]
+fn pop3_custom_top_outputs_multiline_body() {
+    let (url, rx) = spawn_pop3_server("", b"+OK top follows\r\nSubject: hi\r\n\r\n.\r\n");
+
+    let mut command = Command::cargo_bin("curl").unwrap();
+    command.args(["-q", "-sS", "-u", "user:secret", "-X", "TOP 42 0", &url]);
+    command.assert().success().stdout("Subject: hi\r\n\r\n");
+
+    assert_eq!(
+        rx.recv().unwrap(),
+        b"CAPA\r\nUSER user\r\nPASS secret\r\nTOP 42 0\r\nQUIT\r\n"
+    );
+}
+
+#[test]
+fn pop3_head_custom_stat_suppresses_body_and_keeps_zero_http_code() {
+    let (url, rx) = spawn_pop3_server("", b"+OK 2 200\r\n");
+
+    let mut command = Command::cargo_bin("curl").unwrap();
+    command.args([
+        "-q",
+        "-sS",
+        "-I",
+        "-u",
+        "user:secret",
+        "-X",
+        "STAT",
+        "-w",
+        "%{http_code} %{size_download} %{header_json}",
+        &url,
+    ]);
+    command.assert().success().stdout("000 0 {}");
+
+    assert_eq!(
+        rx.recv().unwrap(),
+        b"CAPA\r\nUSER user\r\nPASS secret\r\nSTAT\r\nQUIT\r\n"
+    );
+}
+
+#[test]
+fn pop3_rejects_decoded_control_path() {
+    let mut command = Command::cargo_bin("curl").unwrap();
+    command.args(["-q", "-sS", "pop3://example.invalid/%0d%0a/42"]);
+    command.assert().failure().code(3).stdout("");
+}
+
+#[test]
+fn pop3_login_failure_returns_login_denied() {
+    let (url, rx) = spawn_pop3_login_denied_server("/42");
+
+    let mut command = Command::cargo_bin("curl").unwrap();
+    command.args(["-q", "-sS", "-u", "user:wrong", &url]);
+    command.assert().failure().code(67).stdout("");
+
+    assert_eq!(rx.recv().unwrap(), b"CAPA\r\nUSER user\r\nPASS wrong\r\n");
+}
+
+#[test]
+fn version_lists_pop3_protocol() {
+    let mut command = Command::cargo_bin("curl").unwrap();
+    let output = command.args(["-q", "-V"]).output().unwrap();
+
+    assert!(output.status.success());
+    assert!(String::from_utf8(output.stdout).unwrap().contains("POP3"));
 }
 
 #[test]
@@ -1819,6 +2038,7 @@ fn libcurl_writes_source_file_for_supported_options() {
         "PUT",
         "-H",
         "X-Test: yes",
+        "--list-only",
         "-d",
         "a=b",
         "-u",
@@ -1849,6 +2069,7 @@ fn libcurl_writes_source_file_for_supported_options() {
     assert!(text.contains(&format!("CURLOPT_URL, \"{url}\"")));
     assert!(text.contains("curl_slist_append(slist1, \"X-Test: yes\");"));
     assert!(text.contains("CURLOPT_CUSTOMREQUEST, \"PUT\""));
+    assert!(text.contains("CURLOPT_DIRLISTONLY, 1"));
     assert!(text.contains("CURLOPT_POSTFIELDS, \"a=b\""));
     assert!(text.contains("CURLOPT_POSTFIELDSIZE_LARGE, (curl_off_t)3"));
     assert!(text.contains("CURLOPT_USERPWD, \"alice:secret\""));

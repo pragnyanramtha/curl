@@ -16,6 +16,8 @@ pub enum CurlError {
     ReadError(String),
     #[error("transfer failed: {0}")]
     Transfer(String),
+    #[error("weird server reply")]
+    WeirdServerReply,
     #[error("IPFS automatic gateway detection failed")]
     IpfsGatewayDetection,
     #[error("{0}")]
@@ -26,6 +28,8 @@ pub enum CurlError {
     HttpStatus { status: u16 },
     #[error("Maximum file size exceeded")]
     FileSizeExceeded,
+    #[error("Login denied")]
+    LoginDenied,
     #[error("Operation timed out")]
     Timeout,
 }
@@ -36,9 +40,11 @@ impl CurlError {
             Self::Usage(_) | Self::Unsupported(_) => 2,
             Self::Url(_) => 3,
             Self::Transfer(_) => 7,
+            Self::WeirdServerReply => 8,
             Self::TooManyRedirects { .. } => 47,
             Self::HttpStatus { .. } => 22,
             Self::FileSizeExceeded => 63,
+            Self::LoginDenied => 67,
             Self::Io(_) => 23,
             Self::ReadError(_) => 26,
             Self::Timeout => 28,

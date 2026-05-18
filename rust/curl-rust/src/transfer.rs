@@ -238,8 +238,8 @@ async fn run_expanded_url(
     client: &Client,
     expanded: glob::ExpandedUrl,
 ) -> Result<i32> {
-    let mut method = effective_method(transfer)?;
-    let mut metrics = writeout::Metrics::empty(&expanded.url, method.as_str());
+    let mut method_label = effective_method_label(transfer);
+    let mut metrics = writeout::Metrics::empty(&expanded.url, &method_label);
     let started = Instant::now();
     let expanded = match ipfs::maybe_rewrite_url(&expanded.url, transfer.ipfs_gateway.as_deref()) {
         Ok(Some(url)) => glob::ExpandedUrl {
@@ -261,23 +261,33 @@ async fn run_expanded_url(
         && !transfer.head
         && is_http_url(&expanded.url)
     {
-        method = Method::PUT;
-        metrics.method = method.as_str().to_string();
+        method_label = Method::PUT.as_str().to_string();
+        metrics.method = method_label.clone();
     }
 
     let result = if expanded.url.starts_with("file://") {
-        run_file_transfer(transfer, &expanded, method.as_str(), &mut metrics).await
+        run_file_transfer(transfer, &expanded, &method_label, &mut metrics).await
     } else if expanded.url.starts_with("dict://") {
-        run_dict_transfer(transfer, &expanded, method.as_str(), &mut metrics).await
+        run_dict_transfer(transfer, &expanded, &method_label, &mut metrics).await
     } else if expanded.url.starts_with("gopher://") {
-        run_gopher_transfer(transfer, &expanded, method.as_str(), &mut metrics).await
+        run_gopher_transfer(transfer, &expanded, &method_label, &mut metrics).await
     } else if expanded.url.starts_with("gophers://") {
         Err(CurlError::Unsupported(
             "gophers:// URLs are not implemented in the Rust sidecar".to_string(),
         ))
     } else if expanded.url.starts_with("telnet://") {
-        run_telnet_transfer(transfer, &expanded, method.as_str(), &mut metrics).await
+        run_telnet_transfer(transfer, &expanded, &method_label, &mut metrics).await
+    } else if expanded.url.starts_with("pop3://") {
+        run_pop3_transfer(transfer, &expanded, &method_label, &mut metrics).await
+    } else if expanded.url.starts_with("pop3s://") {
+        Err(CurlError::Unsupported(
+            "pop3s:// URLs are not implemented in the Rust sidecar".to_string(),
+        ))
     } else {
+        let mut method = effective_http_method(transfer)?;
+        if method_label == Method::PUT.as_str() && transfer.method.is_none() {
+            method = Method::PUT;
+        }
         run_http_with_retries(transfer, client, &expanded, method, &mut metrics, started).await
     };
 
@@ -433,6 +443,111 @@ async fn run_dict_transfer(
         &reqwest::header::HeaderMap::new(),
         &expanded.variables,
         &bytes,
+        false,
+    )?;
+    metrics.filename_effective = filename.map(|path| path.display().to_string());
+    if max_filesize_exceeded {
+        return Err(CurlError::FileSizeExceeded);
+    }
+    Ok(())
+}
+
+async fn run_pop3_transfer(
+    transfer: &TransferConfig,
+    expanded: &glob::ExpandedUrl,
+    method: &str,
+    metrics: &mut writeout::Metrics,
+) -> Result<()> {
+    if transfer.method.is_none() && method != "GET" && method != "HEAD" {
+        return Err(CurlError::Unsupported(format!(
+            "{method} requests for pop3:// URLs"
+        )));
+    }
+    reject_upload_file_for_scheme(transfer, "pop3://")?;
+    if transfer.oauth2_bearer.is_some() {
+        return Err(CurlError::Unsupported(
+            "--oauth2-bearer for pop3:// URLs".to_string(),
+        ));
+    }
+
+    if let Some(timeout) = transfer.max_time {
+        tokio::time::timeout(
+            timeout,
+            run_pop3_exchange(transfer, expanded, method, metrics),
+        )
+        .await
+        .map_err(|_| CurlError::Timeout)?
+    } else {
+        run_pop3_exchange(transfer, expanded, method, metrics).await
+    }
+}
+
+async fn run_pop3_exchange(
+    transfer: &TransferConfig,
+    expanded: &glob::ExpandedUrl,
+    method: &str,
+    metrics: &mut writeout::Metrics,
+) -> Result<()> {
+    let url = Url::parse(&expanded.url).map_err(|error| CurlError::Url(error.to_string()))?;
+    output::validate_output_target(transfer, &url)?;
+    let host = url
+        .host_str()
+        .ok_or_else(|| CurlError::Url("POP3 URL is missing a host".to_string()))?;
+    let port = url.port().unwrap_or(110);
+    let message_id = pop3_message_id(&url)?;
+    let (user, password) = pop3_credentials(transfer, &url)?;
+    let command = pop3_command(transfer, &message_id)?;
+    let command_has_body = pop3_command_has_body(&command);
+
+    let mut stream = connect_tcp(host, port, transfer).await?;
+    pop3_expect_ok(pop3_read_line(&mut stream).await?, false)?;
+
+    pop3_send_line(&mut stream, b"CAPA").await?;
+    pop3_read_capa(&mut stream).await?;
+
+    let mut user_command = Vec::from(&b"USER "[..]);
+    user_command.extend_from_slice(&user);
+    pop3_send_line(&mut stream, &user_command).await?;
+    pop3_expect_ok(pop3_read_line(&mut stream).await?, true)?;
+
+    let mut pass_command = Vec::from(&b"PASS "[..]);
+    pass_command.extend_from_slice(&password);
+    pop3_send_line(&mut stream, &pass_command).await?;
+    pop3_expect_ok(pop3_read_line(&mut stream).await?, true)?;
+
+    pop3_send_line(&mut stream, &command).await?;
+    pop3_expect_ok(pop3_read_line(&mut stream).await?, false)?;
+
+    let mut body = if command_has_body {
+        pop3_read_multiline_body(&mut stream).await?
+    } else {
+        Vec::new()
+    };
+
+    let _ = pop3_send_line(&mut stream, b"QUIT").await;
+    let _ = pop3_read_line(&mut stream).await;
+
+    metrics.url_effective = url.to_string();
+    if transfer.head || method == "HEAD" {
+        body.clear();
+    }
+    let (body_bytes, max_filesize_exceeded) = if transfer.head || method == "HEAD" {
+        (&body[..], false)
+    } else {
+        limit_body_for_max_filesize(transfer, &body)
+    };
+    metrics.size_download = body_bytes.len() as u64;
+
+    if let Some(path) = &transfer.dump_header {
+        output::dump_headers(path, &[], transfer.create_dirs)?;
+    }
+
+    let filename = output::write_response(
+        transfer,
+        &url,
+        &reqwest::header::HeaderMap::new(),
+        &expanded.variables,
+        body_bytes,
         false,
     )?;
     metrics.filename_effective = filename.map(|path| path.display().to_string());
@@ -628,6 +743,150 @@ fn reject_upload_file_for_scheme(transfer: &TransferConfig, scheme: &str) -> Res
         )));
     }
     Ok(())
+}
+
+fn pop3_message_id(url: &Url) -> Result<Vec<u8>> {
+    let path = url.path().strip_prefix('/').unwrap_or(url.path());
+    let decoded = percent_decode(path.as_bytes()).collect::<Vec<_>>();
+    if has_control_byte(&decoded) {
+        return Err(CurlError::Url(
+            "POP3 message id contains a decoded control byte".to_string(),
+        ));
+    }
+    Ok(decoded)
+}
+
+fn pop3_credentials(transfer: &TransferConfig, url: &Url) -> Result<(Vec<u8>, Vec<u8>)> {
+    if let Some(user) = &transfer.user {
+        let (login, password) = split_user_password(user);
+        return Ok((login.as_bytes().to_vec(), password.as_bytes().to_vec()));
+    }
+
+    let login = percent_decode(url.username().as_bytes()).collect::<Vec<_>>();
+    let password = url
+        .password()
+        .map(|password| percent_decode(password.as_bytes()).collect::<Vec<_>>())
+        .unwrap_or_default();
+    if has_control_byte(&login) || has_control_byte(&password) {
+        return Err(CurlError::Url(
+            "POP3 credentials contain a decoded control byte".to_string(),
+        ));
+    }
+    Ok((login, password))
+}
+
+fn pop3_command(transfer: &TransferConfig, message_id: &[u8]) -> Result<Vec<u8>> {
+    let mut command = if let Some(custom) = &transfer.method {
+        let decoded = percent_decode(custom.as_bytes()).collect::<Vec<_>>();
+        if has_control_byte(&decoded) {
+            return Err(CurlError::Url(
+                "POP3 custom request contains a decoded control byte".to_string(),
+            ));
+        }
+        decoded
+    } else if message_id.is_empty() || transfer.list_only {
+        Vec::from(&b"LIST"[..])
+    } else {
+        Vec::from(&b"RETR"[..])
+    };
+
+    if !message_id.is_empty() {
+        command.push(b' ');
+        command.extend_from_slice(message_id);
+    }
+    Ok(command)
+}
+
+fn pop3_command_has_body(command: &[u8]) -> bool {
+    let mut parts = command.splitn(2, |byte| byte.is_ascii_whitespace());
+    let name = parts.next().unwrap_or_default();
+    let has_args = parts
+        .next()
+        .is_some_and(|args| args.iter().any(|byte| !byte.is_ascii_whitespace()));
+
+    if name.eq_ignore_ascii_case(b"LIST") || name.eq_ignore_ascii_case(b"UIDL") {
+        return !has_args;
+    }
+    name.eq_ignore_ascii_case(b"RETR")
+        || name.eq_ignore_ascii_case(b"TOP")
+        || name.eq_ignore_ascii_case(b"CAPA")
+        || name.eq_ignore_ascii_case(b"MSG")
+        || name.eq_ignore_ascii_case(b"XTND")
+}
+
+fn has_control_byte(bytes: &[u8]) -> bool {
+    bytes.iter().any(|byte| *byte < 32 || *byte == 127)
+}
+
+async fn pop3_send_line(stream: &mut TcpStream, line: &[u8]) -> Result<()> {
+    stream.write_all(line).await.map_err(tcp_io_error)?;
+    stream.write_all(b"\r\n").await.map_err(tcp_io_error)
+}
+
+async fn pop3_read_line(stream: &mut TcpStream) -> Result<Vec<u8>> {
+    let mut line = Vec::new();
+    let mut byte = [0; 1];
+    loop {
+        let read = stream.read(&mut byte).await.map_err(tcp_io_error)?;
+        if read == 0 {
+            if line.is_empty() {
+                return Err(CurlError::WeirdServerReply);
+            }
+            break;
+        }
+        line.push(byte[0]);
+        if byte[0] == b'\n' {
+            break;
+        }
+    }
+    Ok(line)
+}
+
+async fn pop3_read_capa(stream: &mut TcpStream) -> Result<()> {
+    let line = pop3_read_line(stream).await?;
+    if line.starts_with(b"+OK") {
+        loop {
+            let line = pop3_read_line(stream).await?;
+            if pop3_is_terminator_line(&line) {
+                break;
+            }
+        }
+        Ok(())
+    } else if line.starts_with(b"-ERR") {
+        Ok(())
+    } else {
+        Err(CurlError::WeirdServerReply)
+    }
+}
+
+async fn pop3_read_multiline_body(stream: &mut TcpStream) -> Result<Vec<u8>> {
+    let mut body = Vec::new();
+    loop {
+        let line = pop3_read_line(stream).await?;
+        if pop3_is_terminator_line(&line) {
+            break;
+        }
+        if line.starts_with(b"..") {
+            body.extend_from_slice(&line[1..]);
+        } else {
+            body.extend_from_slice(&line);
+        }
+    }
+    Ok(body)
+}
+
+fn pop3_is_terminator_line(line: &[u8]) -> bool {
+    matches!(line, b".\r\n" | b".\n" | b".")
+}
+
+fn pop3_expect_ok(line: Vec<u8>, login: bool) -> Result<()> {
+    if line.starts_with(b"+OK") {
+        Ok(())
+    } else if line.starts_with(b"-ERR") && login {
+        Err(CurlError::LoginDenied)
+    } else {
+        Err(CurlError::WeirdServerReply)
+    }
 }
 
 fn max_filesize_limit(transfer: &TransferConfig) -> Option<u64> {
@@ -1315,7 +1574,23 @@ fn retry_after_delay(headers: &reqwest::header::HeaderMap) -> Option<Duration> {
     retry_at.duration_since(std::time::SystemTime::now()).ok()
 }
 
-fn effective_method(transfer: &TransferConfig) -> Result<Method> {
+fn effective_method_label(transfer: &TransferConfig) -> String {
+    if let Some(method) = &transfer.method {
+        return method.clone();
+    }
+
+    if transfer.head {
+        return Method::HEAD.as_str().to_string();
+    }
+
+    if (!transfer.data.is_empty() || !transfer.forms.is_empty()) && !transfer.get {
+        return Method::POST.as_str().to_string();
+    }
+
+    Method::GET.as_str().to_string()
+}
+
+fn effective_http_method(transfer: &TransferConfig) -> Result<Method> {
     if let Some(method) = &transfer.method {
         return Method::from_bytes(method.as_bytes())
             .map_err(|error| CurlError::Usage(format!("invalid method {method:?}: {error}")));

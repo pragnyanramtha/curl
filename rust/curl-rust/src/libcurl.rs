@@ -141,6 +141,9 @@ fn write_request(out: &mut String, render: &RenderTransfer<'_>, url: &str) -> Re
     if transfer.include_headers {
         emit_long_setopt(out, "CURLOPT_HEADER", 1);
     }
+    if transfer.list_only {
+        emit_long_setopt(out, "CURLOPT_DIRLISTONLY", 1);
+    }
     if transfer.fail {
         emit_long_setopt(out, "CURLOPT_FAILONERROR", 1);
     }
