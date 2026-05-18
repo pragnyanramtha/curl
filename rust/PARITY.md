@@ -59,6 +59,7 @@ companion data before this rewrite can be called complete.
 | `--write-out` | partial | `writeout.rs` | `renders_common_variables` | Many variables missing |
 | `--referer` | partial | `TransferConfig::referer` | `sends_referer_range_and_url_query` | `;auto` semantics missing |
 | `--range` | partial | `TransferConfig::range` | `file_range_outputs_slice`, HTTP header test | Multipart ranges and resume interactions missing |
+| `--etag-save`, `--etag-compare` | partial | `TransferConfig::etag_save`, `TransferConfig::etag_compare` | `etag_compare_sends_if_none_match`, `etag_save_writes_response_etag` | Single URL semantics and full corpus mapping missing |
 | `--user` | partial | `TransferConfig::user` | `username_only_basic_auth_encodes_empty_password` | Basic auth only |
 | `--oauth2-bearer` | partial | `TransferConfig::oauth2_bearer` | `sends_oauth2_bearer_authorization_header` | Redirect credential scoping needs parity work |
 | `--proxy` | partial | `TransferConfig::proxy` | `proxy_user_sets_proxy_authorization_header`, `noproxy_bypasses_configured_proxy` | Basic HTTP proxy path only |
@@ -72,7 +73,6 @@ companion data before this rewrite can be called complete.
 | `--retry*` | missing | none | retry corpus | |
 | `--continue-at` | missing | none | resume tests | |
 | `--cookie-jar` | missing | none | cookie persistence tests | |
-| `--etag-save`, `--etag-compare` | missing | none | ETag tests | |
 | `--time-cond` | missing | none | conditional request tests | |
 | `--parallel` | missing | none | parallel tests | |
 | `--libcurl` | missing | none | tool output tests | |

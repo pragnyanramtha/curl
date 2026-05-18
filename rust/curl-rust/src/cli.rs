@@ -29,6 +29,8 @@ pub struct TransferConfig {
     pub remote_name: bool,
     pub remote_header_name: bool,
     pub dump_header: Option<PathBuf>,
+    pub etag_compare: Option<PathBuf>,
+    pub etag_save: Option<PathBuf>,
     pub write_out: Option<String>,
     pub follow_location: bool,
     pub max_redirs: usize,
@@ -91,6 +93,8 @@ impl Default for TransferConfig {
             remote_name: false,
             remote_header_name: false,
             dump_header: None,
+            etag_compare: None,
+            etag_save: None,
             write_out: None,
             follow_location: false,
             max_redirs: 50,
@@ -304,6 +308,14 @@ impl Parser {
             "dump-header" => {
                 let value = self.value_for(name, inline_value)?;
                 self.current().dump_header = Some(PathBuf::from(value));
+            }
+            "etag-compare" => {
+                let value = self.value_for(name, inline_value)?;
+                self.current().etag_compare = Some(PathBuf::from(value));
+            }
+            "etag-save" => {
+                let value = self.value_for(name, inline_value)?;
+                self.current().etag_save = Some(PathBuf::from(value));
             }
             "write-out" => {
                 let value = self.value_for(name, inline_value)?;
@@ -601,6 +613,8 @@ impl TransferConfig {
             || self.remote_name
             || self.remote_header_name
             || self.dump_header.is_some()
+            || self.etag_compare.is_some()
+            || self.etag_save.is_some()
             || self.write_out.is_some()
             || self.follow_location
             || self.fail
@@ -663,6 +677,8 @@ pub fn print_help() {
            -L, --location              Follow redirects\n\
            -o, --output <file>         Write output to file\n\
            -O, --remote-name           Write output to remote filename\n\
+               --etag-compare <file>   Load ETag from file\n\
+               --etag-save <file>      Save response ETag to file\n\
            -w, --write-out <format>    Write transfer metrics\n\
            -X, --request <method>      Specify request method\n\
            -u, --user <user:pass>      Server user and password\n\
@@ -943,6 +959,10 @@ mod tests {
             "-q",
             "--oauth2-bearer",
             "token",
+            "--etag-compare",
+            "etag.in",
+            "--etag-save",
+            "etag.out",
             "-x",
             "http://proxy.example:8080",
             "-U",
@@ -955,6 +975,14 @@ mod tests {
 
         let transfer = &config.transfers[0];
         assert_eq!(transfer.oauth2_bearer.as_deref(), Some("token"));
+        assert_eq!(
+            transfer.etag_compare.as_deref(),
+            Some(std::path::Path::new("etag.in"))
+        );
+        assert_eq!(
+            transfer.etag_save.as_deref(),
+            Some(std::path::Path::new("etag.out"))
+        );
         assert_eq!(transfer.proxy.as_deref(), Some("http://proxy.example:8080"));
         assert_eq!(transfer.proxy_user.as_deref(), Some("proxy-user:secret"));
         assert_eq!(transfer.noproxy.as_deref(), Some("example.com"));

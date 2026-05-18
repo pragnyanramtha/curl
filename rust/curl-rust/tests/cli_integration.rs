@@ -199,6 +199,71 @@ fn noproxy_bypasses_configured_proxy() {
 }
 
 #[test]
+fn etag_compare_sends_if_none_match() {
+    let temp = tempdir().unwrap();
+    let etag = temp.path().join("etag.txt");
+    std::fs::write(&etag, "\"abc123\"\n").unwrap();
+    let (url, rx) = spawn_server(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok");
+
+    let mut command = Command::cargo_bin("curl").unwrap();
+    command.args(["-q", "-sS", "--etag-compare", etag.to_str().unwrap(), &url]);
+    command.assert().success().stdout("ok");
+
+    let request = rx.recv().unwrap();
+    assert_eq!(header(&request, "if-none-match"), Some("\"abc123\""));
+}
+
+#[test]
+fn etag_compare_missing_file_sends_empty_etag() {
+    let temp = tempdir().unwrap();
+    let etag = temp.path().join("missing.txt");
+    let (url, rx) = spawn_server(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok");
+
+    let mut command = Command::cargo_bin("curl").unwrap();
+    command.args(["-q", "-sS", "--etag-compare", etag.to_str().unwrap(), &url]);
+    command.assert().success().stdout("ok");
+
+    let request = rx.recv().unwrap();
+    assert_eq!(header(&request, "if-none-match"), Some("\"\""));
+}
+
+#[test]
+fn etag_save_writes_response_etag() {
+    let temp = tempdir().unwrap();
+    let etag = temp.path().join("nested").join("etag.txt");
+    let (url, rx) =
+        spawn_server(b"HTTP/1.1 200 OK\r\nETag: \"saved\"\r\nContent-Length: 2\r\n\r\nok");
+
+    let mut command = Command::cargo_bin("curl").unwrap();
+    command.args([
+        "-q",
+        "-sS",
+        "--create-dirs",
+        "--etag-save",
+        etag.to_str().unwrap(),
+        &url,
+    ]);
+    command.assert().success().stdout("ok");
+
+    rx.recv().unwrap();
+    assert_eq!(std::fs::read_to_string(etag).unwrap(), "\"saved\"\n");
+}
+
+#[test]
+fn etag_save_creates_empty_file_when_header_missing() {
+    let temp = tempdir().unwrap();
+    let etag = temp.path().join("etag.txt");
+    let (url, rx) = spawn_server(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok");
+
+    let mut command = Command::cargo_bin("curl").unwrap();
+    command.args(["-q", "-sS", "--etag-save", etag.to_str().unwrap(), &url]);
+    command.assert().success().stdout("ok");
+
+    rx.recv().unwrap();
+    assert_eq!(std::fs::read_to_string(etag).unwrap(), "");
+}
+
+#[test]
 fn file_head_outputs_file_headers() {
     let temp = tempdir().unwrap();
     let file = temp.path().join("plain.txt");

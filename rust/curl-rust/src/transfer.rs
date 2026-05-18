@@ -1,8 +1,9 @@
+use std::path::Path;
 use std::time::Instant;
 
 use reqwest::header::{
-    ACCEPT, ACCEPT_ENCODING, AUTHORIZATION, CONTENT_LENGTH, CONTENT_TYPE, COOKIE, HeaderName,
-    HeaderValue, LOCATION, RANGE, REFERER, USER_AGENT,
+    ACCEPT, ACCEPT_ENCODING, AUTHORIZATION, CONTENT_LENGTH, CONTENT_TYPE, COOKIE, ETAG, HeaderName,
+    HeaderValue, IF_NONE_MATCH, LOCATION, RANGE, REFERER, USER_AGENT,
 };
 use reqwest::{Client, Method, StatusCode, Url, Version};
 
@@ -262,6 +263,9 @@ async fn run_http_transfer(
     if let Some(path) = &transfer.dump_header {
         output::dump_headers(path, &header_bytes, transfer.create_dirs)?;
     }
+    if let Some(path) = &transfer.etag_save {
+        save_etag(path, &headers, transfer.create_dirs)?;
+    }
 
     let body = if method == Method::HEAD {
         Vec::new()
@@ -362,6 +366,10 @@ fn apply_headers(
         request = request.header(AUTHORIZATION, format!("Bearer {token}"));
     }
 
+    if let Some(path) = &transfer.etag_compare {
+        request = request.header(IF_NONE_MATCH, load_etag_compare(path)?);
+    }
+
     if let Some(referer) = &transfer.referer {
         request = request.header(REFERER, referer);
     }
@@ -432,6 +440,42 @@ fn apply_auth(
 
 fn split_user_password(value: &str) -> (&str, &str) {
     value.split_once(':').unwrap_or((value, ""))
+}
+
+fn load_etag_compare(path: &Path) -> Result<String> {
+    let text = match std::fs::read_to_string(path) {
+        Ok(text) => text,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => String::new(),
+        Err(error) => return Err(error.into()),
+    };
+    let etag = text.lines().next().unwrap_or("").trim();
+    if etag.is_empty() {
+        Ok("\"\"".to_string())
+    } else {
+        Ok(etag.to_string())
+    }
+}
+
+fn save_etag(path: &Path, headers: &reqwest::header::HeaderMap, create_dirs: bool) -> Result<()> {
+    if create_dirs
+        && let Some(parent) = path
+            .parent()
+            .filter(|parent| !parent.as_os_str().is_empty())
+    {
+        std::fs::create_dir_all(parent)?;
+    }
+
+    let mut text = headers
+        .get(ETAG)
+        .and_then(|value| value.to_str().ok())
+        .unwrap_or("")
+        .trim()
+        .to_string();
+    if !text.is_empty() {
+        text.push('\n');
+    }
+    std::fs::write(path, text)?;
+    Ok(())
 }
 
 fn append_query_body(url: &mut Url, body: &[u8]) {
