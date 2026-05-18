@@ -423,6 +423,86 @@ fn file_range_outputs_slice() {
 }
 
 #[test]
+fn continue_at_fixed_offset_sends_range_and_appends_output() {
+    let (url, rx) = spawn_server(b"HTTP/1.1 206 Partial Content\r\nContent-Length: 3\r\n\r\nllo");
+    let temp = tempdir().unwrap();
+    let output = temp.path().join("download.txt");
+    std::fs::write(&output, "he").unwrap();
+
+    let mut command = Command::cargo_bin("curl").unwrap();
+    command.args(["-q", "-sS", "-C", "2", "-o", output.to_str().unwrap(), &url]);
+    command.assert().success().stdout("");
+
+    let request = rx.recv().unwrap();
+    assert_eq!(header(&request, "range"), Some("bytes=2-"));
+    assert_eq!(std::fs::read_to_string(output).unwrap(), "hello");
+}
+
+#[test]
+fn continue_at_fixed_offset_to_stdout_sends_range() {
+    let (url, rx) = spawn_server(b"HTTP/1.1 206 Partial Content\r\nContent-Length: 2\r\n\r\nlo");
+
+    let mut command = Command::cargo_bin("curl").unwrap();
+    command.args(["-q", "-sS", "-C3", &url]);
+    command.assert().success().stdout("lo");
+
+    let request = rx.recv().unwrap();
+    assert_eq!(header(&request, "range"), Some("bytes=3-"));
+}
+
+#[test]
+fn continue_at_auto_uses_existing_output_size() {
+    let (url, rx) = spawn_server(b"HTTP/1.1 206 Partial Content\r\nContent-Length: 2\r\n\r\nlo");
+    let temp = tempdir().unwrap();
+    let output = temp.path().join("download.txt");
+    std::fs::write(&output, "hel").unwrap();
+
+    let mut command = Command::cargo_bin("curl").unwrap();
+    command.args([
+        "-q",
+        "-sS",
+        "--continue-at",
+        "-",
+        "-o",
+        output.to_str().unwrap(),
+        &url,
+    ]);
+    command.assert().success().stdout("");
+
+    let request = rx.recv().unwrap();
+    assert_eq!(header(&request, "range"), Some("bytes=3-"));
+    assert_eq!(std::fs::read_to_string(output).unwrap(), "hello");
+}
+
+#[test]
+fn continue_at_auto_to_stdout_uses_zero_offset() {
+    let (url, rx) = spawn_server(b"HTTP/1.1 200 OK\r\nContent-Length: 5\r\n\r\nhello");
+
+    let mut command = Command::cargo_bin("curl").unwrap();
+    command.args(["-q", "-sS", "-C", "-", &url]);
+    command.assert().success().stdout("hello");
+
+    let request = rx.recv().unwrap();
+    assert_eq!(header(&request, "range"), None);
+}
+
+#[test]
+fn continue_at_resumes_file_url_output() {
+    let temp = tempdir().unwrap();
+    let source = temp.path().join("plain.txt");
+    let output = temp.path().join("copy.txt");
+    std::fs::write(&source, "hello").unwrap();
+    std::fs::write(&output, "he").unwrap();
+    let url = Url::from_file_path(&source).unwrap().to_string();
+
+    let mut command = Command::cargo_bin("curl").unwrap();
+    command.args(["-q", "-sS", "-C", "2", "-o", output.to_str().unwrap(), &url]);
+    command.assert().success().stdout("");
+
+    assert_eq!(std::fs::read_to_string(output).unwrap(), "hello");
+}
+
+#[test]
 fn sends_referer_range_and_url_query() {
     let (url, rx) = spawn_server(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok");
 

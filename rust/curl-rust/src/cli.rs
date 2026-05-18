@@ -53,6 +53,7 @@ pub struct TransferConfig {
     pub user_agent: Option<String>,
     pub referer: Option<String>,
     pub range: Option<String>,
+    pub continue_at: Option<ContinueAt>,
     pub cookie: Option<String>,
     pub compressed: bool,
     pub verbose: bool,
@@ -61,6 +62,12 @@ pub struct TransferConfig {
     pub globoff: bool,
     pub create_dirs: bool,
     pub http_version: HttpVersionPreference,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ContinueAt {
+    Offset(u64),
+    Auto,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -123,6 +130,7 @@ impl Default for TransferConfig {
             user_agent: None,
             referer: None,
             range: None,
+            continue_at: None,
             cookie: None,
             compressed: false,
             verbose: false,
@@ -254,7 +262,21 @@ impl Parser {
             }
             "range" => {
                 let value = self.value_for(name, inline_value)?;
+                if self.current().continue_at.is_some() {
+                    return Err(CurlError::Usage(
+                        "--range is mutually exclusive with --continue-at".to_string(),
+                    ));
+                }
                 self.current().range = Some(value);
+            }
+            "continue-at" => {
+                let value = self.value_for(name, inline_value)?;
+                if self.current().range.is_some() {
+                    return Err(CurlError::Usage(
+                        "--continue-at is mutually exclusive with --range".to_string(),
+                    ));
+                }
+                self.current().continue_at = Some(parse_continue_at(name, &value)?);
             }
             "data" | "data-ascii" => {
                 let value = self.value_for(name, inline_value)?;
@@ -490,7 +512,22 @@ impl Parser {
                 }
                 'r' => {
                     let value = self.short_value('r', rest)?;
+                    if self.current().continue_at.is_some() {
+                        return Err(CurlError::Usage(
+                            "--range is mutually exclusive with --continue-at".to_string(),
+                        ));
+                    }
                     self.current().range = Some(value);
+                    break;
+                }
+                'C' => {
+                    let value = self.short_value('C', rest)?;
+                    if self.current().range.is_some() {
+                        return Err(CurlError::Usage(
+                            "--continue-at is mutually exclusive with --range".to_string(),
+                        ));
+                    }
+                    self.current().continue_at = Some(parse_continue_at("continue-at", &value)?);
                     break;
                 }
                 'd' => {
@@ -673,6 +710,7 @@ impl TransferConfig {
             || self.user_agent.is_some()
             || self.referer.is_some()
             || self.range.is_some()
+            || self.continue_at.is_some()
             || self.cookie.is_some()
             || self.compressed
             || self.verbose
@@ -688,6 +726,20 @@ fn parse_usize(name: &str, value: &str) -> Result<usize> {
     value
         .parse()
         .map_err(|_| CurlError::Usage(format!("option --{name} expects an integer")))
+}
+
+fn parse_u64(name: &str, value: &str) -> Result<u64> {
+    value
+        .parse()
+        .map_err(|_| CurlError::Usage(format!("option --{name} expects an integer")))
+}
+
+fn parse_continue_at(name: &str, value: &str) -> Result<ContinueAt> {
+    if value == "-" {
+        Ok(ContinueAt::Auto)
+    } else {
+        Ok(ContinueAt::Offset(parse_u64(name, value)?))
+    }
 }
 
 fn parse_duration(name: &str, value: &str) -> Result<Duration> {
@@ -725,6 +777,7 @@ pub fn print_help() {
                --json <data>           JSON request body\n\
            -e, --referer <url>         Send Referer header\n\
            -r, --range <range>         Request a byte range\n\
+           -C, --continue-at <offset>  Resume transfer at offset\n\
            -H, --header <header>       Pass custom header\n\
            -I, --head                  Show document information only\n\
            -L, --location              Follow redirects\n\
@@ -1049,6 +1102,57 @@ mod tests {
         assert_eq!(transfer.proxy.as_deref(), Some("http://proxy.example:8080"));
         assert_eq!(transfer.proxy_user.as_deref(), Some("proxy-user:secret"));
         assert_eq!(transfer.noproxy.as_deref(), Some("example.com"));
+    }
+
+    #[test]
+    fn parses_continue_at_options() {
+        let config = parse_args(["-q", "-C", "42", "https://example.com"]).unwrap();
+        assert_eq!(
+            config.transfers[0].continue_at,
+            Some(ContinueAt::Offset(42))
+        );
+
+        let config = parse_args(["-q", "-C42", "https://example.com"]).unwrap();
+        assert_eq!(
+            config.transfers[0].continue_at,
+            Some(ContinueAt::Offset(42))
+        );
+
+        let config = parse_args(["-q", "--continue-at", "-", "https://example.com"]).unwrap();
+        assert_eq!(config.transfers[0].continue_at, Some(ContinueAt::Auto));
+    }
+
+    #[test]
+    fn rejects_bad_continue_at_offsets() {
+        for value in ["abc", "-1", ""] {
+            let error = parse_args(["-q", "-C", value, "https://example.com"]).unwrap_err();
+            assert!(error.to_string().contains("expects an integer"));
+        }
+    }
+
+    #[test]
+    fn rejects_continue_at_range_combination() {
+        let error = parse_args([
+            "-q",
+            "--continue-at",
+            "42",
+            "--range",
+            "42-",
+            "https://example.com",
+        ])
+        .unwrap_err();
+        assert!(error.to_string().contains("mutually exclusive"));
+
+        let error = parse_args([
+            "-q",
+            "--range",
+            "42-",
+            "--continue-at",
+            "42",
+            "https://example.com",
+        ])
+        .unwrap_err();
+        assert!(error.to_string().contains("mutually exclusive"));
     }
 
     #[test]

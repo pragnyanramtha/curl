@@ -1,3 +1,4 @@
+use std::fs::OpenOptions;
 use std::io::{self, ErrorKind, Write};
 use std::path::{Path, PathBuf};
 
@@ -51,6 +52,7 @@ pub fn write_response(
     headers: &HeaderMap,
     variables: &[String],
     bytes: &[u8],
+    append: bool,
 ) -> Result<Option<PathBuf>> {
     let path = output_path(transfer, url, headers, variables)?;
     match path {
@@ -62,7 +64,15 @@ pub fn write_response(
             {
                 std::fs::create_dir_all(parent)?;
             }
-            std::fs::write(&path, bytes)?;
+            if append {
+                OpenOptions::new()
+                    .create(true)
+                    .append(true)
+                    .open(&path)?
+                    .write_all(bytes)?;
+            } else {
+                std::fs::write(&path, bytes)?;
+            }
             Ok(Some(path))
         }
         None => {
@@ -110,7 +120,7 @@ pub fn dump_headers(path: &Path, bytes: &[u8], create_dirs: bool) -> Result<()> 
     Ok(())
 }
 
-fn output_path(
+pub fn output_path(
     transfer: &TransferConfig,
     url: &Url,
     headers: &HeaderMap,

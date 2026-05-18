@@ -72,7 +72,7 @@ companion data before this rewrite can be called complete.
 | `--connect-timeout`, `--max-time` | partial | reqwest client builder | none | Needs edge case tests |
 | `--http1.0`, `--http1.1`, `--http2` | partial | reqwest versions | `http2_does_not_force_prior_knowledge` | HTTP/3 missing |
 | `--retry*` | partial | `TransferConfig::retry` | `retries_transient_http_status_then_succeeds`, `retry_all_errors_retries_failed_http_status` | HTTP transient status retry and basic retry timers only; FTP, upload rewind, partial-output resume, and full error taxonomy missing |
-| `--continue-at` | missing | none | resume tests | |
+| `--continue-at` | partial | `TransferConfig::continue_at` | `continue_at_fixed_offset_sends_range_and_appends_output`, `continue_at_auto_uses_existing_output_size`, `continue_at_fixed_offset_to_stdout_sends_range`, `continue_at_resumes_file_url_output` | Download resume for HTTP/file output and stdout only; upload resume, HTTP resume response validation, partial-output retry resume, and remote-header filename auto-resume incomplete |
 | `--cookie-jar` | missing | none | cookie persistence tests | |
 | `--parallel` | missing | none | parallel tests | |
 | `--libcurl` | missing | none | tool output tests | |

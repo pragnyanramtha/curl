@@ -1,3 +1,4 @@
+use std::io;
 use std::path::Path;
 use std::time::{Duration, Instant};
 
@@ -8,7 +9,7 @@ use reqwest::header::{
 };
 use reqwest::{Client, Method, StatusCode, Url, Version};
 
-use crate::cli::{Config, HttpVersionPreference, TransferConfig};
+use crate::cli::{Config, ContinueAt, HttpVersionPreference, TransferConfig};
 use crate::data::{self, PreparedBody};
 use crate::error::{CurlError, Result, ResultExt};
 use crate::{glob, output, writeout};
@@ -20,6 +21,7 @@ struct HttpAttempt {
     headers: reqwest::header::HeaderMap,
     body: Vec<u8>,
     retry_after: Option<Duration>,
+    resume_from: u64,
 }
 
 pub async fn run(config: Config) -> Result<i32> {
@@ -147,6 +149,16 @@ async fn run_file_transfer(
         .to_file_path()
         .map_err(|_| CurlError::Url("file URL cannot be converted to a local path".to_string()))?;
     let metadata_size = std::fs::metadata(&path)?.len();
+    let output_url =
+        Url::parse(&expanded.url).map_err(|error| CurlError::Url(error.to_string()))?;
+    output::validate_output_target(transfer, &output_url)?;
+    let resume_from = resume_offset(
+        transfer,
+        &output_url,
+        &reqwest::header::HeaderMap::new(),
+        &expanded.variables,
+    )?;
+
     let body = if method == "HEAD" {
         Vec::new()
     } else {
@@ -155,7 +167,7 @@ async fn run_file_transfer(
     let body = if method == "HEAD" {
         body
     } else {
-        apply_file_range(body, transfer.range.as_deref())?
+        apply_file_range(body, effective_range(transfer, resume_from).as_deref())?
     };
     let modified = url
         .to_file_path()
@@ -177,9 +189,6 @@ async fn run_file_transfer(
     metrics.size_download = body.len() as u64;
     metrics.headers = headers.clone();
 
-    let output_url =
-        Url::parse(&expanded.url).map_err(|error| CurlError::Url(error.to_string()))?;
-    output::validate_output_target(transfer, &output_url)?;
     let mut bytes = Vec::new();
     if transfer.include_headers || method == "HEAD" {
         bytes.extend_from_slice(&header_bytes);
@@ -187,8 +196,14 @@ async fn run_file_transfer(
     if method != "HEAD" {
         bytes.extend_from_slice(&body);
     }
-    let filename =
-        output::write_response(transfer, &output_url, &headers, &expanded.variables, &bytes)?;
+    let filename = output::write_response(
+        transfer,
+        &output_url,
+        &headers,
+        &expanded.variables,
+        &bytes,
+        resume_from > 0,
+    )?;
     metrics.filename_effective = filename.map(|path| path.display().to_string());
     Ok(())
 }
@@ -215,6 +230,12 @@ async fn run_http_transfer(
     }
     let mut url = Url::parse(&expanded.url).map_err(|error| CurlError::Url(error.to_string()))?;
     output::validate_output_target(transfer, &url)?;
+    let resume_from = resume_offset(
+        transfer,
+        &url,
+        &reqwest::header::HeaderMap::new(),
+        &expanded.variables,
+    )?;
 
     if let Some(query) = prepared_query.as_ref().filter(|query| !query.is_empty()) {
         append_query_body(&mut url, &query.bytes);
@@ -228,7 +249,7 @@ async fn run_http_transfer(
 
     let mut request = client.request(method.clone(), url.clone());
     request = apply_version(request, transfer, &url);
-    request = apply_headers(request, transfer, prepared_body.as_ref())?;
+    request = apply_headers(request, transfer, prepared_body.as_ref(), resume_from)?;
     request = apply_auth(request, transfer);
 
     if let Some(form) = multipart {
@@ -284,6 +305,7 @@ async fn run_http_transfer(
         headers,
         body,
         retry_after,
+        resume_from,
     })
 }
 
@@ -364,6 +386,7 @@ fn finish_http_transfer(
             &attempt.headers,
             &expanded.variables,
             &bytes,
+            attempt.resume_from > 0,
         )?;
         metrics.filename_effective = filename.map(|path| path.display().to_string());
     }
@@ -512,6 +535,7 @@ fn apply_headers(
     mut request: reqwest::RequestBuilder,
     transfer: &TransferConfig,
     body: Option<&PreparedBody>,
+    resume_from: u64,
 ) -> Result<reqwest::RequestBuilder> {
     let parsed_headers = parse_headers(&transfer.headers)?;
     let has_accept = parsed_headers
@@ -554,8 +578,8 @@ fn apply_headers(
         request = request.header(REFERER, referer);
     }
 
-    if let Some(range) = &transfer.range {
-        request = request.header(RANGE, range_header_value(range));
+    if let Some(range) = effective_range(transfer, resume_from) {
+        request = request.header(RANGE, range_header_value(&range));
     }
 
     if body.is_some_and(|body| body.is_json) {
@@ -674,6 +698,39 @@ fn append_query_body(url: &mut Url, body: &[u8]) {
     }
     query.push_str(&body);
     url.set_query(Some(&query));
+}
+
+fn resume_offset(
+    transfer: &TransferConfig,
+    url: &Url,
+    headers: &reqwest::header::HeaderMap,
+    variables: &[String],
+) -> Result<u64> {
+    let Some(continue_at) = transfer.continue_at else {
+        return Ok(0);
+    };
+
+    match continue_at {
+        ContinueAt::Offset(offset) => Ok(offset),
+        ContinueAt::Auto => {
+            let Some(path) = output::output_path(transfer, url, headers, variables)? else {
+                return Ok(0);
+            };
+            match std::fs::metadata(path) {
+                Ok(metadata) => Ok(metadata.len()),
+                Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(0),
+                Err(error) => Err(error.into()),
+            }
+        }
+    }
+}
+
+fn effective_range(transfer: &TransferConfig, resume_from: u64) -> Option<String> {
+    if resume_from > 0 {
+        Some(format!("{resume_from}-"))
+    } else {
+        transfer.range.clone()
+    }
 }
 
 fn range_header_value(range: &str) -> String {
