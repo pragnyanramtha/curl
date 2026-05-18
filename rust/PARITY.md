@@ -79,6 +79,7 @@ companion data before this rewrite can be called complete.
 | `--location` | partial | reqwest redirect policy | parser tests only | Manual redirect behavior needed for full parity |
 | `--fail`, `--fail-with-body` | partial | transfer status handling | `fail_suppresses_http_error_body`, `fail_with_body_outputs_http_error_body_and_fails`, `fail_after_fail_with_body_suppresses_error_body`, `fail_with_body_after_fail_outputs_error_body`, `no_fail_with_body_disables_http_error_failure`, `fail_include_outputs_headers_without_error_body`, `fail_writeout_reports_zero_delivered_body_bytes`, `fail_with_body_retry_outputs_failed_and_successful_bodies`, `fail_options_are_mutexed_with_last_one_winning` | Basic HTTP 4xx/5xx exit 22 handling is covered; `--fail` suppresses bodies while preserving included headers and zero delivered body bytes, `--fail-with-body` preserves bodies, retry preserves failed bodies for stdout, and option mutex ordering follows C warnings. Auth negotiation edge cases, 416 resume exception, exact stderr/`%{errormsg}` wording, output-file retry truncation parity, and full corpus mapping remain incomplete |
 | `--silent`, `--show-error`, `--no-progress-meter` | partial | `TransferConfig::silent`, `TransferConfig::show_error` | `parses_no_progress_meter_as_silent_progress_suppression` | Progress meter output is not implemented, but `--no-progress-meter` is accepted for harness/corpus compatibility |
+| `--dump-header` | partial | `TransferConfig::dump_header`, `output::dump_headers` | `dump_header_dash_writes_headers_to_stdout`, `dump_header_missing_parent_exits_write_error`, curl corpus 419 | Header dumping is wired for HTTP and implemented protocols, with missing parent paths failing as write errors unless `--create-dirs` is used; append semantics across repeated transfers, `%` stderr output, and exact header casing remain incomplete |
 | `--connect-timeout`, `--max-time` | partial | reqwest client builder | none | Needs edge case tests |
 | `--max-filesize` | partial | `TransferConfig::max_filesize` | `parses_max_filesize_units_and_fractions`, `rejects_bad_max_filesize_values`, `max_filesize_allows_http_body_within_limit`, `max_filesize_zero_disables_limit`, `max_filesize_rejects_http_content_length_before_body_output`, `max_filesize_truncates_unknown_http_body_then_fails`, `max_filesize_does_not_fail_head_with_large_content_length`, `max_filesize_truncates_telnet_body_then_fails`, `mqtt_max_filesize_rejects_large_publish_before_output`, `ftp_max_filesize_rejects_after_size_before_retr`, `libcurl_writes_source_file_for_supported_options` | Parses curl-style bytes plus `b/K/M/G/T/P` suffixes and fractional unit values, with `0` disabling the limit; HTTP known `Content-Length`, FTP `SIZE`, and MQTT PUBLISH remaining length fail with exit 63 before body output, unknown-size HTTP/TELNET/FTP buffered bodies write up to the limit then fail, and `--libcurl` emits `CURLOPT_MAXFILESIZE_LARGE`. Overflow `Content-Length`, exact C stderr variants, true streaming cutoff, decompressed `--compressed` accounting, redirect/retry edge cases, and full corpus mapping remain incomplete |
 | `--http1.0`, `--http1.1`, `--http2` | partial | reqwest versions | `http2_does_not_force_prior_knowledge` | HTTP/3 missing |
@@ -99,7 +100,7 @@ companion data before this rewrite can be called complete.
 | CMake sidecar build | partial | `BUILD_RUST_CURL_EXE=ON`, `curl-rust-test`, `curl-rust-corpus-test` |
 | Autotools sidecar build | partial | `--enable-rust-curl`, `make -C rust rust-test`, `make -C rust rust-corpus-test` |
 | Existing curl Perl suite with C binary | verified for C path | Does not prove Rust parity |
-| Existing curl Perl suite with Rust binary | partial | `curl-rust-corpus-test` maps 38 smoke cases across FILE, FTP, DICT, GOPHER, MQTT, SMTP, TFTP, TELNET, and URL/HTTP preflight/error cases; broader protocol corpus remains required before full parity |
+| Existing curl Perl suite with Rust binary | partial | `curl-rust-corpus-test` maps 39 smoke cases across FILE, FTP, DICT, GOPHER, MQTT, SMTP, TFTP, TELNET, and URL/HTTP preflight/error cases; broader protocol corpus remains required before full parity |
 | Pytest HTTP suite with Rust binary | missing | Required before full parity |
 
 Current `curl-rust-corpus-test` selection:
@@ -108,7 +109,7 @@ Current `curl-rust-corpus-test` selection:
 - FTP: 100, 102, 104, 1224
 - DICT: 1450
 - GOPHER: 1200, 1201, 1202
-- URL/HTTP preflight/error paths: 23, 426, 1673
+- URL/HTTP preflight/error paths: 23, 419, 426, 1673
 - MQTT: 1190, 1191, 1198, 1199
 - SMTP: 900, 909, 912, 923, 927, 928, 929, 930
 - TFTP: 271, 283, 1242

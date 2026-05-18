@@ -6108,6 +6108,19 @@ fn dump_header_dash_writes_headers_to_stdout() {
 }
 
 #[test]
+fn dump_header_missing_parent_exits_write_error() {
+    let temp = tempdir().unwrap();
+    let dump_path = temp.path().join("missing").join("headers.txt");
+    let url = "http://127.0.0.1:9/resource";
+
+    let mut command = Command::cargo_bin("curl").unwrap();
+    command.args(["-q", "-sS", "-D", dump_path.to_str().unwrap(), url]);
+    command.assert().failure().code(23).stdout("");
+
+    assert!(!dump_path.exists());
+}
+
+#[test]
 fn remote_header_name_requires_remote_name() {
     let (url, rx) = spawn_server(
         b"HTTP/1.1 200 OK\r\nContent-Disposition: attachment; filename=\"server.bin\"\r\nContent-Length: 2\r\n\r\nok",

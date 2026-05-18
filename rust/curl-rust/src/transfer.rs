@@ -5970,6 +5970,9 @@ async fn run_http_transfer(
     let mut url = Url::parse(&expanded.url).map_err(|error| CurlError::Url(error.to_string()))?;
     data::append_upload_filename_to_url(&mut url, transfer.upload_file.as_deref());
     output::validate_output_target(transfer, &url)?;
+    if let Some(path) = &transfer.dump_header {
+        output::prepare_dump_header_target(path, transfer.create_dirs)?;
+    }
     let resume_from = resume_offset(
         transfer,
         &url,
