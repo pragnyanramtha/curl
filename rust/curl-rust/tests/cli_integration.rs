@@ -607,6 +607,8 @@ fn libcurl_writes_source_file_for_supported_options() {
         "-A",
         "MyUA",
         "--http1.1",
+        "-e",
+        "firstone.html;auto",
         "-j",
         "-b",
         cookie_file.to_str().unwrap(),
@@ -617,6 +619,7 @@ fn libcurl_writes_source_file_for_supported_options() {
     let request = rx.recv().unwrap();
     assert!(request.start_line.starts_with("PUT /resource HTTP/1.1"));
     assert_eq!(header(&request, "x-test"), Some("yes"));
+    assert_eq!(header(&request, "referer"), Some("firstone.html"));
     assert_eq!(header(&request, "cookie"), Some("persist=yes"));
     assert_eq!(request.body, b"a=b");
 
@@ -629,6 +632,8 @@ fn libcurl_writes_source_file_for_supported_options() {
     assert!(text.contains("CURLOPT_POSTFIELDSIZE_LARGE, (curl_off_t)3"));
     assert!(text.contains("CURLOPT_USERPWD, \"alice:secret\""));
     assert!(text.contains("CURLOPT_USERAGENT, \"MyUA\""));
+    assert!(text.contains("CURLOPT_REFERER, \"firstone.html\""));
+    assert!(text.contains("CURLOPT_AUTOREFERER, 1"));
     assert!(text.contains("CURLOPT_HTTP_VERSION, CURL_HTTP_VERSION_1_1"));
     assert!(text.contains(&format!(
         "CURLOPT_COOKIEFILE, \"{}\"",
@@ -858,6 +863,142 @@ fn sends_referer_range_and_url_query() {
         Some("https://refer.example/source")
     );
     assert_eq!(header(&request, "range"), Some("bytes=2-5"));
+}
+
+#[test]
+fn location_does_not_auto_referer_without_referer_auto() {
+    let (url, rx) = spawn_sequence_server(vec![
+        b"HTTP/1.1 302 Found\r\nLocation: /next\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+        b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok",
+    ]);
+
+    let mut command = Command::cargo_bin("curl").unwrap();
+    command.args(["-q", "-sS", "-L", &url]);
+    command.assert().success().stdout("ok");
+
+    let first = rx.recv().unwrap();
+    let second = rx.recv().unwrap();
+    assert_eq!(header(&first, "referer"), None);
+    assert_eq!(header(&second, "referer"), None);
+}
+
+#[test]
+fn fixed_referer_is_reused_across_redirects_without_auto() {
+    let (url, rx) = spawn_sequence_server(vec![
+        b"HTTP/1.1 302 Found\r\nLocation: /next\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+        b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok",
+    ]);
+
+    let mut command = Command::cargo_bin("curl").unwrap();
+    command.args(["-q", "-sS", "-L", "-e", "fixed", "-w", " %{referer}", &url]);
+    command.assert().success().stdout("ok fixed");
+
+    let first = rx.recv().unwrap();
+    let second = rx.recv().unwrap();
+    assert_eq!(header(&first, "referer"), Some("fixed"));
+    assert_eq!(header(&second, "referer"), Some("fixed"));
+}
+
+#[test]
+fn auto_referer_strips_credentials_and_fragment_on_redirect() {
+    let (url, rx) = spawn_sequence_server(vec![
+        b"HTTP/1.1 302 Found\r\nLocation: /next\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+        b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok",
+    ]);
+    let auth_url = format!("{}#anchor", url.replacen("http://", "http://user:pass@", 1));
+
+    let mut command = Command::cargo_bin("curl").unwrap();
+    command.args([
+        "-q",
+        "-sS",
+        "-L",
+        "-e",
+        ";auto",
+        "-w",
+        " %{referer}",
+        &auth_url,
+    ]);
+    command.assert().success().stdout(format!("ok {url}"));
+
+    let first = rx.recv().unwrap();
+    let second = rx.recv().unwrap();
+    assert_eq!(header(&first, "referer"), None);
+    assert_eq!(header(&second, "referer"), Some(url.as_str()));
+}
+
+#[test]
+fn auto_referer_tracks_immediately_previous_redirect_url() {
+    let (url, rx) = spawn_sequence_server(vec![
+        b"HTTP/1.1 302 Found\r\nLocation: /one\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+        b"HTTP/1.1 302 Found\r\nLocation: /two\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+        b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok",
+    ]);
+    let first_hop = Url::parse(&url).unwrap().join("/one").unwrap().to_string();
+
+    let mut command = Command::cargo_bin("curl").unwrap();
+    command.args(["-q", "-sS", "-L", "-e", ";auto", "-w", " %{referer}", &url]);
+    command.assert().success().stdout(format!("ok {first_hop}"));
+
+    let first = rx.recv().unwrap();
+    let second = rx.recv().unwrap();
+    let third = rx.recv().unwrap();
+    assert_eq!(header(&first, "referer"), None);
+    assert_eq!(header(&second, "referer"), Some(url.as_str()));
+    assert_eq!(header(&third, "referer"), Some(first_hop.as_str()));
+}
+
+#[test]
+fn initial_referer_auto_replaces_referer_after_redirect() {
+    let (url, rx) = spawn_sequence_server(vec![
+        b"HTTP/1.1 302 Found\r\nLocation: /next\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+        b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok",
+    ]);
+
+    let mut command = Command::cargo_bin("curl").unwrap();
+    command.args([
+        "-q",
+        "-sS",
+        "-L",
+        "-e",
+        "firstone.html;auto",
+        "-w",
+        " %{referer}",
+        &url,
+    ]);
+    command.assert().success().stdout(format!("ok {url}"));
+
+    let first = rx.recv().unwrap();
+    let second = rx.recv().unwrap();
+    assert_eq!(header(&first, "referer"), Some("firstone.html"));
+    assert_eq!(header(&second, "referer"), Some(url.as_str()));
+}
+
+#[test]
+fn custom_referer_header_suppresses_generated_referer() {
+    let (url, rx) = spawn_sequence_server(vec![
+        b"HTTP/1.1 302 Found\r\nLocation: /next\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+        b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok",
+    ]);
+
+    let mut command = Command::cargo_bin("curl").unwrap();
+    command.args([
+        "-q",
+        "-sS",
+        "-L",
+        "-e",
+        ";auto",
+        "-H",
+        "Referer: custom",
+        "-w",
+        " %{referer}",
+        &url,
+    ]);
+    command.assert().success().stdout("ok custom");
+
+    let first = rx.recv().unwrap();
+    let second = rx.recv().unwrap();
+    assert_eq!(header(&first, "referer"), Some("custom"));
+    assert_eq!(header(&second, "referer"), Some("custom"));
 }
 
 #[test]

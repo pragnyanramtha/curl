@@ -61,6 +61,7 @@ pub struct TransferConfig {
     pub max_time: Option<Duration>,
     pub user_agent: Option<String>,
     pub referer: Option<String>,
+    pub auto_referer: bool,
     pub range: Option<String>,
     pub continue_at: Option<ContinueAt>,
     pub cookie: Option<String>,
@@ -146,6 +147,7 @@ impl Default for TransferConfig {
             max_time: None,
             user_agent: None,
             referer: None,
+            auto_referer: false,
             range: None,
             continue_at: None,
             cookie: None,
@@ -298,7 +300,7 @@ impl Parser {
             }
             "referer" => {
                 let value = self.value_for(name, inline_value)?;
-                self.current().referer = Some(value);
+                self.set_referer(value);
             }
             "range" => {
                 let value = self.value_for(name, inline_value)?;
@@ -556,7 +558,7 @@ impl Parser {
                 }
                 'e' => {
                     let value = self.short_value('e', rest)?;
-                    self.current().referer = Some(value);
+                    self.set_referer(value);
                     break;
                 }
                 'r' => {
@@ -713,6 +715,17 @@ impl Parser {
         }
     }
 
+    fn set_referer(&mut self, value: String) {
+        let transfer = self.current();
+        if let Some(referer) = value.strip_suffix(";auto") {
+            transfer.auto_referer = true;
+            transfer.referer = (!referer.is_empty()).then(|| referer.to_string());
+        } else {
+            transfer.auto_referer = false;
+            transfer.referer = (!value.is_empty()).then_some(value);
+        }
+    }
+
     fn insert_config_file(&mut self, path: &str) -> Result<()> {
         self.loaded_configs += 1;
         if self.loaded_configs > 20 {
@@ -772,6 +785,7 @@ impl TransferConfig {
             || self.max_time.is_some()
             || self.user_agent.is_some()
             || self.referer.is_some()
+            || self.auto_referer
             || self.range.is_some()
             || self.continue_at.is_some()
             || self.cookie.is_some()
@@ -1075,6 +1089,34 @@ mod tests {
         assert_eq!(transfer.data[0].value, "a=b");
         assert_eq!(transfer.output.as_deref(), Some("out.txt"));
         assert_eq!(transfer.urls, ["https://example.com"]);
+    }
+
+    #[test]
+    fn parses_referer_auto_suffix() {
+        let config = parse_args([
+            "-q",
+            "--referer",
+            "https://refer.example/source;auto",
+            "https://example.com",
+        ])
+        .unwrap();
+        assert_eq!(
+            config.transfers[0].referer.as_deref(),
+            Some("https://refer.example/source")
+        );
+        assert!(config.transfers[0].auto_referer);
+
+        let config = parse_args(["-q", "-e", ";auto", "https://example.com"]).unwrap();
+        assert_eq!(config.transfers[0].referer, None);
+        assert!(config.transfers[0].auto_referer);
+
+        let config =
+            parse_args(["-q", "-e", "https://refer.example/", "https://example.com"]).unwrap();
+        assert_eq!(
+            config.transfers[0].referer.as_deref(),
+            Some("https://refer.example/")
+        );
+        assert!(!config.transfers[0].auto_referer);
     }
 
     #[test]

@@ -14,6 +14,7 @@ pub struct Metrics {
     pub exit_code: i32,
     pub errormsg: String,
     pub redirect_url: Option<String>,
+    pub referer: Option<String>,
     pub num_retries: usize,
     pub headers: HeaderMap,
 }
@@ -31,6 +32,7 @@ impl Metrics {
             exit_code: 0,
             errormsg: String::new(),
             redirect_url: None,
+            referer: None,
             num_retries: 0,
             headers: HeaderMap::new(),
         }
@@ -96,6 +98,7 @@ fn variable(name: &str, metrics: &Metrics) -> String {
         "exitcode" => metrics.exit_code.to_string(),
         "errormsg" => metrics.errormsg.clone(),
         "redirect_url" => metrics.redirect_url.clone().unwrap_or_default(),
+        "referer" => metrics.referer.clone().unwrap_or_default(),
         "num_retries" => metrics.num_retries.to_string(),
         "json" => json(metrics),
         "header_json" => header_json(&metrics.headers),
@@ -106,7 +109,7 @@ fn variable(name: &str, metrics: &Metrics) -> String {
 
 fn json(metrics: &Metrics) -> String {
     format!(
-        "{{\"url_effective\":\"{}\",\"http_code\":{},\"response_code\":{},\"size_download\":{},\"time_total\":{:.6},\"method\":\"{}\",\"exitcode\":{},\"errormsg\":\"{}\",\"num_retries\":{}}}",
+        "{{\"url_effective\":\"{}\",\"http_code\":{},\"response_code\":{},\"size_download\":{},\"time_total\":{:.6},\"method\":\"{}\",\"exitcode\":{},\"errormsg\":\"{}\",\"referer\":{},\"num_retries\":{}}}",
         escape_json(&metrics.url_effective),
         metrics.response_code.unwrap_or(0),
         metrics.response_code.unwrap_or(0),
@@ -115,8 +118,15 @@ fn json(metrics: &Metrics) -> String {
         escape_json(&metrics.method),
         metrics.exit_code,
         escape_json(&metrics.errormsg),
+        json_optional_string(metrics.referer.as_deref()),
         metrics.num_retries
     )
+}
+
+fn json_optional_string(value: Option<&str>) -> String {
+    value
+        .map(|value| format!("\"{}\"", escape_json(value)))
+        .unwrap_or_else(|| "null".to_string())
 }
 
 fn header_json(headers: &HeaderMap) -> String {
@@ -158,13 +168,17 @@ mod tests {
         metrics.response_code = Some(200);
         metrics.size_download = 5;
         metrics.num_retries = 2;
+        metrics.referer = Some("https://refer.example/source".to_string());
 
         assert_eq!(
             render(
-                "%{url_effective} %{http_code} %{size_download} %{num_retries}\\n",
+                "%{url_effective} %{http_code} %{size_download} %{referer} %{num_retries}\\n",
                 &metrics
             ),
-            "https://example.com/ 200 5 2\n"
+            "https://example.com/ 200 5 https://refer.example/source 2\n"
+        );
+        assert!(
+            render("%{json}", &metrics).contains("\"referer\":\"https://refer.example/source\"")
         );
     }
 }

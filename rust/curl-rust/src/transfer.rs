@@ -167,7 +167,7 @@ fn expand_urls(transfer: &TransferConfig) -> Result<Vec<glob::ExpandedUrl>> {
 }
 
 fn build_client(transfer: &TransferConfig, cookie_jar: Option<Arc<CookieJar>>) -> Result<Client> {
-    let redirect = if transfer.follow_location {
+    let redirect = if transfer.follow_location && !transfer.auto_referer {
         reqwest::redirect::Policy::limited(transfer.max_redirs)
     } else {
         reqwest::redirect::Policy::none()
@@ -175,6 +175,7 @@ fn build_client(transfer: &TransferConfig, cookie_jar: Option<Arc<CookieJar>>) -
 
     let mut builder = Client::builder()
         .redirect(redirect)
+        .referer(false)
         .danger_accept_invalid_certs(transfer.insecure);
 
     if !transfer.compressed {
@@ -337,13 +338,13 @@ async fn run_http_transfer(
 ) -> Result<HttpAttempt> {
     let prepared_query = data::prepare_body(&transfer.url_query)?;
     let prepared_body = data::prepare_body(&transfer.data)?;
-    let multipart = data::prepare_multipart(&transfer.forms)?;
-    if prepared_body.is_some() && multipart.is_some() {
+    let has_multipart = !transfer.forms.is_empty();
+    if prepared_body.is_some() && has_multipart {
         return Err(CurlError::Usage(
             "--form cannot be combined with --data or --json".to_string(),
         ));
     }
-    if transfer.get && multipart.is_some() {
+    if transfer.get && has_multipart {
         return Err(CurlError::Usage(
             "--get cannot be combined with --form".to_string(),
         ));
@@ -367,66 +368,100 @@ async fn run_http_transfer(
         append_query_body(&mut url, &body.bytes);
     }
 
-    let mut request = client.request(method.clone(), url.clone());
-    request = apply_version(request, transfer, &url);
-    request = apply_headers(request, transfer, prepared_body.as_ref(), resume_from)?;
-    request = apply_auth(request, transfer);
-
-    if let Some(form) = multipart {
-        request = request.multipart(form);
-    } else if !transfer.get
-        && let Some(body) = prepared_body.as_ref()
-    {
-        request = request
-            .header(CONTENT_LENGTH, body.bytes.len())
-            .body(body.bytes.clone());
-    }
-
-    if transfer.verbose {
-        eprintln!("> {} {}", method.as_str(), url);
-    }
-
-    let response = request.send().await.transfer_err()?;
-    let status = response.status();
-    let version = response.version();
-    let final_url = response.url().clone();
-    let headers = response.headers().clone();
-    metrics.url_effective = final_url.to_string();
-    metrics.response_code = Some(status.as_u16());
-    metrics.content_type = headers
-        .get(CONTENT_TYPE)
-        .and_then(|value| value.to_str().ok())
-        .map(ToString::to_string);
-    metrics.redirect_url = headers
-        .get(LOCATION)
-        .and_then(|value| value.to_str().ok())
-        .map(ToString::to_string);
-    metrics.headers = headers.clone();
-
-    if transfer.verbose {
-        eprintln!("< {}", status_line(version, status));
-        for (name, value) in &headers {
-            eprintln!("< {}: {}", name, String::from_utf8_lossy(value.as_bytes()));
-        }
-    }
-
-    let body = if method == Method::HEAD {
-        Vec::new()
+    let custom_referer = explicit_header_value(&transfer.headers, "referer")?;
+    let mut current_referer = if custom_referer.is_some() {
+        None
     } else {
-        response.bytes().await.transfer_err()?.to_vec()
+        transfer.referer.clone()
     };
-    metrics.size_download = body.len() as u64;
-    let retry_after = retry_after_delay(&headers);
+    let mut redirects = 0usize;
 
-    Ok(HttpAttempt {
-        status,
-        version,
-        final_url,
-        headers,
-        body,
-        retry_after,
-        resume_from,
-    })
+    loop {
+        let multipart = data::prepare_multipart(&transfer.forms)?;
+        let mut request = client.request(method.clone(), url.clone());
+        request = apply_version(request, transfer, &url);
+        request = apply_headers(
+            request,
+            transfer,
+            prepared_body.as_ref(),
+            resume_from,
+            current_referer.as_deref(),
+        )?;
+        request = apply_auth(request, transfer);
+
+        if let Some(form) = multipart {
+            request = request.multipart(form);
+        } else if !transfer.get
+            && let Some(body) = prepared_body.as_ref()
+        {
+            request = request
+                .header(CONTENT_LENGTH, body.bytes.len())
+                .body(body.bytes.clone());
+        }
+
+        if transfer.verbose {
+            eprintln!("> {} {}", method.as_str(), url);
+        }
+
+        let response = request.send().await.transfer_err()?;
+        let status = response.status();
+        let version = response.version();
+        let final_url = response.url().clone();
+        let headers = response.headers().clone();
+
+        if transfer.verbose {
+            eprintln!("< {}", status_line(version, status));
+            for (name, value) in &headers {
+                eprintln!("< {}: {}", name, String::from_utf8_lossy(value.as_bytes()));
+            }
+        }
+
+        if transfer.auto_referer
+            && transfer.follow_location
+            && redirects < transfer.max_redirs
+            && is_followed_redirect(status)
+            && let Some(next_url) = redirect_location(&final_url, &headers)?
+        {
+            response.bytes().await.transfer_err()?;
+            if custom_referer.is_none() {
+                current_referer = Some(auto_referer_value(&final_url));
+            }
+            url = next_url;
+            redirects += 1;
+            continue;
+        }
+
+        metrics.url_effective = final_url.to_string();
+        metrics.response_code = Some(status.as_u16());
+        metrics.referer = custom_referer.clone().or_else(|| current_referer.clone());
+        metrics.content_type = headers
+            .get(CONTENT_TYPE)
+            .and_then(|value| value.to_str().ok())
+            .map(ToString::to_string);
+        metrics.redirect_url = headers
+            .get(LOCATION)
+            .and_then(|value| value.to_str().ok())
+            .map(ToString::to_string);
+        metrics.headers = headers.clone();
+
+        let body = if method == Method::HEAD {
+            Vec::new()
+        } else {
+            response.bytes().await.transfer_err()?.to_vec()
+        };
+        metrics.size_download = body.len() as u64;
+        let retry_after = retry_after_delay(&headers);
+
+        return Ok(HttpAttempt {
+            status,
+            version,
+            final_url,
+            headers,
+            body,
+            retry_after,
+            resume_from,
+        });
+    }
 }
 
 async fn run_http_with_retries(
@@ -469,6 +504,7 @@ fn reset_attempt_metrics(metrics: &mut writeout::Metrics) {
     metrics.exit_code = 0;
     metrics.errormsg.clear();
     metrics.redirect_url = None;
+    metrics.referer = None;
     metrics.headers = reqwest::header::HeaderMap::new();
 }
 
@@ -656,6 +692,7 @@ fn apply_headers(
     transfer: &TransferConfig,
     body: Option<&PreparedBody>,
     resume_from: u64,
+    referer: Option<&str>,
 ) -> Result<reqwest::RequestBuilder> {
     let parsed_headers = parse_headers(&transfer.headers)?;
     let has_accept = parsed_headers
@@ -664,6 +701,9 @@ fn apply_headers(
     let has_content_type = parsed_headers
         .iter()
         .any(|(name, _)| name.as_str().eq_ignore_ascii_case("content-type"));
+    let has_referer = parsed_headers
+        .iter()
+        .any(|(name, _)| name.as_str().eq_ignore_ascii_case("referer"));
 
     request = request.header(
         USER_AGENT,
@@ -696,7 +736,9 @@ fn apply_headers(
         request = request.header(name, value);
     }
 
-    if let Some(referer) = &transfer.referer {
+    if let Some(referer) = referer
+        && !has_referer
+    {
         request = request.header(REFERER, referer);
     }
 
@@ -720,6 +762,41 @@ fn apply_headers(
     Ok(request)
 }
 
+fn is_followed_redirect(status: StatusCode) -> bool {
+    matches!(
+        status,
+        StatusCode::MOVED_PERMANENTLY
+            | StatusCode::FOUND
+            | StatusCode::SEE_OTHER
+            | StatusCode::TEMPORARY_REDIRECT
+            | StatusCode::PERMANENT_REDIRECT
+    )
+}
+
+fn redirect_location(
+    current_url: &Url,
+    headers: &reqwest::header::HeaderMap,
+) -> Result<Option<Url>> {
+    let Some(location) = headers.get(LOCATION) else {
+        return Ok(None);
+    };
+    let location = location
+        .to_str()
+        .map_err(|error| CurlError::Transfer(format!("redirect Location is not UTF-8: {error}")))?;
+    current_url
+        .join(location)
+        .map(Some)
+        .map_err(|error| CurlError::Url(error.to_string()))
+}
+
+fn auto_referer_value(previous: &Url) -> String {
+    let mut referer = previous.clone();
+    let _ = referer.set_username("");
+    let _ = referer.set_password(None);
+    referer.set_fragment(None);
+    referer.to_string()
+}
+
 fn parse_headers(headers: &[String]) -> Result<Vec<(HeaderName, HeaderValue)>> {
     let mut parsed = Vec::new();
     for header in headers {
@@ -733,6 +810,14 @@ fn parse_headers(headers: &[String]) -> Result<Vec<(HeaderName, HeaderValue)>> {
         }
     }
     Ok(parsed)
+}
+
+fn explicit_header_value(headers: &[String], name: &str) -> Result<Option<String>> {
+    Ok(parse_headers(headers)?
+        .into_iter()
+        .rev()
+        .find(|(header_name, _)| header_name.as_str().eq_ignore_ascii_case(name))
+        .and_then(|(_, value)| value.to_str().ok().map(ToString::to_string)))
 }
 
 fn parse_header(header: &str) -> Result<(HeaderName, HeaderValue)> {

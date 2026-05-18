@@ -201,6 +201,9 @@ fn write_request(out: &mut String, render: &RenderTransfer<'_>, url: &str) -> Re
     if let Some(referer) = &transfer.referer {
         emit_string_setopt(out, "CURLOPT_REFERER", referer);
     }
+    if transfer.auto_referer {
+        emit_long_setopt(out, "CURLOPT_AUTOREFERER", 1);
+    }
     if let Some(range) = &transfer.range {
         emit_string_setopt(out, "CURLOPT_RANGE", range);
     }
@@ -475,6 +478,24 @@ mod tests {
         assert!(source.contains("CURLOPT_PROXY, \"http://proxy.example:8080\""));
         assert!(source.contains("CURLOPT_NOPROXY, \"localhost\""));
         assert!(source.contains("CURLOPT_USERAGENT, \"MyUA\""));
+    }
+
+    #[test]
+    fn renders_auto_referer_without_initial_referer() {
+        let config = parse_args([
+            "-q",
+            "--libcurl",
+            "client.c",
+            "-e",
+            ";auto",
+            "https://example.com",
+        ])
+        .unwrap();
+
+        let source = render_source(&config).unwrap();
+
+        assert!(source.contains("CURLOPT_AUTOREFERER, 1"));
+        assert!(!source.contains("CURLOPT_REFERER"));
     }
 
     #[test]
