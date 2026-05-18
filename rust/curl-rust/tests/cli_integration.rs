@@ -2718,7 +2718,21 @@ fn pop3_command_error_returns_weird_server_reply() {
 
     assert_eq!(
         rx.recv().unwrap(),
-        b"CAPA\r\nUSER user\r\nPASS secret\r\nLIST 42\r\n"
+        b"CAPA\r\nUSER user\r\nPASS secret\r\nLIST 42\r\nQUIT\r\n"
+    );
+}
+
+#[test]
+fn pop3_retr_command_error_sends_quit_and_returns_weird_server_reply() {
+    let (url, rx) = spawn_pop3_server("/42", b"-ERR no such message\r\n");
+
+    let mut command = Command::cargo_bin("curl").unwrap();
+    command.args(["-q", "-sS", "-u", "user:secret", &url]);
+    command.assert().failure().code(8).stdout("");
+
+    assert_eq!(
+        rx.recv().unwrap(),
+        b"CAPA\r\nUSER user\r\nPASS secret\r\nRETR 42\r\nQUIT\r\n"
     );
 }
 

@@ -1822,7 +1822,12 @@ async fn run_pop3_exchange(
     pop3_expect_ok(pop3_read_line(&mut stream).await?, true)?;
 
     pop3_send_line(&mut stream, &command).await?;
-    pop3_expect_ok(pop3_read_line(&mut stream).await?, false)?;
+    let command_response = pop3_read_line(&mut stream).await?;
+    if let Err(error) = pop3_expect_ok(command_response, false) {
+        let _ = pop3_send_line(&mut stream, b"QUIT").await;
+        let _ = pop3_read_line(&mut stream).await;
+        return Err(error);
+    }
 
     let mut body = if command_has_body {
         pop3_read_multiline_body(&mut stream).await?

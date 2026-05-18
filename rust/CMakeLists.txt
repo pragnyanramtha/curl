@@ -49,6 +49,8 @@ set(_curl_rust_corpus_tests
   807
   850
   851
+  852
+  855
   900
   909
   912
