@@ -230,6 +230,24 @@ fn write_request(out: &mut String, render: &RenderTransfer<'_>, url: &str) -> Re
         emit_string_setopt(out, "CURLOPT_USERPWD", user);
         emit_raw_setopt(out, "CURLOPT_HTTPAUTH", "(long)CURLAUTH_BASIC");
     }
+    if let Some(private_key) = &transfer.ssh_private_key {
+        emit_path_setopt(out, "CURLOPT_SSH_PRIVATE_KEYFILE", private_key);
+    }
+    if let Some(public_key) = &transfer.ssh_public_key {
+        emit_path_setopt(out, "CURLOPT_SSH_PUBLIC_KEYFILE", public_key);
+    }
+    if let Some(known_hosts) = &transfer.ssh_known_hosts {
+        emit_path_setopt(out, "CURLOPT_SSH_KNOWNHOSTS", known_hosts);
+    }
+    if let Some(hostpubmd5) = &transfer.ssh_hostpubmd5 {
+        emit_string_setopt(out, "CURLOPT_SSH_HOST_PUBLIC_KEY_MD5", hostpubmd5);
+    }
+    if let Some(hostpubsha256) = &transfer.ssh_hostpubsha256 {
+        emit_string_setopt(out, "CURLOPT_SSH_HOST_PUBLIC_KEY_SHA256", hostpubsha256);
+    }
+    if transfer.compressed_ssh {
+        emit_long_setopt(out, "CURLOPT_SSH_COMPRESSION", 1);
+    }
     if let Some(token) = &transfer.oauth2_bearer {
         emit_string_setopt(out, "CURLOPT_XOAUTH2_BEARER", token);
     }
@@ -463,6 +481,10 @@ fn emit_slist_append(out: &mut String, slist: &str, value: &str) {
 
 fn emit_string_setopt(out: &mut String, option: &str, value: &str) {
     emit_bytes_setopt(out, option, value.as_bytes());
+}
+
+fn emit_path_setopt(out: &mut String, option: &str, value: &Path) {
+    emit_bytes_setopt(out, option, value.to_string_lossy().as_bytes());
 }
 
 fn emit_bytes_setopt(out: &mut String, option: &str, value: &[u8]) {

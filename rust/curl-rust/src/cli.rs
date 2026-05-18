@@ -38,6 +38,12 @@ pub struct TransferConfig {
     pub mail_from: Option<String>,
     pub mail_rcpt: Vec<String>,
     pub mail_rcpt_allowfails: bool,
+    pub ssh_private_key: Option<PathBuf>,
+    pub ssh_public_key: Option<PathBuf>,
+    pub ssh_known_hosts: Option<PathBuf>,
+    pub ssh_hostpubmd5: Option<String>,
+    pub ssh_hostpubsha256: Option<String>,
+    pub compressed_ssh: bool,
     pub tftp_blksize: Option<u16>,
     pub tftp_no_options: bool,
     pub telnet_options: Vec<String>,
@@ -134,6 +140,12 @@ impl Default for TransferConfig {
             mail_from: None,
             mail_rcpt: Vec::new(),
             mail_rcpt_allowfails: false,
+            ssh_private_key: None,
+            ssh_public_key: None,
+            ssh_known_hosts: None,
+            ssh_hostpubmd5: None,
+            ssh_hostpubsha256: None,
+            compressed_ssh: false,
             tftp_blksize: None,
             tftp_no_options: false,
             telnet_options: Vec::new(),
@@ -405,6 +417,27 @@ impl Parser {
                 self.current().mail_rcpt.push(value);
             }
             "mail-rcpt-allowfails" => self.current().mail_rcpt_allowfails = true,
+            "key" => {
+                let value = self.value_for(name, inline_value)?;
+                self.current().ssh_private_key = Some(parse_nonempty_path(name, &value)?);
+            }
+            "pubkey" => {
+                let value = self.value_for(name, inline_value)?;
+                self.current().ssh_public_key = Some(parse_nonempty_path(name, &value)?);
+            }
+            "knownhosts" => {
+                let value = self.value_for(name, inline_value)?;
+                self.current().ssh_known_hosts = Some(parse_nonempty_path(name, &value)?);
+            }
+            "hostpubmd5" => {
+                let value = self.value_for(name, inline_value)?;
+                self.current().ssh_hostpubmd5 = Some(parse_nonempty_string(name, value)?);
+            }
+            "hostpubsha256" => {
+                let value = self.value_for(name, inline_value)?;
+                self.current().ssh_hostpubsha256 = Some(parse_nonempty_string(name, value)?);
+            }
+            "compressed-ssh" => self.current().compressed_ssh = true,
             "tftp-blksize" => {
                 let value = self.value_for(name, inline_value)?;
                 self.current().tftp_blksize = Some(parse_tftp_blksize(name, &value)?);
@@ -562,6 +595,7 @@ impl Parser {
             "insecure" => self.current().insecure = false,
             "junk-session-cookies" => self.current().junk_session_cookies = false,
             "mail-rcpt-allowfails" => self.current().mail_rcpt_allowfails = false,
+            "compressed-ssh" => self.current().compressed_ssh = false,
             "tftp-no-options" => self.current().tftp_no_options = false,
             "compressed" => self.current().compressed = false,
             "verbose" => self.current().verbose = false,
@@ -846,6 +880,12 @@ impl TransferConfig {
             || self.mail_from.is_some()
             || !self.mail_rcpt.is_empty()
             || self.mail_rcpt_allowfails
+            || self.ssh_private_key.is_some()
+            || self.ssh_public_key.is_some()
+            || self.ssh_known_hosts.is_some()
+            || self.ssh_hostpubmd5.is_some()
+            || self.ssh_hostpubsha256.is_some()
+            || self.compressed_ssh
             || self.tftp_blksize.is_some()
             || self.tftp_no_options
             || !self.telnet_options.is_empty()
@@ -1077,6 +1117,10 @@ pub fn print_help() {
            -T, --upload-file <file>    Transfer local file to remote URL\n\
                --mail-from <address>   Mail from this address\n\
                --mail-rcpt <address>   Mail to this address\n\
+               --key <file>            SSH private key file\n\
+               --pubkey <file>         SSH public key file\n\
+               --knownhosts <file>     SSH known_hosts file\n\
+               --compressed-ssh        Enable SSH compression\n\
                --tftp-blksize <value>  Set TFTP BLKSIZE option\n\
                --tftp-no-options       Do not send TFTP options\n\
            -t, --telnet-option <opt>   Set telnet option\n\
@@ -1111,7 +1155,7 @@ pub fn print_help() {
                --oauth2-bearer <token> OAuth 2 Bearer token\n\
            -U, --proxy-user <user:pass> Proxy user and password\n\
                --noproxy <list>        List hosts that do not use proxy\n\
-           -k, --insecure              Allow insecure TLS\n\
+           -k, --insecure              Allow insecure TLS/SSH\n\
            -s, --silent                Silent mode\n\
            -v, --verbose               Verbose transfer trace\n\
            -V, --version               Show version"
@@ -1120,7 +1164,7 @@ pub fn print_help() {
 
 pub fn print_version() {
     println!(
-        "curl-rust {} (Rust rewrite) DICT FTP HTTP HTTPS FILE GOPHER IMAP IPFS IPNS LDAP MQTT POP3 RTSP SMB SMTP TELNET TFTP WS",
+        "curl-rust {} (Rust rewrite) DICT FTP HTTP HTTPS FILE GOPHER IMAP IPFS IPNS LDAP MQTT POP3 RTSP SCP SFTP SMB SMTP TELNET TFTP WS",
         env!("CARGO_PKG_VERSION")
     );
 }
@@ -1258,6 +1302,8 @@ fn shell_words(line: &str) -> Result<Vec<String>> {
 
 #[cfg(test)]
 mod tests {
+    use std::path::Path;
+
     use super::*;
 
     #[test]
@@ -1352,6 +1398,50 @@ mod tests {
         ])
         .unwrap();
         assert!(!config.transfers[0].mail_rcpt_allowfails);
+    }
+
+    #[test]
+    fn parses_ssh_options() {
+        let config = parse_args([
+            "-q",
+            "--key",
+            "id_ed25519",
+            "--pubkey=client.pub",
+            "--knownhosts",
+            "known_hosts",
+            "--hostpubmd5",
+            "00:11",
+            "--hostpubsha256=abc",
+            "--compressed-ssh",
+            "sftp://example.com/file",
+        ])
+        .unwrap();
+
+        let transfer = &config.transfers[0];
+        assert_eq!(
+            transfer.ssh_private_key.as_deref(),
+            Some(Path::new("id_ed25519"))
+        );
+        assert_eq!(
+            transfer.ssh_public_key.as_deref(),
+            Some(Path::new("client.pub"))
+        );
+        assert_eq!(
+            transfer.ssh_known_hosts.as_deref(),
+            Some(Path::new("known_hosts"))
+        );
+        assert_eq!(transfer.ssh_hostpubmd5.as_deref(), Some("00:11"));
+        assert_eq!(transfer.ssh_hostpubsha256.as_deref(), Some("abc"));
+        assert!(transfer.compressed_ssh);
+
+        let config = parse_args([
+            "-q",
+            "--compressed-ssh",
+            "--no-compressed-ssh",
+            "sftp://example.com/file",
+        ])
+        .unwrap();
+        assert!(!config.transfers[0].compressed_ssh);
     }
 
     #[test]

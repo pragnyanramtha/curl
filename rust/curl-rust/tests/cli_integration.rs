@@ -1,12 +1,14 @@
 use std::io::ErrorKind;
 use std::io::{Read, Write};
 use std::net::{Shutdown, TcpListener, UdpSocket};
+use std::path::{Path, PathBuf};
+use std::process::{Child, Command as StdCommand, Stdio};
 use std::sync::mpsc::{self, Receiver};
 use std::thread;
 use std::time::{Duration, Instant};
 
 use assert_cmd::Command;
-use tempfile::tempdir;
+use tempfile::{TempDir, tempdir};
 use url::Url;
 
 const DICT_GREETING: &[u8] = b"220 dictserver <xnooptions> <msgid@msgid>\n";
@@ -99,6 +101,134 @@ struct SmbFixture {
     malformed_read: bool,
 }
 
+struct SshdFixture {
+    _temp: TempDir,
+    child: Child,
+    port: u16,
+    root: PathBuf,
+    private_key: PathBuf,
+    public_key: PathBuf,
+    bad_private_key: PathBuf,
+    known_hosts: PathBuf,
+    user: String,
+}
+
+impl SshdFixture {
+    fn new() -> Option<Self> {
+        let sshd = Path::new("/usr/sbin/sshd");
+        let sftp_server = Path::new("/usr/lib/openssh/sftp-server");
+        if !sshd.is_file() || !sftp_server.is_file() {
+            return None;
+        }
+
+        let temp = tempdir().unwrap();
+        let root = temp.path().join("root");
+        std::fs::create_dir(&root).unwrap();
+        std::fs::write(root.join("data.txt"), "ssh fixture body\n").unwrap();
+        let directory = root.join("dir");
+        std::fs::create_dir(&directory).unwrap();
+        std::fs::write(directory.join("alpha.txt"), "alpha").unwrap();
+        std::fs::write(directory.join("beta.txt"), "beta").unwrap();
+
+        let host_key = temp.path().join("host_ed25519");
+        let private_key = temp.path().join("client_ed25519");
+        let bad_private_key = temp.path().join("bad_ed25519");
+        generate_ssh_key(&host_key);
+        generate_ssh_key(&private_key);
+        generate_ssh_key(&bad_private_key);
+
+        let public_key = private_key.with_extension("pub");
+        let authorized_keys = temp.path().join("authorized_keys");
+        std::fs::copy(&public_key, &authorized_keys).unwrap();
+        set_private_file_mode(&authorized_keys);
+
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        drop(listener);
+
+        let known_hosts = temp.path().join("known_hosts");
+        write_known_hosts(&known_hosts, port, &host_key.with_extension("pub"));
+
+        let config = temp.path().join("sshd_config");
+        std::fs::write(
+            &config,
+            format!(
+                "Port {port}\n\
+                 ListenAddress 127.0.0.1\n\
+                 HostKey {}\n\
+                 PidFile {}\n\
+                 AuthorizedKeysFile {}\n\
+                 PasswordAuthentication no\n\
+                 KbdInteractiveAuthentication no\n\
+                 ChallengeResponseAuthentication no\n\
+                 PubkeyAuthentication yes\n\
+                 StrictModes no\n\
+                 UsePAM no\n\
+                 PermitRootLogin yes\n\
+                 LogLevel ERROR\n\
+                 Subsystem sftp {}\n",
+                host_key.display(),
+                temp.path().join("sshd.pid").display(),
+                authorized_keys.display(),
+                sftp_server.display()
+            ),
+        )
+        .unwrap();
+
+        let mut child = StdCommand::new(sshd)
+            .args(["-D", "-e", "-f"])
+            .arg(&config)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .unwrap();
+        wait_for_sshd(port, &mut child);
+
+        Some(Self {
+            _temp: temp,
+            child,
+            port,
+            root,
+            private_key,
+            public_key,
+            bad_private_key,
+            known_hosts,
+            user: std::env::var("USER")
+                .or_else(|_| std::env::var("LOGNAME"))
+                .unwrap_or_else(|_| "ubuntu".to_string()),
+        })
+    }
+
+    fn url_for(&self, scheme: &str, path: &Path) -> String {
+        format!(
+            "{scheme}://127.0.0.1:{}{}",
+            self.port,
+            path.to_str().unwrap()
+        )
+    }
+
+    fn auth_args(&self) -> Vec<String> {
+        vec![
+            "--knownhosts".to_string(),
+            self.known_hosts.display().to_string(),
+            "--key".to_string(),
+            self.private_key.display().to_string(),
+            "--pubkey".to_string(),
+            self.public_key.display().to_string(),
+            "--user".to_string(),
+            self.user.clone(),
+        ]
+    }
+}
+
+impl Drop for SshdFixture {
+    fn drop(&mut self) {
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+    }
+}
+
 #[derive(Debug)]
 struct FtpServerOptions {
     data: Vec<u8>,
@@ -133,6 +263,52 @@ fn gateway_origin(url: &str) -> String {
         .unwrap_or_default();
     format!("{}://{host}{port}", url.scheme())
 }
+
+fn generate_ssh_key(path: &Path) {
+    let status = StdCommand::new("ssh-keygen")
+        .args(["-q", "-t", "ed25519", "-N", "", "-f"])
+        .arg(path)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .unwrap();
+    assert!(status.success());
+    set_private_file_mode(path);
+}
+
+fn write_known_hosts(path: &Path, port: u16, host_public_key: &Path) {
+    let public = std::fs::read_to_string(host_public_key).unwrap();
+    let mut fields = public.split_whitespace();
+    let key_type = fields.next().unwrap();
+    let key = fields.next().unwrap();
+    std::fs::write(path, format!("[127.0.0.1]:{port} {key_type} {key}\n")).unwrap();
+}
+
+fn wait_for_sshd(port: u16, child: &mut Child) {
+    for _ in 0..100 {
+        if let Some(status) = child.try_wait().unwrap() {
+            panic!("sshd exited before accepting connections: {status}");
+        }
+        if std::net::TcpStream::connect(("127.0.0.1", port)).is_ok() {
+            return;
+        }
+        thread::sleep(Duration::from_millis(25));
+    }
+    panic!("sshd did not start on port {port}");
+}
+
+#[cfg(unix)]
+fn set_private_file_mode(path: &Path) {
+    use std::os::unix::fs::PermissionsExt;
+
+    let mut permissions = std::fs::metadata(path).unwrap().permissions();
+    permissions.set_mode(0o600);
+    std::fs::set_permissions(path, permissions).unwrap();
+}
+
+#[cfg(not(unix))]
+fn set_private_file_mode(_path: &Path) {}
 
 fn spawn_sequence_server(responses: Vec<&'static [u8]>) -> (String, Receiver<RequestRecord>) {
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
@@ -3934,6 +4110,119 @@ fn version_lists_smb_protocol() {
 
     assert!(output.status.success());
     assert!(String::from_utf8(output.stdout).unwrap().contains("SMB"));
+}
+
+#[test]
+fn sftp_downloads_file_with_known_hosts() {
+    let Some(fixture) = SshdFixture::new() else {
+        return;
+    };
+    let url = fixture.url_for("sftp", &fixture.root.join("data.txt"));
+
+    let mut command = Command::cargo_bin("curl").unwrap();
+    command.args(["-q", "-sS"]);
+    command.args(fixture.auth_args());
+    command.arg(url);
+    command.assert().success().stdout("ssh fixture body\n");
+}
+
+#[test]
+fn scp_downloads_file_with_known_hosts() {
+    let Some(fixture) = SshdFixture::new() else {
+        return;
+    };
+    let url = fixture.url_for("scp", &fixture.root.join("data.txt"));
+
+    let mut command = Command::cargo_bin("curl").unwrap();
+    command.args(["-q", "-sS"]);
+    command.args(fixture.auth_args());
+    command.arg(url);
+    command.assert().success().stdout("ssh fixture body\n");
+}
+
+#[test]
+fn sftp_missing_file_returns_78() {
+    let Some(fixture) = SshdFixture::new() else {
+        return;
+    };
+    let url = fixture.url_for("sftp", &fixture.root.join("missing.txt"));
+
+    let mut command = Command::cargo_bin("curl").unwrap();
+    command.args(["-q", "-sS"]);
+    command.args(fixture.auth_args());
+    command.arg(url);
+    command.assert().failure().code(78).stdout("");
+}
+
+#[test]
+fn sftp_bad_key_returns_login_denied() {
+    let Some(fixture) = SshdFixture::new() else {
+        return;
+    };
+    let url = fixture.url_for("sftp", &fixture.root.join("data.txt"));
+    let bad_public_key = fixture.bad_private_key.with_extension("pub");
+
+    let mut command = Command::cargo_bin("curl").unwrap();
+    command.args([
+        "-q",
+        "-sS",
+        "--knownhosts",
+        fixture.known_hosts.to_str().unwrap(),
+        "--key",
+        fixture.bad_private_key.to_str().unwrap(),
+        "--pubkey",
+        bad_public_key.to_str().unwrap(),
+        "--user",
+        &fixture.user,
+        &url,
+    ]);
+    command.assert().failure().code(67).stdout("");
+}
+
+#[test]
+fn sftp_head_writes_headers_without_body() {
+    let Some(fixture) = SshdFixture::new() else {
+        return;
+    };
+    let url = fixture.url_for("sftp", &fixture.root.join("data.txt"));
+
+    let mut command = Command::cargo_bin("curl").unwrap();
+    command.args(["-q", "-sS", "-I"]);
+    command.args(fixture.auth_args());
+    command.arg(url);
+    let output = command.output().unwrap();
+
+    assert!(output.status.success());
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    assert!(stdout.contains("content-length: 17\r\n"));
+    assert!(!stdout.contains("ssh fixture body"));
+}
+
+#[test]
+fn sftp_list_only_outputs_directory_names() {
+    let Some(fixture) = SshdFixture::new() else {
+        return;
+    };
+    let mut directory = fixture.root.join("dir").to_str().unwrap().to_string();
+    directory.push('/');
+    let url = fixture.url_for("sftp", Path::new(&directory));
+
+    let mut command = Command::cargo_bin("curl").unwrap();
+    command.args(["-q", "-sS", "--list-only"]);
+    command.args(fixture.auth_args());
+    command.arg(url);
+    command.assert().success().stdout("alpha.txt\nbeta.txt\n");
+}
+
+#[test]
+fn version_lists_scp_and_sftp_protocols() {
+    let mut command = Command::cargo_bin("curl").unwrap();
+    let output = command.args(["-q", "-V"]).output().unwrap();
+    let stdout = String::from_utf8(output.stdout).unwrap();
+
+    assert!(output.status.success());
+    assert!(stdout.contains("SCP"));
+    assert!(stdout.contains("SFTP"));
 }
 
 #[test]

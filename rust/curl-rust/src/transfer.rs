@@ -1,9 +1,13 @@
 use std::io::{self, Read};
-use std::path::Path;
+use std::net::{TcpStream as StdTcpStream, ToSocketAddrs};
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use percent_encoding::percent_decode;
+use ssh2::{
+    CheckResult, ErrorCode as SshErrorCode, HashType, KnownHostFileKind, MethodType, Session,
+};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpStream, UdpSocket};
 use tokio::task::JoinSet;
@@ -37,6 +41,7 @@ const RTSP_DEFAULT_PORT: u16 = 554;
 const SMB_DEFAULT_PORT: u16 = 445;
 const WS_DEFAULT_PORT: u16 = 80;
 const LDAP_DEFAULT_PORT: u16 = 389;
+const SSH_DEFAULT_PORT: u16 = 22;
 const MQTT_CLIENT_ID: &[u8; 12] = b"curlrust0000";
 const SMB_COM_CLOSE: u8 = 0x04;
 const SMB_COM_READ_ANDX: u8 = 0x2e;
@@ -348,6 +353,10 @@ async fn run_expanded_url(
         Err(CurlError::Unsupported(
             "smbs:// URLs are not implemented in the Rust sidecar".to_string(),
         ))
+    } else if expanded.url.starts_with("scp://") {
+        run_scp_transfer(transfer, &expanded, &method_label, &mut metrics).await
+    } else if expanded.url.starts_with("sftp://") {
+        run_sftp_transfer(transfer, &expanded, &method_label, &mut metrics).await
     } else if expanded.url.starts_with("smtp://") {
         run_smtp_transfer(transfer, &expanded, &method_label, &mut metrics).await
     } else if expanded.url.starts_with("smtps://") {
@@ -1144,6 +1153,531 @@ fn days_from_civil(year: i32, month: u32, day: u32) -> i64 {
     let doy = (153 * (month + if month > 2 { -3 } else { 9 }) + 2) / 5 + day as i32 - 1;
     let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
     i64::from(era * 146_097 + doe - 719_468)
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum SshProtocol {
+    Scp,
+    Sftp,
+}
+
+struct SshDownload {
+    body: Vec<u8>,
+    headers: reqwest::header::HeaderMap,
+}
+
+async fn run_scp_transfer(
+    transfer: &TransferConfig,
+    expanded: &glob::ExpandedUrl,
+    method: &str,
+    metrics: &mut writeout::Metrics,
+) -> Result<()> {
+    run_ssh_transfer(transfer, expanded, method, metrics, SshProtocol::Scp).await
+}
+
+async fn run_sftp_transfer(
+    transfer: &TransferConfig,
+    expanded: &glob::ExpandedUrl,
+    method: &str,
+    metrics: &mut writeout::Metrics,
+) -> Result<()> {
+    run_ssh_transfer(transfer, expanded, method, metrics, SshProtocol::Sftp).await
+}
+
+async fn run_ssh_transfer(
+    transfer: &TransferConfig,
+    expanded: &glob::ExpandedUrl,
+    method: &str,
+    metrics: &mut writeout::Metrics,
+    protocol: SshProtocol,
+) -> Result<()> {
+    validate_ssh_transfer(transfer, method, protocol)?;
+
+    let url = Url::parse(&expanded.url).map_err(|error| CurlError::Url(error.to_string()))?;
+    output::validate_output_target(transfer, &url)?;
+
+    let transfer_for_task = transfer.clone();
+    let url_for_task = expanded.url.clone();
+    let method_for_task = method.to_string();
+    let task = tokio::task::spawn_blocking(move || {
+        run_ssh_blocking(
+            &transfer_for_task,
+            &url_for_task,
+            &method_for_task,
+            protocol,
+        )
+    });
+    let download = if let Some(timeout) = transfer.max_time {
+        tokio::time::timeout(timeout, task)
+            .await
+            .map_err(|_| CurlError::Timeout)?
+    } else {
+        task.await
+    }
+    .map_err(|error| CurlError::Transfer(format!("SSH transfer task failed: {error}")))??;
+
+    let is_head = method == "HEAD" || transfer.head;
+    let (body_bytes, max_filesize_exceeded) = if is_head {
+        (&[][..], false)
+    } else {
+        limit_body_for_max_filesize(transfer, &download.body)
+    };
+    let header_bytes = if is_head && !download.headers.is_empty() {
+        output::render_file_headers(&download.headers)
+    } else {
+        Vec::new()
+    };
+
+    if let Some(path) = &transfer.dump_header {
+        output::dump_headers(path, &header_bytes, transfer.create_dirs)?;
+    }
+
+    let mut bytes = Vec::new();
+    if is_head {
+        bytes.extend_from_slice(&header_bytes);
+    } else {
+        bytes.extend_from_slice(body_bytes);
+    }
+
+    metrics.url_effective = url.to_string();
+    metrics.size_download = body_bytes.len() as u64;
+    metrics.headers = download.headers.clone();
+
+    let filename = output::write_response(
+        transfer,
+        &url,
+        &download.headers,
+        &expanded.variables,
+        &bytes,
+        false,
+    )?;
+    metrics.filename_effective = filename.map(|path| path.display().to_string());
+    if max_filesize_exceeded {
+        return Err(CurlError::FileSizeExceeded);
+    }
+    Ok(())
+}
+
+fn validate_ssh_transfer(
+    transfer: &TransferConfig,
+    method: &str,
+    protocol: SshProtocol,
+) -> Result<()> {
+    let scheme = match protocol {
+        SshProtocol::Scp => "scp://",
+        SshProtocol::Sftp => "sftp://",
+    };
+    if transfer.method.is_some() {
+        return Err(CurlError::Unsupported(format!(
+            "custom requests for {scheme} URLs"
+        )));
+    }
+    if method != "GET" && method != "HEAD" {
+        return Err(CurlError::Unsupported(format!(
+            "{method} requests for {scheme} URLs"
+        )));
+    }
+    if !transfer.data.is_empty() || !transfer.url_query.is_empty() || !transfer.forms.is_empty() {
+        return Err(CurlError::Unsupported(format!(
+            "data/form/query request bodies for {scheme} URLs"
+        )));
+    }
+    reject_upload_file_for_scheme(transfer, scheme)?;
+    if transfer.oauth2_bearer.is_some() {
+        return Err(CurlError::Unsupported(format!(
+            "--oauth2-bearer for {scheme} URLs"
+        )));
+    }
+    if transfer.range.is_some() || transfer.continue_at.is_some() {
+        return Err(CurlError::Unsupported(format!(
+            "range/resume for {scheme} URLs"
+        )));
+    }
+    if transfer.proxy.is_some() {
+        return Err(CurlError::Unsupported(format!(
+            "proxying for {scheme} URLs"
+        )));
+    }
+    Ok(())
+}
+
+fn run_ssh_blocking(
+    transfer: &TransferConfig,
+    url: &str,
+    method: &str,
+    protocol: SshProtocol,
+) -> Result<SshDownload> {
+    let url = Url::parse(url).map_err(|error| CurlError::Url(error.to_string()))?;
+    let path = ssh_url_path(&url, protocol)?;
+    let session = ssh_connect(transfer, &url)?;
+
+    match protocol {
+        SshProtocol::Scp => ssh_scp_download(&session, &path, method),
+        SshProtocol::Sftp => ssh_sftp_download(transfer, &session, &path, method),
+    }
+}
+
+fn ssh_scp_download(session: &Session, path: &str, method: &str) -> Result<SshDownload> {
+    let (mut channel, stat) = session
+        .scp_recv(Path::new(path))
+        .map_err(ssh_error_to_curl)?;
+    if stat.is_dir() {
+        return Err(CurlError::RemoteAccessDenied);
+    }
+
+    let headers = output::file_headers(stat.size(), None);
+    let mut body = Vec::new();
+    if method != "HEAD" {
+        channel
+            .read_to_end(&mut body)
+            .map_err(|error| CurlError::Transfer(error.to_string()))?;
+    }
+    Ok(SshDownload { body, headers })
+}
+
+fn ssh_sftp_download(
+    transfer: &TransferConfig,
+    session: &Session,
+    path: &str,
+    method: &str,
+) -> Result<SshDownload> {
+    let sftp = session.sftp().map_err(ssh_error_to_curl)?;
+    if path.ends_with('/') {
+        let entries = sftp.readdir(Path::new(path)).map_err(ssh_error_to_curl)?;
+        let body = if method == "HEAD" {
+            Vec::new()
+        } else {
+            sftp_directory_listing(entries, transfer.list_only)
+        };
+        return Ok(SshDownload {
+            body,
+            headers: reqwest::header::HeaderMap::new(),
+        });
+    }
+
+    let stat = sftp.stat(Path::new(path)).map_err(ssh_error_to_curl)?;
+    let headers = sftp_file_headers(&stat);
+    let mut body = Vec::new();
+    if method != "HEAD" {
+        let mut file = sftp.open(Path::new(path)).map_err(ssh_error_to_curl)?;
+        file.read_to_end(&mut body)
+            .map_err(|error| CurlError::Transfer(error.to_string()))?;
+    }
+    Ok(SshDownload { body, headers })
+}
+
+fn ssh_connect(transfer: &TransferConfig, url: &Url) -> Result<Session> {
+    let host = url
+        .host_str()
+        .ok_or_else(|| CurlError::Url("SSH URL is missing a host".to_string()))?;
+    let port = url.port().unwrap_or(SSH_DEFAULT_PORT);
+    let stream = ssh_tcp_connect(host, port, transfer)?;
+    let mut session = Session::new().map_err(ssh_error_to_curl)?;
+
+    if transfer.compressed_ssh {
+        session
+            .method_pref(MethodType::CompCs, "zlib@openssh.com,zlib,none")
+            .map_err(ssh_error_to_curl)?;
+        session
+            .method_pref(MethodType::CompSc, "zlib@openssh.com,zlib,none")
+            .map_err(ssh_error_to_curl)?;
+    }
+    if let Some(timeout) = ssh_timeout_ms(transfer) {
+        session.set_timeout(timeout);
+    }
+
+    session.set_tcp_stream(stream);
+    session.handshake().map_err(ssh_error_to_curl)?;
+    verify_ssh_host_key(transfer, &session, host, port)?;
+    ssh_authenticate(transfer, &session, url)?;
+    Ok(session)
+}
+
+fn ssh_tcp_connect(host: &str, port: u16, transfer: &TransferConfig) -> Result<StdTcpStream> {
+    let addresses = (host, port)
+        .to_socket_addrs()
+        .map_err(|error| CurlError::Transfer(error.to_string()))?;
+    let mut last_error = None;
+    for address in addresses {
+        let stream = if let Some(timeout) = transfer.connect_timeout {
+            StdTcpStream::connect_timeout(&address, timeout)
+        } else {
+            StdTcpStream::connect(address)
+        };
+        match stream {
+            Ok(stream) => {
+                if let Some(timeout) = transfer.max_time {
+                    let _ = stream.set_read_timeout(Some(timeout));
+                    let _ = stream.set_write_timeout(Some(timeout));
+                }
+                return Ok(stream);
+            }
+            Err(error) => last_error = Some(error),
+        }
+    }
+    Err(CurlError::Transfer(
+        last_error
+            .map(|error| error.to_string())
+            .unwrap_or_else(|| "could not resolve SSH host".to_string()),
+    ))
+}
+
+fn verify_ssh_host_key(
+    transfer: &TransferConfig,
+    session: &Session,
+    host: &str,
+    port: u16,
+) -> Result<()> {
+    if transfer.insecure {
+        return Ok(());
+    }
+
+    let mut checked_hostpub = false;
+    if let Some(expected) = &transfer.ssh_hostpubmd5 {
+        checked_hostpub = true;
+        let actual = session
+            .host_key_hash(HashType::Md5)
+            .ok_or(CurlError::PeerVerificationFailed)?;
+        if normalize_md5(expected) != hex_lower(actual) {
+            return Err(CurlError::PeerVerificationFailed);
+        }
+    }
+    if let Some(expected) = &transfer.ssh_hostpubsha256 {
+        checked_hostpub = true;
+        let actual = session
+            .host_key_hash(HashType::Sha256)
+            .ok_or(CurlError::PeerVerificationFailed)?;
+        if normalize_sha256(expected) != base64_no_padding(actual) {
+            return Err(CurlError::PeerVerificationFailed);
+        }
+    }
+    if checked_hostpub {
+        return Ok(());
+    }
+
+    let (key, _) = session
+        .host_key()
+        .ok_or(CurlError::PeerVerificationFailed)?;
+    let mut known_hosts = session.known_hosts().map_err(ssh_error_to_curl)?;
+    let known_hosts_file = ssh_known_hosts_file(transfer)?;
+    known_hosts
+        .read_file(&known_hosts_file, KnownHostFileKind::OpenSSH)
+        .map_err(|_| CurlError::PeerVerificationFailed)?;
+    match known_hosts.check_port(host, port, key) {
+        CheckResult::Match => Ok(()),
+        CheckResult::Mismatch | CheckResult::NotFound | CheckResult::Failure => {
+            Err(CurlError::PeerVerificationFailed)
+        }
+    }
+}
+
+fn ssh_authenticate(transfer: &TransferConfig, session: &Session, url: &Url) -> Result<()> {
+    let credentials = ssh_credentials(transfer, url)?;
+    if let Some(private_key) = &transfer.ssh_private_key {
+        let passphrase =
+            (!credentials.password.is_empty()).then_some(credentials.password.as_str());
+        session
+            .userauth_pubkey_file(
+                &credentials.username,
+                transfer.ssh_public_key.as_deref(),
+                private_key,
+                passphrase,
+            )
+            .map_err(|_| CurlError::LoginDenied)?;
+    } else if credentials.has_password {
+        session
+            .userauth_password(&credentials.username, &credentials.password)
+            .map_err(|_| CurlError::LoginDenied)?;
+    } else {
+        session
+            .userauth_agent(&credentials.username)
+            .map_err(|_| CurlError::LoginDenied)?;
+    }
+
+    if session.authenticated() {
+        Ok(())
+    } else {
+        Err(CurlError::LoginDenied)
+    }
+}
+
+struct SshCredentials {
+    username: String,
+    password: String,
+    has_password: bool,
+}
+
+fn ssh_credentials(transfer: &TransferConfig, url: &Url) -> Result<SshCredentials> {
+    if let Some(user) = &transfer.user {
+        let (username, password) = split_user_password(user);
+        if has_control_byte(username.as_bytes()) || has_control_byte(password.as_bytes()) {
+            return Err(CurlError::Url(
+                "SSH credentials contain a decoded control byte".to_string(),
+            ));
+        }
+        return Ok(SshCredentials {
+            username: username.to_string(),
+            password: password.to_string(),
+            has_password: true,
+        });
+    }
+
+    let url_has_user = !url.username().is_empty();
+    let url_has_password = url.password().is_some();
+    let username = if url_has_user {
+        percent_decode(url.username().as_bytes()).collect::<Vec<_>>()
+    } else {
+        ssh_default_username().into_bytes()
+    };
+    let password = url
+        .password()
+        .map(|password| percent_decode(password.as_bytes()).collect::<Vec<_>>())
+        .unwrap_or_default();
+    if has_control_byte(&username) || has_control_byte(&password) {
+        return Err(CurlError::Url(
+            "SSH credentials contain a decoded control byte".to_string(),
+        ));
+    }
+
+    Ok(SshCredentials {
+        username: String::from_utf8(username)
+            .map_err(|_| CurlError::Url("SSH username is not valid UTF-8".to_string()))?,
+        password: String::from_utf8(password)
+            .map_err(|_| CurlError::Url("SSH password is not valid UTF-8".to_string()))?,
+        has_password: url_has_password,
+    })
+}
+
+fn ssh_default_username() -> String {
+    std::env::var("USER")
+        .or_else(|_| std::env::var("LOGNAME"))
+        .unwrap_or_else(|_| "anonymous".to_string())
+}
+
+fn ssh_known_hosts_file(transfer: &TransferConfig) -> Result<PathBuf> {
+    if let Some(path) = &transfer.ssh_known_hosts {
+        return Ok(path.clone());
+    }
+    let home = std::env::var_os("HOME")
+        .map(PathBuf::from)
+        .ok_or(CurlError::PeerVerificationFailed)?;
+    for filename in ["known_hosts", "known_hosts2"] {
+        let path = home.join(".ssh").join(filename);
+        if path.is_file() {
+            return Ok(path);
+        }
+    }
+    Err(CurlError::PeerVerificationFailed)
+}
+
+fn ssh_timeout_ms(transfer: &TransferConfig) -> Option<u32> {
+    transfer.max_time.map(|timeout| {
+        u32::try_from(timeout.as_millis())
+            .unwrap_or(u32::MAX)
+            .max(1)
+    })
+}
+
+fn ssh_url_path(url: &Url, protocol: SshProtocol) -> Result<String> {
+    let decoded = percent_decode(url.path().as_bytes()).collect::<Vec<_>>();
+    if has_control_byte(&decoded) {
+        return Err(CurlError::Url(
+            "SSH path contains a decoded control byte".to_string(),
+        ));
+    }
+    let mut path = String::from_utf8(decoded)
+        .map_err(|_| CurlError::Url("SSH path is not valid UTF-8".to_string()))?;
+    if path.is_empty() {
+        path = ".".to_string();
+    }
+    if protocol == SshProtocol::Scp {
+        if path == "/~" {
+            path = ".".to_string();
+        } else if let Some(stripped) = path.strip_prefix("/~/") {
+            path = stripped.to_string();
+        }
+    }
+    Ok(path)
+}
+
+fn sftp_file_headers(stat: &ssh2::FileStat) -> reqwest::header::HeaderMap {
+    let size = stat.size.unwrap_or(0);
+    let modified = stat
+        .mtime
+        .map(|mtime| UNIX_EPOCH + Duration::from_secs(mtime));
+    output::file_headers(size, modified)
+}
+
+fn sftp_directory_listing(mut entries: Vec<(PathBuf, ssh2::FileStat)>, list_only: bool) -> Vec<u8> {
+    entries.sort_by(|(left, _), (right, _)| left.cmp(right));
+    let mut body = Vec::new();
+    for (path, stat) in entries {
+        let name = path
+            .file_name()
+            .map(|name| name.to_string_lossy())
+            .unwrap_or_else(|| path.to_string_lossy());
+        if list_only {
+            body.extend_from_slice(name.as_bytes());
+            body.push(b'\n');
+        } else {
+            body.extend_from_slice(format!("{:>12} {name}\n", stat.size.unwrap_or(0)).as_bytes());
+        }
+    }
+    body
+}
+
+fn normalize_md5(value: &str) -> String {
+    value
+        .chars()
+        .filter(|ch| *ch != ':')
+        .flat_map(char::to_lowercase)
+        .collect()
+}
+
+fn normalize_sha256(value: &str) -> String {
+    value
+        .strip_prefix("SHA256:")
+        .or_else(|| value.strip_prefix("sha256//"))
+        .unwrap_or(value)
+        .trim_end_matches('=')
+        .to_string()
+}
+
+fn hex_lower(bytes: &[u8]) -> String {
+    let mut output = String::with_capacity(bytes.len() * 2);
+    for byte in bytes {
+        output.push_str(&format!("{byte:02x}"));
+    }
+    output
+}
+
+fn base64_no_padding(bytes: &[u8]) -> String {
+    const ALPHABET: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut output = String::new();
+    for chunk in bytes.chunks(3) {
+        let b0 = chunk[0];
+        let b1 = chunk.get(1).copied().unwrap_or(0);
+        let b2 = chunk.get(2).copied().unwrap_or(0);
+        output.push(ALPHABET[(b0 >> 2) as usize] as char);
+        output.push(ALPHABET[(((b0 & 0x03) << 4) | (b1 >> 4)) as usize] as char);
+        if chunk.len() > 1 {
+            output.push(ALPHABET[(((b1 & 0x0f) << 2) | (b2 >> 6)) as usize] as char);
+        }
+        if chunk.len() > 2 {
+            output.push(ALPHABET[(b2 & 0x3f) as usize] as char);
+        }
+    }
+    output
+}
+
+fn ssh_error_to_curl(error: ssh2::Error) -> CurlError {
+    match error.code() {
+        SshErrorCode::SFTP(2 | 10) | SshErrorCode::Session(-28) => CurlError::RemoteFileNotFound,
+        SshErrorCode::SFTP(3) => CurlError::RemoteAccessDenied,
+        SshErrorCode::Session(-18 | -48) => CurlError::LoginDenied,
+        SshErrorCode::Session(-9) => CurlError::Timeout,
+        _ => CurlError::Transfer(error.to_string()),
+    }
 }
 
 async fn run_pop3_transfer(
