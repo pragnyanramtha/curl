@@ -191,6 +191,109 @@ fn spawn_pop3_login_denied_server(path: &str) -> (String, Receiver<Vec<u8>>) {
     (format!("pop3://{addr}{path}"), rx)
 }
 
+fn spawn_imap_server(
+    path: &str,
+    command_responses: Vec<(&'static str, &'static [u8])>,
+) -> (String, Receiver<Vec<u8>>) {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = listener.local_addr().unwrap();
+    let (tx, rx) = mpsc::channel();
+    let url = format!("imap://{addr}{path}");
+
+    thread::spawn(move || {
+        let (mut stream, _) = listener.accept().unwrap();
+        stream
+            .write_all(b"* OK curl IMAP test server ready\r\n")
+            .unwrap();
+        let mut commands = Vec::new();
+        while let Some(line) = read_pop3_client_line(&mut stream) {
+            commands.extend_from_slice(&line);
+            let text = String::from_utf8_lossy(&line);
+            let text = text.trim_end_matches(['\r', '\n']);
+            let Some((tag, command)) = text.split_once(' ') else {
+                continue;
+            };
+
+            if let Some((_, response)) = command_responses
+                .iter()
+                .find(|(expected, _)| *expected == command)
+            {
+                write_imap_response(&mut stream, tag, response);
+            } else if command == "CAPABILITY" {
+                write_imap_response(
+                    &mut stream,
+                    tag,
+                    b"* CAPABILITY IMAP4rev1\r\n{tag} OK CAPABILITY completed\r\n",
+                );
+            } else if command.starts_with("LOGIN ") {
+                write_imap_response(&mut stream, tag, b"{tag} OK LOGIN completed\r\n");
+            } else if command.starts_with("SELECT ") {
+                write_imap_response(
+                    &mut stream,
+                    tag,
+                    b"* OK [UIDVALIDITY 3857529045] UIDs valid\r\n{tag} OK [READ-WRITE] SELECT completed\r\n",
+                );
+            } else if command == "LOGOUT" {
+                write_imap_response(
+                    &mut stream,
+                    tag,
+                    b"* BYE logging out\r\n{tag} OK LOGOUT completed\r\n",
+                );
+                break;
+            } else {
+                write_imap_response(&mut stream, tag, b"{tag} OK completed\r\n");
+            }
+        }
+
+        tx.send(commands).unwrap();
+    });
+
+    (url, rx)
+}
+
+fn spawn_imap_login_denied_server(path: &str) -> (String, Receiver<Vec<u8>>) {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = listener.local_addr().unwrap();
+    let (tx, rx) = mpsc::channel();
+    let url = format!("imap://{addr}{path}");
+
+    thread::spawn(move || {
+        let (mut stream, _) = listener.accept().unwrap();
+        stream
+            .write_all(b"* OK curl IMAP test server ready\r\n")
+            .unwrap();
+        let mut commands = Vec::new();
+        while let Some(line) = read_pop3_client_line(&mut stream) {
+            commands.extend_from_slice(&line);
+            let text = String::from_utf8_lossy(&line);
+            let text = text.trim_end_matches(['\r', '\n']);
+            let Some((tag, command)) = text.split_once(' ') else {
+                continue;
+            };
+            if command == "CAPABILITY" {
+                write_imap_response(
+                    &mut stream,
+                    tag,
+                    b"* CAPABILITY IMAP4rev1\r\n{tag} OK CAPABILITY completed\r\n",
+                );
+            } else if command.starts_with("LOGIN ") {
+                write_imap_response(&mut stream, tag, b"{tag} NO LOGIN failed\r\n");
+                break;
+            }
+        }
+
+        tx.send(commands).unwrap();
+    });
+
+    (url, rx)
+}
+
+fn write_imap_response(stream: &mut impl Write, tag: &str, template: &'static [u8]) {
+    let text = String::from_utf8_lossy(template);
+    let text = text.replace("{tag}", tag);
+    stream.write_all(text.as_bytes()).unwrap();
+}
+
 fn read_pop3_client_line(stream: &mut impl Read) -> Option<Vec<u8>> {
     let mut line = Vec::new();
     let mut byte = [0; 1];
@@ -1489,6 +1592,231 @@ fn version_lists_pop3_protocol() {
 
     assert!(output.status.success());
     assert!(String::from_utf8(output.stdout).unwrap().contains("POP3"));
+}
+
+#[test]
+fn imap_fetch_mailindex_outputs_literal_and_quotes_login_atoms() {
+    let (url, rx) = spawn_imap_server(
+        "/inbox/;MAILINDEX=1",
+        vec![(
+            "FETCH 1 BODY[]",
+            b"* 1 FETCH (BODY[] {7}\r\nhello\r\n{tag} OK FETCH completed\r\n",
+        )],
+    );
+
+    let mut command = Command::cargo_bin("curl").unwrap();
+    command.args(["-q", "-sS", "-u", "\"user:sec\"ret{", &url]);
+    command.assert().success().stdout("hello\r\n");
+
+    assert_eq!(
+        rx.recv().unwrap(),
+        b"A001 CAPABILITY\r\nA002 LOGIN \"\\\"user\" \"sec\\\"ret{\"\r\nA003 SELECT inbox\r\nA004 FETCH 1 BODY[]\r\nA005 LOGOUT\r\n"
+    );
+}
+
+#[test]
+fn imap_uses_url_userinfo_and_uid_section_fetch() {
+    let (url, rx) = spawn_imap_server(
+        "/mailbox/;UID=42/;SECTION=TEXT",
+        vec![(
+            "UID FETCH 42 BODY[TEXT]",
+            b"* 42 FETCH (BODY[TEXT] {4}\r\nbody{tag} OK FETCH completed\r\n",
+        )],
+    );
+    let url = url.replacen("imap://", "imap://alice:secret@", 1);
+
+    let mut command = Command::cargo_bin("curl").unwrap();
+    command.args(["-q", "-sS", &url]);
+    command.assert().success().stdout("body");
+
+    assert_eq!(
+        rx.recv().unwrap(),
+        b"A001 CAPABILITY\r\nA002 LOGIN alice secret\r\nA003 SELECT mailbox\r\nA004 UID FETCH 42 BODY[TEXT]\r\nA005 LOGOUT\r\n"
+    );
+}
+
+#[test]
+fn imap_lists_mailbox_without_select() {
+    let (url, rx) = spawn_imap_server(
+        "/mailbox",
+        vec![(
+            "LIST \"mailbox\" *",
+            b"* LIST () \"/\" /mailbox/one\r\n* LIST (\\Noselect) \"/\" /mailbox/two\r\n{tag} OK LIST completed\r\n",
+        )],
+    );
+
+    let mut command = Command::cargo_bin("curl").unwrap();
+    command.args(["-q", "-sS", "-u", "user:secret", &url]);
+    command
+        .assert()
+        .success()
+        .stdout("* LIST () \"/\" /mailbox/one\r\n* LIST (\\Noselect) \"/\" /mailbox/two\r\n");
+
+    assert_eq!(
+        rx.recv().unwrap(),
+        b"A001 CAPABILITY\r\nA002 LOGIN user secret\r\nA003 LIST \"mailbox\" *\r\nA004 LOGOUT\r\n"
+    );
+}
+
+#[test]
+fn imap_search_uses_url_query_after_select() {
+    let (url, rx) = spawn_imap_server(
+        "/mailbox?NEW",
+        vec![(
+            "SEARCH NEW",
+            b"* SEARCH 1 123 456\r\n{tag} OK SEARCH completed\r\n",
+        )],
+    );
+
+    let mut command = Command::cargo_bin("curl").unwrap();
+    command.args(["-q", "-sS", "-u", "user:secret", &url]);
+    command.assert().success().stdout("* SEARCH 1 123 456\r\n");
+
+    assert_eq!(
+        rx.recv().unwrap(),
+        b"A001 CAPABILITY\r\nA002 LOGIN user secret\r\nA003 SELECT mailbox\r\nA004 SEARCH NEW\r\nA005 LOGOUT\r\n"
+    );
+}
+
+#[test]
+fn imap_custom_noop_without_mailbox_outputs_untagged_lines() {
+    let (url, rx) = spawn_imap_server(
+        "/",
+        vec![(
+            "NOOP",
+            b"* 22 EXPUNGE\r\n* 23 EXISTS\r\n{tag} OK NOOP completed\r\n",
+        )],
+    );
+
+    let mut command = Command::cargo_bin("curl").unwrap();
+    command.args(["-q", "-sS", "-u", "user:secret", "-X", "NOOP", &url]);
+    command
+        .assert()
+        .success()
+        .stdout("* 22 EXPUNGE\r\n* 23 EXISTS\r\n");
+
+    assert_eq!(
+        rx.recv().unwrap(),
+        b"A001 CAPABILITY\r\nA002 LOGIN user secret\r\nA003 NOOP\r\nA004 LOGOUT\r\n"
+    );
+}
+
+#[test]
+fn imap_without_credentials_skips_login() {
+    let (url, rx) = spawn_imap_server(
+        "/mailbox",
+        vec![(
+            "LIST \"mailbox\" *",
+            b"* LIST () \"/\" /mailbox/one\r\n{tag} OK LIST completed\r\n",
+        )],
+    );
+
+    let mut command = Command::cargo_bin("curl").unwrap();
+    command.args(["-q", "-sS", &url]);
+    command
+        .assert()
+        .success()
+        .stdout("* LIST () \"/\" /mailbox/one\r\n");
+
+    assert_eq!(
+        rx.recv().unwrap(),
+        b"A001 CAPABILITY\r\nA002 LIST \"mailbox\" *\r\nA003 LOGOUT\r\n"
+    );
+}
+
+#[test]
+fn imap_custom_fetch_outputs_envelope_and_literal() {
+    let (url, rx) = spawn_imap_server(
+        "/mailbox",
+        vec![(
+            "UID FETCH 1 BODY[]",
+            b"* 1 FETCH (BODY[] {4}\r\nbody{tag} OK FETCH completed\r\n",
+        )],
+    );
+
+    let mut command = Command::cargo_bin("curl").unwrap();
+    command.args([
+        "-q",
+        "-sS",
+        "-u",
+        "user:secret",
+        "-X",
+        "UID FETCH 1 BODY[]",
+        &url,
+    ]);
+    command
+        .assert()
+        .success()
+        .stdout("* 1 FETCH (BODY[] {4}\r\nbody");
+
+    assert_eq!(
+        rx.recv().unwrap(),
+        b"A001 CAPABILITY\r\nA002 LOGIN user secret\r\nA003 SELECT mailbox\r\nA004 UID FETCH 1 BODY[]\r\nA005 LOGOUT\r\n"
+    );
+}
+
+#[test]
+fn imap_custom_command_failure_exits_quote_error() {
+    let (url, rx) = spawn_imap_server("/", vec![("NOOP", b"{tag} NO command rejected\r\n")]);
+
+    let mut command = Command::cargo_bin("curl").unwrap();
+    command.args(["-q", "-sS", "-u", "user:secret", "-X", "NOOP", &url]);
+    command.assert().failure().code(21).stdout("");
+
+    assert_eq!(
+        rx.recv().unwrap(),
+        b"A001 CAPABILITY\r\nA002 LOGIN user secret\r\nA003 NOOP\r\nA004 LOGOUT\r\n"
+    );
+}
+
+#[test]
+fn imap_uidvalidity_mismatch_exits_remote_file_not_found() {
+    let (url, rx) = spawn_imap_server(
+        "/mailbox;UIDVALIDITY=123/;MAILINDEX=1",
+        vec![(
+            "SELECT mailbox",
+            b"* OK [UIDVALIDITY 456] UIDs valid\r\n{tag} OK SELECT completed\r\n",
+        )],
+    );
+
+    let mut command = Command::cargo_bin("curl").unwrap();
+    command.args(["-q", "-sS", "-u", "user:secret", &url]);
+    command.assert().failure().code(78).stdout("");
+
+    assert_eq!(
+        rx.recv().unwrap(),
+        b"A001 CAPABILITY\r\nA002 LOGIN user secret\r\nA003 SELECT mailbox\r\nA004 LOGOUT\r\n"
+    );
+}
+
+#[test]
+fn imap_login_failure_returns_login_denied() {
+    let (url, rx) = spawn_imap_login_denied_server("/mailbox/;MAILINDEX=1");
+
+    let mut command = Command::cargo_bin("curl").unwrap();
+    command.args(["-q", "-sS", "-u", "user:wrong", &url]);
+    command.assert().failure().code(67).stdout("");
+
+    assert_eq!(
+        rx.recv().unwrap(),
+        b"A001 CAPABILITY\r\nA002 LOGIN user wrong\r\n"
+    );
+}
+
+#[test]
+fn imap_rejects_decoded_control_path() {
+    let mut command = Command::cargo_bin("curl").unwrap();
+    command.args(["-q", "-sS", "imap://example.invalid/%0d%0a/mailbox"]);
+    command.assert().failure().code(3).stdout("");
+}
+
+#[test]
+fn version_lists_imap_protocol() {
+    let mut command = Command::cargo_bin("curl").unwrap();
+    let output = command.args(["-q", "-V"]).output().unwrap();
+
+    assert!(output.status.success());
+    assert!(String::from_utf8(output.stdout).unwrap().contains("IMAP"));
 }
 
 #[test]

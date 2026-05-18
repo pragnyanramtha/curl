@@ -30,6 +30,7 @@ const TELNET_SB: u8 = 250;
 const TELNET_SE: u8 = 240;
 const TFTP_DEFAULT_BLKSIZE: u16 = 512;
 const TFTP_MAX_PACKET_SIZE: usize = 65_468;
+const IMAP_DEFAULT_PORT: u16 = 143;
 const MQTT_DEFAULT_PORT: u16 = 1883;
 const RTSP_DEFAULT_PORT: u16 = 554;
 const MQTT_CLIENT_ID: &[u8; 12] = b"curlrust0000";
@@ -294,6 +295,12 @@ async fn run_expanded_url(
     } else if expanded.url.starts_with("pop3s://") {
         Err(CurlError::Unsupported(
             "pop3s:// URLs are not implemented in the Rust sidecar".to_string(),
+        ))
+    } else if expanded.url.starts_with("imap://") {
+        run_imap_transfer(transfer, &expanded, &method_label, &mut metrics).await
+    } else if expanded.url.starts_with("imaps://") {
+        Err(CurlError::Unsupported(
+            "imaps:// URLs are not implemented in the Rust sidecar".to_string(),
         ))
     } else if expanded.url.starts_with("smtp://") {
         run_smtp_transfer(transfer, &expanded, &method_label, &mut metrics).await
@@ -1645,6 +1652,661 @@ fn pop3_expect_ok(line: Vec<u8>, login: bool) -> Result<()> {
     } else {
         Err(CurlError::WeirdServerReply)
     }
+}
+
+async fn run_imap_transfer(
+    transfer: &TransferConfig,
+    expanded: &glob::ExpandedUrl,
+    method: &str,
+    metrics: &mut writeout::Metrics,
+) -> Result<()> {
+    if transfer.method.is_none() && method != "GET" && method != "HEAD" {
+        return Err(CurlError::Unsupported(format!(
+            "{method} requests for imap:// URLs"
+        )));
+    }
+    if !transfer.data.is_empty() || !transfer.forms.is_empty() {
+        return Err(CurlError::Unsupported(
+            "data/form request bodies for imap:// URLs".to_string(),
+        ));
+    }
+    reject_upload_file_for_scheme(transfer, "imap://")?;
+    if !transfer.url_query.is_empty() {
+        return Err(CurlError::Unsupported(
+            "--url-query for imap:// URLs".to_string(),
+        ));
+    }
+    if transfer.oauth2_bearer.is_some() {
+        return Err(CurlError::Unsupported(
+            "--oauth2-bearer for imap:// URLs".to_string(),
+        ));
+    }
+
+    if let Some(timeout) = transfer.max_time {
+        tokio::time::timeout(
+            timeout,
+            run_imap_exchange(transfer, expanded, method, metrics),
+        )
+        .await
+        .map_err(|_| CurlError::Timeout)?
+    } else {
+        run_imap_exchange(transfer, expanded, method, metrics).await
+    }
+}
+
+async fn run_imap_exchange(
+    transfer: &TransferConfig,
+    expanded: &glob::ExpandedUrl,
+    method: &str,
+    metrics: &mut writeout::Metrics,
+) -> Result<()> {
+    let url = Url::parse(&expanded.url).map_err(|error| CurlError::Url(error.to_string()))?;
+    output::validate_output_target(transfer, &url)?;
+    let host = url
+        .host_str()
+        .ok_or_else(|| CurlError::Url("IMAP URL is missing a host".to_string()))?;
+    let port = url.port().unwrap_or(IMAP_DEFAULT_PORT);
+    let request = imap_request(transfer, &url)?;
+    let credentials = imap_credentials(transfer, &url)?;
+
+    let mut stream = connect_tcp(host, port, transfer).await?;
+    let preauth = imap_read_greeting(&mut stream).await?;
+    let mut tag_id = 0_u16;
+
+    let tag = imap_next_tag(&mut tag_id);
+    imap_send_command(&mut stream, &tag, b"CAPABILITY").await?;
+    let _ = imap_read_response(&mut stream, &tag, ImapReadMode::Quiet).await?;
+
+    if let (false, Some((user, password))) = (preauth, credentials) {
+        let tag = imap_next_tag(&mut tag_id);
+        let mut login = Vec::from(&b"LOGIN "[..]);
+        login.extend_from_slice(&imap_atom(&user, false));
+        login.push(b' ');
+        login.extend_from_slice(&imap_atom(&password, false));
+        imap_send_command(&mut stream, &tag, &login).await?;
+        let response = imap_read_response(&mut stream, &tag, ImapReadMode::Quiet).await?;
+        if response.status != ImapStatus::Ok {
+            return Err(CurlError::LoginDenied);
+        }
+    }
+
+    let body = imap_run_selected_command(&mut stream, &mut tag_id, &request).await;
+    let _ = imap_logout(&mut stream, &mut tag_id).await;
+    let mut body = body?;
+
+    metrics.url_effective = url.to_string();
+    metrics.method = imap_method_label(&request);
+    if transfer.head || method == "HEAD" {
+        body.clear();
+    }
+    let (body_bytes, max_filesize_exceeded) = if transfer.head || method == "HEAD" {
+        (&body[..], false)
+    } else {
+        limit_body_for_max_filesize(transfer, &body)
+    };
+    metrics.size_download = body_bytes.len() as u64;
+
+    if let Some(path) = &transfer.dump_header {
+        output::dump_headers(path, &[], transfer.create_dirs)?;
+    }
+
+    let filename = output::write_response(
+        transfer,
+        &url,
+        &reqwest::header::HeaderMap::new(),
+        &expanded.variables,
+        body_bytes,
+        false,
+    )?;
+    metrics.filename_effective = filename.map(|path| path.display().to_string());
+    if max_filesize_exceeded {
+        return Err(CurlError::FileSizeExceeded);
+    }
+    Ok(())
+}
+
+struct ImapRequest {
+    mailbox: Option<Vec<u8>>,
+    uidvalidity: Option<u32>,
+    uid: Option<Vec<u8>>,
+    mail_index: Option<Vec<u8>>,
+    section: Option<Vec<u8>>,
+    partial: Option<Vec<u8>>,
+    query: Option<Vec<u8>>,
+    custom: Option<Vec<u8>>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ImapStatus {
+    Ok,
+    Preauth,
+    No,
+    Bad,
+    Other,
+}
+
+enum ImapReadMode {
+    Quiet,
+    Lines,
+    FetchBody,
+}
+
+struct ImapResponse {
+    status: ImapStatus,
+    output: Vec<u8>,
+    uidvalidity: Option<u32>,
+    saw_untagged: bool,
+    saw_literal: bool,
+}
+
+async fn imap_run_selected_command(
+    stream: &mut TcpStream,
+    tag_id: &mut u16,
+    request: &ImapRequest,
+) -> Result<Vec<u8>> {
+    if request.mailbox.is_some()
+        && (request.custom.is_some()
+            || request.uid.is_some()
+            || request.mail_index.is_some()
+            || request.query.is_some())
+    {
+        let tag = imap_next_tag(tag_id);
+        let mailbox = imap_atom(request.mailbox.as_deref().unwrap_or_default(), false);
+        let mut select = Vec::from(&b"SELECT "[..]);
+        select.extend_from_slice(&mailbox);
+        imap_send_command(stream, &tag, &select).await?;
+        let response = imap_read_response(stream, &tag, ImapReadMode::Quiet).await?;
+        if response.status != ImapStatus::Ok {
+            return Err(CurlError::LoginDenied);
+        }
+        if let (Some(expected), Some(actual)) = (request.uidvalidity, response.uidvalidity)
+            && expected != actual
+        {
+            return Err(CurlError::RemoteFileNotFound);
+        }
+    }
+
+    if let Some(custom) = &request.custom {
+        let mode = if imap_custom_fetch_listing(custom) {
+            ImapReadMode::Quiet
+        } else {
+            ImapReadMode::Lines
+        };
+        return imap_send_body_command(stream, tag_id, custom, mode).await;
+    }
+
+    if request.uid.is_some() || request.mail_index.is_some() {
+        let command = imap_fetch_command(request)?;
+        let response =
+            imap_send_response_command(stream, tag_id, &command, ImapReadMode::FetchBody).await?;
+        if response.status != ImapStatus::Ok {
+            return Err(CurlError::RemoteFileNotFound);
+        }
+        if !response.saw_literal {
+            return if response.saw_untagged {
+                Err(CurlError::WeirdServerReply)
+            } else {
+                Err(CurlError::RemoteFileNotFound)
+            };
+        }
+        return Ok(response.output);
+    }
+
+    if let Some(query) = &request.query {
+        let mut command = Vec::from(&b"SEARCH "[..]);
+        command.extend_from_slice(query);
+        return imap_send_body_command(stream, tag_id, &command, ImapReadMode::Lines).await;
+    }
+
+    let mailbox = request.mailbox.as_deref().unwrap_or_default();
+    let mut command = Vec::from(&b"LIST \""[..]);
+    command.extend_from_slice(&imap_atom(mailbox, true));
+    command.extend_from_slice(b"\" *");
+    imap_send_body_command(stream, tag_id, &command, ImapReadMode::Lines).await
+}
+
+async fn imap_send_body_command(
+    stream: &mut TcpStream,
+    tag_id: &mut u16,
+    command: &[u8],
+    mode: ImapReadMode,
+) -> Result<Vec<u8>> {
+    let response = imap_send_response_command(stream, tag_id, command, mode).await?;
+    if response.status == ImapStatus::Ok {
+        Ok(response.output)
+    } else {
+        Err(CurlError::QuoteError)
+    }
+}
+
+async fn imap_send_response_command(
+    stream: &mut TcpStream,
+    tag_id: &mut u16,
+    command: &[u8],
+    mode: ImapReadMode,
+) -> Result<ImapResponse> {
+    let tag = imap_next_tag(tag_id);
+    imap_send_command(stream, &tag, command).await?;
+    imap_read_response(stream, &tag, mode).await
+}
+
+fn imap_request(transfer: &TransferConfig, url: &Url) -> Result<ImapRequest> {
+    let mut request = imap_parse_url_path(url)?;
+    if let Some(custom) = &transfer.method {
+        let decoded = percent_decode(custom.as_bytes()).collect::<Vec<_>>();
+        if has_control_byte(&decoded) {
+            return Err(CurlError::Url(
+                "IMAP custom request contains a decoded control byte".to_string(),
+            ));
+        }
+        request.custom = Some(decoded);
+    }
+    Ok(request)
+}
+
+fn imap_parse_url_path(url: &Url) -> Result<ImapRequest> {
+    let path = url.path().as_bytes();
+    let mut index = usize::from(path.first() == Some(&b'/'));
+    let begin = index;
+    while index < path.len() && imap_is_bchar(path[index]) {
+        index += 1;
+    }
+
+    let mailbox = if index != begin {
+        let mut end = index;
+        if end > begin && path[end - 1] == b'/' {
+            end -= 1;
+        }
+        Some(imap_percent_decode("IMAP mailbox", &path[begin..end])?)
+    } else {
+        None
+    };
+
+    let mut request = ImapRequest {
+        mailbox,
+        uidvalidity: None,
+        uid: None,
+        mail_index: None,
+        section: None,
+        partial: None,
+        query: None,
+        custom: None,
+    };
+
+    while index < path.len() && path[index] == b';' {
+        index += 1;
+        let name_begin = index;
+        while index < path.len() && path[index] != b'=' {
+            index += 1;
+        }
+        if index >= path.len() {
+            return Err(CurlError::Url("malformed IMAP URL parameter".to_string()));
+        }
+        let name = imap_percent_decode("IMAP URL parameter", &path[name_begin..index])?;
+        index += 1;
+        let value_begin = index;
+        while index < path.len() && imap_is_bchar(path[index]) {
+            index += 1;
+        }
+        let mut value = imap_percent_decode("IMAP URL parameter value", &path[value_begin..index])?;
+        if value.last() == Some(&b'/') {
+            value.pop();
+        }
+        if value.is_empty() {
+            continue;
+        }
+
+        if name.eq_ignore_ascii_case(b"UIDVALIDITY") && request.uidvalidity.is_none() {
+            let text = std::str::from_utf8(&value)
+                .map_err(|_| CurlError::Url("bad IMAP UIDVALIDITY".to_string()))?;
+            request.uidvalidity = text.parse::<u32>().ok();
+        } else if name.eq_ignore_ascii_case(b"UID") && request.uid.is_none() {
+            request.uid = Some(value);
+        } else if name.eq_ignore_ascii_case(b"MAILINDEX") && request.mail_index.is_none() {
+            request.mail_index = Some(value);
+        } else if name.eq_ignore_ascii_case(b"SECTION") && request.section.is_none() {
+            request.section = Some(value);
+        } else if name.eq_ignore_ascii_case(b"PARTIAL") && request.partial.is_none() {
+            request.partial = Some(value);
+        } else {
+            return Err(CurlError::Url("unsupported IMAP URL parameter".to_string()));
+        }
+    }
+
+    if request.mailbox.is_some()
+        && request.uid.is_none()
+        && request.mail_index.is_none()
+        && let Some(query) = url.query()
+    {
+        request.query = Some(imap_percent_decode("IMAP query", query.as_bytes())?);
+    }
+
+    if index != path.len() {
+        return Err(CurlError::Url("malformed IMAP URL path".to_string()));
+    }
+    Ok(request)
+}
+
+fn imap_percent_decode(name: &str, bytes: &[u8]) -> Result<Vec<u8>> {
+    let decoded = percent_decode(bytes).collect::<Vec<_>>();
+    if has_control_byte(&decoded) {
+        return Err(CurlError::Url(format!(
+            "{name} contains a decoded control byte"
+        )));
+    }
+    Ok(decoded)
+}
+
+fn imap_fetch_command(request: &ImapRequest) -> Result<Vec<u8>> {
+    let section = request.section.as_deref().unwrap_or_default();
+    let mut command = if let Some(uid) = &request.uid {
+        let mut command = Vec::from(&b"UID FETCH "[..]);
+        command.extend_from_slice(uid);
+        command
+    } else if let Some(mail_index) = &request.mail_index {
+        let mut command = Vec::from(&b"FETCH "[..]);
+        command.extend_from_slice(mail_index);
+        command
+    } else {
+        return Err(CurlError::Url("Cannot FETCH without a UID".to_string()));
+    };
+    command.extend_from_slice(b" BODY[");
+    command.extend_from_slice(section);
+    command.push(b']');
+    if let Some(partial) = &request.partial {
+        command.push(b'<');
+        command.extend_from_slice(partial);
+        command.push(b'>');
+    }
+    Ok(command)
+}
+
+fn imap_credentials(transfer: &TransferConfig, url: &Url) -> Result<Option<(Vec<u8>, Vec<u8>)>> {
+    if let Some(user) = &transfer.user {
+        let (login, password) = split_user_password(user);
+        return Ok(Some((
+            login.as_bytes().to_vec(),
+            password.as_bytes().to_vec(),
+        )));
+    }
+
+    if url.username().is_empty() && url.password().is_none() {
+        return Ok(None);
+    }
+
+    let login = percent_decode(url.username().as_bytes()).collect::<Vec<_>>();
+    let password = url
+        .password()
+        .map(|password| percent_decode(password.as_bytes()).collect::<Vec<_>>())
+        .unwrap_or_default();
+    if has_control_byte(&login) || has_control_byte(&password) {
+        return Err(CurlError::Url(
+            "IMAP credentials contain a decoded control byte".to_string(),
+        ));
+    }
+    Ok(Some((login, password)))
+}
+
+fn imap_atom(input: &[u8], escape_only: bool) -> Vec<u8> {
+    const SPECIALS: &[u8] = b"() {%*]\\\"";
+    if !input.iter().any(|byte| SPECIALS.contains(byte)) {
+        return input.to_vec();
+    }
+
+    let mut atom = Vec::new();
+    if !escape_only {
+        atom.push(b'"');
+    }
+    for byte in input {
+        if matches!(*byte, b'\\' | b'"') {
+            atom.push(b'\\');
+        }
+        atom.push(*byte);
+    }
+    if !escape_only {
+        atom.push(b'"');
+    }
+    atom
+}
+
+fn imap_is_bchar(byte: u8) -> bool {
+    byte.is_ascii_alphanumeric() || b":@/&=-._~!$'()*+,%".contains(&byte)
+}
+
+fn imap_method_label(request: &ImapRequest) -> String {
+    if let Some(custom) = &request.custom {
+        let word = custom
+            .split(|byte| byte.is_ascii_whitespace())
+            .next()
+            .unwrap_or_default();
+        return String::from_utf8_lossy(word).to_string();
+    }
+    if request.uid.is_some() || request.mail_index.is_some() {
+        "FETCH".to_string()
+    } else if request.query.is_some() {
+        "SEARCH".to_string()
+    } else {
+        "LIST".to_string()
+    }
+}
+
+async fn imap_read_greeting(stream: &mut TcpStream) -> Result<bool> {
+    let line = pop3_read_line(stream).await?;
+    match imap_untagged_status(&line) {
+        ImapStatus::Ok => Ok(false),
+        ImapStatus::Preauth => Ok(true),
+        _ => Err(CurlError::WeirdServerReply),
+    }
+}
+
+async fn imap_logout(stream: &mut TcpStream, tag_id: &mut u16) -> Result<()> {
+    let tag = imap_next_tag(tag_id);
+    imap_send_command(stream, &tag, b"LOGOUT").await?;
+    let _ = imap_read_response(stream, &tag, ImapReadMode::Quiet).await?;
+    Ok(())
+}
+
+fn imap_next_tag(tag_id: &mut u16) -> String {
+    *tag_id += 1;
+    format!("A{:03}", *tag_id)
+}
+
+async fn imap_send_command(stream: &mut TcpStream, tag: &str, command: &[u8]) -> Result<()> {
+    stream
+        .write_all(tag.as_bytes())
+        .await
+        .map_err(tcp_io_error)?;
+    stream.write_all(b" ").await.map_err(tcp_io_error)?;
+    stream.write_all(command).await.map_err(tcp_io_error)?;
+    stream.write_all(b"\r\n").await.map_err(tcp_io_error)
+}
+
+async fn imap_read_response(
+    stream: &mut TcpStream,
+    tag: &str,
+    mode: ImapReadMode,
+) -> Result<ImapResponse> {
+    let mut response = ImapResponse {
+        status: ImapStatus::Other,
+        output: Vec::new(),
+        uidvalidity: None,
+        saw_untagged: false,
+        saw_literal: false,
+    };
+
+    loop {
+        let line = pop3_read_line(stream).await?;
+        if imap_is_empty_line(&line) {
+            continue;
+        }
+        if imap_is_tagged_line(&line, tag) {
+            response.status = imap_tagged_status(&line, tag);
+            return Ok(response);
+        }
+
+        response.saw_untagged = true;
+        if response.uidvalidity.is_none() {
+            response.uidvalidity = imap_uidvalidity(&line);
+        }
+        let literal_size = imap_literal_size(&line)?;
+        match mode {
+            ImapReadMode::Quiet => {
+                if let Some(size) = literal_size {
+                    let _ = imap_read_literal(stream, size).await?;
+                    response.saw_literal = true;
+                }
+            }
+            ImapReadMode::FetchBody => {
+                if let Some(size) = literal_size {
+                    let literal = imap_read_literal(stream, size).await?;
+                    response.output.extend_from_slice(&literal);
+                    response.saw_literal = true;
+                }
+            }
+            ImapReadMode::Lines => {
+                response.output.extend_from_slice(&line);
+                if let Some(size) = literal_size {
+                    let literal = imap_read_literal(stream, size).await?;
+                    response.output.extend_from_slice(&literal);
+                    response.saw_literal = true;
+                }
+            }
+        }
+    }
+}
+
+async fn imap_read_literal(stream: &mut TcpStream, size: usize) -> Result<Vec<u8>> {
+    let mut literal = vec![0; size];
+    stream
+        .read_exact(&mut literal)
+        .await
+        .map_err(tcp_io_error)?;
+    Ok(literal)
+}
+
+fn imap_is_empty_line(line: &[u8]) -> bool {
+    matches!(line, b"\r\n" | b"\n" | b"")
+}
+
+fn imap_is_tagged_line(line: &[u8], tag: &str) -> bool {
+    let tag = tag.as_bytes();
+    line.starts_with(tag)
+        && line
+            .get(tag.len())
+            .is_some_and(|byte| byte.is_ascii_whitespace())
+}
+
+fn imap_tagged_status(line: &[u8], tag: &str) -> ImapStatus {
+    imap_status_word(line.get(tag.len()..).unwrap_or_default())
+}
+
+fn imap_untagged_status(line: &[u8]) -> ImapStatus {
+    if let Some(rest) = line.strip_prefix(b"*") {
+        imap_status_word(rest)
+    } else {
+        ImapStatus::Other
+    }
+}
+
+fn imap_status_word(bytes: &[u8]) -> ImapStatus {
+    let mut index = 0;
+    while bytes
+        .get(index)
+        .is_some_and(|byte| byte.is_ascii_whitespace())
+    {
+        index += 1;
+    }
+    let start = index;
+    while bytes
+        .get(index)
+        .is_some_and(|byte| !byte.is_ascii_whitespace())
+    {
+        index += 1;
+    }
+    match &bytes[start..index].to_ascii_uppercase()[..] {
+        b"OK" => ImapStatus::Ok,
+        b"PREAUTH" => ImapStatus::Preauth,
+        b"NO" => ImapStatus::No,
+        b"BAD" => ImapStatus::Bad,
+        _ => ImapStatus::Other,
+    }
+}
+
+fn imap_uidvalidity(line: &[u8]) -> Option<u32> {
+    let upper = line.to_ascii_uppercase();
+    let marker = b"[UIDVALIDITY ";
+    let start = upper
+        .windows(marker.len())
+        .position(|window| window == marker)?
+        + marker.len();
+    let mut end = start;
+    while upper.get(end).is_some_and(|byte| byte.is_ascii_digit()) {
+        end += 1;
+    }
+    std::str::from_utf8(&upper[start..end]).ok()?.parse().ok()
+}
+
+fn imap_literal_size(line: &[u8]) -> Result<Option<usize>> {
+    let mut in_quote = false;
+    let mut escaped = false;
+    let mut index = 0;
+    while index < line.len() {
+        let byte = line[index];
+        if in_quote {
+            if escaped {
+                escaped = false;
+            } else if byte == b'\\' {
+                escaped = true;
+            } else if byte == b'"' {
+                in_quote = false;
+            }
+            index += 1;
+            continue;
+        }
+        if byte == b'"' {
+            in_quote = true;
+            index += 1;
+            continue;
+        }
+        if byte == b'{' {
+            let start = index + 1;
+            let mut end = start;
+            while line.get(end).is_some_and(|byte| byte.is_ascii_digit()) {
+                end += 1;
+            }
+            if end > start && line.get(end) == Some(&b'}') {
+                let size = std::str::from_utf8(&line[start..end])
+                    .ok()
+                    .and_then(|value| value.parse::<usize>().ok())
+                    .ok_or(CurlError::WeirdServerReply)?;
+                return Ok(Some(size));
+            }
+        }
+        index += 1;
+    }
+    Ok(None)
+}
+
+fn imap_custom_fetch_listing(command: &[u8]) -> bool {
+    let upper = command.to_ascii_uppercase();
+    if upper.starts_with(b"FETCH ") {
+        imap_custom_fetch_listing_match(&command[5..])
+    } else if upper.starts_with(b"UID FETCH ") {
+        imap_custom_fetch_listing_match(&command[9..])
+    } else {
+        false
+    }
+}
+
+fn imap_custom_fetch_listing_match(params: &[u8]) -> bool {
+    if params.first() != Some(&b' ') {
+        return false;
+    }
+    let mut index = 1;
+    while params.get(index).is_some_and(|byte| byte.is_ascii_digit()) {
+        index += 1;
+    }
+    index > 1 && matches!(params.get(index), Some(b':' | b','))
 }
 
 struct SmtpResponse {

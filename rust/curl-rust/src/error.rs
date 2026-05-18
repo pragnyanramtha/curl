@@ -20,6 +20,8 @@ pub enum CurlError {
     WeirdServerReply,
     #[error("remote access denied")]
     RemoteAccessDenied,
+    #[error("quote command failed")]
+    QuoteError,
     #[error("IPFS automatic gateway detection failed")]
     IpfsGatewayDetection,
     #[error("{0}")]
@@ -32,6 +34,8 @@ pub enum CurlError {
     FileSizeExceeded,
     #[error("Login denied")]
     LoginDenied,
+    #[error("Remote file not found")]
+    RemoteFileNotFound,
     #[error("failed sending data to the peer")]
     SendError,
     #[error("TFTP file not found")]
@@ -62,10 +66,12 @@ impl CurlError {
             Self::Transfer(_) => 7,
             Self::WeirdServerReply => 8,
             Self::RemoteAccessDenied => 9,
+            Self::QuoteError => 21,
             Self::TooManyRedirects { .. } => 47,
             Self::HttpStatus { .. } => 22,
             Self::FileSizeExceeded => 63,
             Self::LoginDenied => 67,
+            Self::RemoteFileNotFound => 78,
             Self::SendError => 55,
             Self::TftpNotFound => 68,
             Self::TftpPermission => 69,

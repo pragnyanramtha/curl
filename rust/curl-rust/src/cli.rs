@@ -1120,7 +1120,7 @@ pub fn print_help() {
 
 pub fn print_version() {
     println!(
-        "curl-rust {} (Rust rewrite) DICT HTTP HTTPS FILE GOPHER IPFS IPNS MQTT POP3 RTSP SMTP TELNET TFTP",
+        "curl-rust {} (Rust rewrite) DICT HTTP HTTPS FILE GOPHER IMAP IPFS IPNS MQTT POP3 RTSP SMTP TELNET TFTP",
         env!("CARGO_PKG_VERSION")
     );
 }
