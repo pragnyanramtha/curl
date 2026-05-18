@@ -31,6 +31,7 @@ pub struct TransferConfig {
     pub dump_header: Option<PathBuf>,
     pub etag_compare: Option<PathBuf>,
     pub etag_save: Option<PathBuf>,
+    pub time_cond: Option<String>,
     pub write_out: Option<String>,
     pub follow_location: bool,
     pub max_redirs: usize,
@@ -95,6 +96,7 @@ impl Default for TransferConfig {
             dump_header: None,
             etag_compare: None,
             etag_save: None,
+            time_cond: None,
             write_out: None,
             follow_location: false,
             max_redirs: 50,
@@ -317,6 +319,10 @@ impl Parser {
                 let value = self.value_for(name, inline_value)?;
                 self.current().etag_save = Some(PathBuf::from(value));
             }
+            "time-cond" => {
+                let value = self.value_for(name, inline_value)?;
+                self.current().time_cond = Some(value);
+            }
             "write-out" => {
                 let value = self.value_for(name, inline_value)?;
                 self.current().write_out = Some(value);
@@ -487,6 +493,11 @@ impl Parser {
                     self.current().dump_header = Some(PathBuf::from(value));
                     break;
                 }
+                'z' => {
+                    let value = self.short_value('z', rest)?;
+                    self.current().time_cond = Some(value);
+                    break;
+                }
                 'w' => {
                     let value = self.short_value('w', rest)?;
                     self.current().write_out = Some(value);
@@ -615,6 +626,7 @@ impl TransferConfig {
             || self.dump_header.is_some()
             || self.etag_compare.is_some()
             || self.etag_save.is_some()
+            || self.time_cond.is_some()
             || self.write_out.is_some()
             || self.follow_location
             || self.fail
@@ -679,6 +691,7 @@ pub fn print_help() {
            -O, --remote-name           Write output to remote filename\n\
                --etag-compare <file>   Load ETag from file\n\
                --etag-save <file>      Save response ETag to file\n\
+           -z, --time-cond <time>      Transfer based on time condition\n\
            -w, --write-out <format>    Write transfer metrics\n\
            -X, --request <method>      Specify request method\n\
            -u, --user <user:pass>      Server user and password\n\
@@ -963,6 +976,8 @@ mod tests {
             "etag.in",
             "--etag-save",
             "etag.out",
+            "-z",
+            "Wed, 21 Oct 2015 07:28:00 GMT",
             "-x",
             "http://proxy.example:8080",
             "-U",
@@ -982,6 +997,10 @@ mod tests {
         assert_eq!(
             transfer.etag_save.as_deref(),
             Some(std::path::Path::new("etag.out"))
+        );
+        assert_eq!(
+            transfer.time_cond.as_deref(),
+            Some("Wed, 21 Oct 2015 07:28:00 GMT")
         );
         assert_eq!(transfer.proxy.as_deref(), Some("http://proxy.example:8080"));
         assert_eq!(transfer.proxy_user.as_deref(), Some("proxy-user:secret"));

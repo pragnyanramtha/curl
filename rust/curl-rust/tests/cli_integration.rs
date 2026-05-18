@@ -264,6 +264,42 @@ fn etag_save_creates_empty_file_when_header_missing() {
 }
 
 #[test]
+fn time_cond_sends_if_modified_since() {
+    let (url, rx) = spawn_server(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok");
+
+    let mut command = Command::cargo_bin("curl").unwrap();
+    command.args(["-q", "-sS", "-z", "Wed, 21 Oct 2015 07:28:00 GMT", &url]);
+    command.assert().success().stdout("ok");
+
+    let request = rx.recv().unwrap();
+    assert_eq!(
+        header(&request, "if-modified-since"),
+        Some("Wed, 21 Oct 2015 07:28:00 GMT")
+    );
+}
+
+#[test]
+fn negative_time_cond_sends_if_unmodified_since() {
+    let (url, rx) = spawn_server(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok");
+
+    let mut command = Command::cargo_bin("curl").unwrap();
+    command.args([
+        "-q",
+        "-sS",
+        "--time-cond",
+        "-Wed, 21 Oct 2015 07:28:00 GMT",
+        &url,
+    ]);
+    command.assert().success().stdout("ok");
+
+    let request = rx.recv().unwrap();
+    assert_eq!(
+        header(&request, "if-unmodified-since"),
+        Some("Wed, 21 Oct 2015 07:28:00 GMT")
+    );
+}
+
+#[test]
 fn file_head_outputs_file_headers() {
     let temp = tempdir().unwrap();
     let file = temp.path().join("plain.txt");

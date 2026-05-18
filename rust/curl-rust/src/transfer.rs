@@ -3,7 +3,8 @@ use std::time::Instant;
 
 use reqwest::header::{
     ACCEPT, ACCEPT_ENCODING, AUTHORIZATION, CONTENT_LENGTH, CONTENT_TYPE, COOKIE, ETAG, HeaderName,
-    HeaderValue, IF_NONE_MATCH, LOCATION, RANGE, REFERER, USER_AGENT,
+    HeaderValue, IF_MODIFIED_SINCE, IF_NONE_MATCH, IF_UNMODIFIED_SINCE, LOCATION, RANGE, REFERER,
+    USER_AGENT,
 };
 use reqwest::{Client, Method, StatusCode, Url, Version};
 
@@ -370,6 +371,11 @@ fn apply_headers(
         request = request.header(IF_NONE_MATCH, load_etag_compare(path)?);
     }
 
+    if let Some(time_cond) = &transfer.time_cond {
+        let (name, value) = time_condition_header(time_cond);
+        request = request.header(name, value);
+    }
+
     if let Some(referer) = &transfer.referer {
         request = request.header(REFERER, referer);
     }
@@ -454,6 +460,14 @@ fn load_etag_compare(path: &Path) -> Result<String> {
     } else {
         Ok(etag.to_string())
     }
+}
+
+fn time_condition_header(value: &str) -> (HeaderName, &str) {
+    value
+        .strip_prefix('-')
+        .map_or((IF_MODIFIED_SINCE, value), |value| {
+            (IF_UNMODIFIED_SINCE, value.trim_start())
+        })
 }
 
 fn save_etag(path: &Path, headers: &reqwest::header::HeaderMap, create_dirs: bool) -> Result<()> {
