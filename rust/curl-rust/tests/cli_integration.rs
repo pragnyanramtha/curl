@@ -236,6 +236,7 @@ struct FtpServerOptions {
     epsv_fails: bool,
     pasv_denied: bool,
     login_denied: bool,
+    pwd_denied: bool,
     cwd_denied: bool,
     type_denied: bool,
     retr_denied: bool,
@@ -366,6 +367,7 @@ fn ftp_options(data: impl Into<Vec<u8>>) -> FtpServerOptions {
         epsv_fails: false,
         pasv_denied: false,
         login_denied: false,
+        pwd_denied: false,
         cwd_denied: false,
         type_denied: false,
         retr_denied: false,
@@ -401,6 +403,10 @@ fn spawn_ftp_server(path: &str, options: FtpServerOptions) -> (String, Receiver<
             } else if command.starts_with("PASS ") {
                 stream.write_all(b"230 Login successful\r\n").unwrap();
             } else if command == "PWD" {
+                if options.pwd_denied {
+                    stream.write_all(b"500 PWD failed\r\n").unwrap();
+                    continue;
+                }
                 stream
                     .write_all(b"257 \"/\" is the current directory\r\n")
                     .unwrap();
@@ -2652,7 +2658,27 @@ fn ftp_cwd_failure_returns_remote_access_denied() {
 
     assert_eq!(
         rx.recv().unwrap().commands,
-        b"USER anonymous\r\nPASS ftp@example.com\r\nPWD\r\nCWD private\r\n"
+        b"USER anonymous\r\nPASS ftp@example.com\r\nPWD\r\nCWD private\r\nQUIT\r\n"
+    );
+}
+
+#[test]
+fn ftp_pwd_failure_is_ignored_before_download() {
+    let mut options = ftp_options(b"downloaded after bad pwd\n".to_vec());
+    options.pwd_denied = true;
+    options.epsv_fails = true;
+    let (url, rx) = spawn_ftp_server("/file.txt", options);
+
+    let mut command = Command::cargo_bin("curl").unwrap();
+    command.args(["-q", "-sS", &url]);
+    command
+        .assert()
+        .success()
+        .stdout("downloaded after bad pwd\n");
+
+    assert_eq!(
+        rx.recv().unwrap().commands,
+        b"USER anonymous\r\nPASS ftp@example.com\r\nPWD\r\nEPSV\r\nPASV\r\nTYPE I\r\nSIZE file.txt\r\nRETR file.txt\r\nQUIT\r\n"
     );
 }
 

@@ -782,14 +782,18 @@ async fn run_ftp_exchange(
         }
     }
 
-    let response = ftp_command(&mut stream, b"PWD", metrics, &mut control_headers).await?;
-    ftp_require_positive(&response, CurlError::WeirdServerReply)?;
+    let _ = ftp_command(&mut stream, b"PWD", metrics, &mut control_headers).await?;
 
     for directory in &path.directories {
         let mut command = Vec::from(&b"CWD "[..]);
         command.extend_from_slice(directory);
         let response = ftp_command(&mut stream, &command, metrics, &mut control_headers).await?;
-        ftp_require_positive(&response, CurlError::RemoteAccessDenied)?;
+        if !ftp_positive_code(response.code) {
+            let response_code_before_quit = metrics.response_code;
+            let _ = ftp_command(&mut stream, b"QUIT", metrics, &mut control_headers).await;
+            metrics.response_code = response_code_before_quit;
+            return Err(CurlError::RemoteAccessDenied);
+        }
     }
 
     let mut synthetic_headers = reqwest::header::HeaderMap::new();
@@ -1086,11 +1090,15 @@ fn ftp_response_code(line: &[u8]) -> Result<u16> {
 }
 
 fn ftp_require_positive(response: &FtpResponse, error: CurlError) -> Result<()> {
-    if response.code / 100 == 2 {
+    if ftp_positive_code(response.code) {
         Ok(())
     } else {
         Err(error)
     }
+}
+
+fn ftp_positive_code(code: u16) -> bool {
+    code / 100 == 2
 }
 
 fn ftp_require_code(response: &FtpResponse, expected: &[u16], error: CurlError) -> Result<()> {
