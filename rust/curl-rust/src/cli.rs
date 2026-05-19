@@ -103,6 +103,7 @@ pub struct TransferConfig {
     pub create_dirs: bool,
     pub http_version: HttpVersionPreference,
     pub ssl_version: Option<SslVersionPreference>,
+    pub ip_version: IpVersionPreference,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -126,6 +127,13 @@ pub enum SslVersionPreference {
     TlsV1_1,
     TlsV1_2,
     TlsV1_3,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum IpVersionPreference {
+    Any,
+    Ipv4,
+    Ipv6,
 }
 
 impl Default for Config {
@@ -221,6 +229,7 @@ impl Default for TransferConfig {
             create_dirs: false,
             http_version: HttpVersionPreference::Any,
             ssl_version: None,
+            ip_version: IpVersionPreference::Any,
         }
     }
 }
@@ -641,6 +650,8 @@ impl Parser {
             "http3" | "http3-only" => {
                 return Err(CurlError::Unsupported(format!("--{name}")));
             }
+            "ipv4" => self.current().ip_version = IpVersionPreference::Ipv4,
+            "ipv6" => self.current().ip_version = IpVersionPreference::Ipv6,
             "tlsv1" | "tlsv1.0" => self.current().ssl_version = Some(SslVersionPreference::TlsV1_0),
             "tlsv1.1" => self.current().ssl_version = Some(SslVersionPreference::TlsV1_1),
             "tlsv1.2" => self.current().ssl_version = Some(SslVersionPreference::TlsV1_2),
@@ -848,6 +859,8 @@ impl Parser {
                 '1' => self.current().ssl_version = Some(SslVersionPreference::TlsV1_0),
                 '2' => warn_deprecated_ssl_option("sslv2"),
                 '3' => warn_deprecated_ssl_option("sslv3"),
+                '4' => self.current().ip_version = IpVersionPreference::Ipv4,
+                '6' => self.current().ip_version = IpVersionPreference::Ipv6,
                 other => return Err(CurlError::Usage(format!("unknown option -{other}"))),
             }
 
@@ -1202,6 +1215,7 @@ impl TransferConfig {
             || self.create_dirs
             || self.http_version != HttpVersionPreference::Any
             || self.ssl_version.is_some()
+            || self.ip_version != IpVersionPreference::Any
     }
 }
 
@@ -2509,6 +2523,31 @@ mod tests {
         .unwrap();
         assert_eq!(config.transfers[0].http_version, HttpVersionPreference::Any);
         assert_eq!(config.transfers[0].ssl_version, None);
+    }
+
+    #[test]
+    fn parses_ip_version_short_aliases() {
+        let config = parse_args(["-q", "-4", "https://example.com"]).unwrap();
+        assert_eq!(config.transfers[0].ip_version, IpVersionPreference::Ipv4);
+
+        let config = parse_args(["-q", "--ipv6", "https://example.com"]).unwrap();
+        assert_eq!(config.transfers[0].ip_version, IpVersionPreference::Ipv6);
+
+        let config = parse_args(["-q", "--ipv4", "-6", "https://example.com"]).unwrap();
+        assert_eq!(config.transfers[0].ip_version, IpVersionPreference::Ipv6);
+
+        let config = parse_args(["-q", "-46", "https://example.com"]).unwrap();
+        assert_eq!(config.transfers[0].ip_version, IpVersionPreference::Ipv6);
+    }
+
+    #[test]
+    fn config_files_parse_ip_version_options() {
+        let temp = tempdir().unwrap();
+        let config_file = temp.path().join("curlrc");
+        std::fs::write(&config_file, "ipv4\nipv6\nurl = https://example.com\n").unwrap();
+
+        let config = parse_args(["-q", "--config", config_file.to_str().unwrap()]).unwrap();
+        assert_eq!(config.transfers[0].ip_version, IpVersionPreference::Ipv6);
     }
 
     #[test]

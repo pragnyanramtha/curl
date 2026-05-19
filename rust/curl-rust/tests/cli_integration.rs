@@ -101,6 +101,12 @@ struct SmbFixture {
     malformed_read: bool,
 }
 
+struct DualFamilyServer {
+    target: String,
+    resolve: String,
+    rx: Receiver<(String, RequestRecord)>,
+}
+
 struct SshdFixture {
     _temp: TempDir,
     child: Child,
@@ -326,6 +332,41 @@ fn spawn_sequence_server(responses: Vec<&'static [u8]>) -> (String, Receiver<Req
     });
 
     (format!("http://{addr}/resource"), rx)
+}
+
+fn spawn_dual_family_server() -> Option<DualFamilyServer> {
+    let ipv6 = TcpListener::bind("[::1]:0").ok()?;
+    let port = ipv6.local_addr().ok()?.port();
+    let ipv4 = TcpListener::bind(("127.0.0.1", port)).ok()?;
+    let (tx, rx) = mpsc::channel();
+
+    for (family, listener, response) in [
+        (
+            "v4",
+            ipv4,
+            b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nv4" as &'static [u8],
+        ),
+        (
+            "v6",
+            ipv6,
+            b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nv6" as &'static [u8],
+        ),
+    ] {
+        let tx = tx.clone();
+        thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let request = read_request(&mut stream);
+            stream.write_all(response).unwrap();
+            tx.send((family.to_string(), request)).unwrap();
+        });
+    }
+    drop(tx);
+
+    Some(DualFamilyServer {
+        target: format!("http://example.test:{port}/resource"),
+        resolve: format!("example.test:{port}:[::1],127.0.0.1"),
+        rx,
+    })
 }
 
 fn spawn_dict_server(response: &'static [u8]) -> (String, Receiver<Vec<u8>>) {
@@ -2049,6 +2090,41 @@ fn resolve_maps_host_to_address() {
         header(&request, "host"),
         Some(format!("example.test:{port}").as_str())
     );
+}
+
+#[test]
+fn ip_version_filters_resolved_address_families() {
+    let Some(server) = spawn_dual_family_server() else {
+        return;
+    };
+
+    let mut ipv4 = Command::cargo_bin("curl").unwrap();
+    ipv4.args([
+        "-q",
+        "-sS",
+        "--resolve",
+        &server.resolve,
+        "--ipv4",
+        &server.target,
+    ]);
+    ipv4.assert().success().stdout("v4");
+
+    let mut ipv6 = Command::cargo_bin("curl").unwrap();
+    ipv6.args([
+        "-q",
+        "-sS",
+        "--resolve",
+        &server.resolve,
+        "--ipv6",
+        &server.target,
+    ]);
+    ipv6.assert().success().stdout("v6");
+
+    let first = server.rx.recv().unwrap();
+    let second = server.rx.recv().unwrap();
+    assert_eq!(first.0, "v4");
+    assert_eq!(second.0, "v6");
+    assert_eq!(header(&first.1, "host"), header(&second.1, "host"));
 }
 
 #[test]
@@ -6145,6 +6221,7 @@ fn libcurl_writes_source_file_for_supported_options() {
         "2M",
         "--http1.1",
         "--tlsv1.2",
+        "--ipv4",
         "-e",
         "firstone.html;auto",
         "-j",
@@ -6176,6 +6253,7 @@ fn libcurl_writes_source_file_for_supported_options() {
     assert!(text.contains("CURLOPT_AUTOREFERER, 1"));
     assert!(text.contains("CURLOPT_HTTP_VERSION, CURL_HTTP_VERSION_1_1"));
     assert!(text.contains("CURLOPT_SSLVERSION, CURL_SSLVERSION_TLSv1_2"));
+    assert!(text.contains("CURLOPT_IPRESOLVE, CURL_IPRESOLVE_V4"));
     assert!(text.contains(&format!(
         "CURLOPT_COOKIEFILE, \"{}\"",
         cookie_file.display()

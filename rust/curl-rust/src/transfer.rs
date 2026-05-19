@@ -19,7 +19,10 @@ use reqwest::header::{
 };
 use reqwest::{Client, Method, StatusCode, Url, Version};
 
-use crate::cli::{Config, ContinueAt, HttpVersionPreference, SslVersionPreference, TransferConfig};
+use crate::cli::{
+    Config, ContinueAt, HttpVersionPreference, IpVersionPreference, SslVersionPreference,
+    TransferConfig,
+};
 use crate::cookie::CookieJar;
 use crate::data::{self, PreparedBody};
 use crate::error::{CurlError, Result, ResultExt};
@@ -294,6 +297,12 @@ fn build_client(transfer: &TransferConfig, cookie_jar: Option<Arc<CookieJar>>) -
         builder = builder.min_tls_version(reqwest_tls_version(version));
     }
 
+    if transfer.ip_version != IpVersionPreference::Any {
+        builder = builder.dns_resolver(Arc::new(IpFamilyResolver {
+            ip_version: transfer.ip_version,
+        }));
+    }
+
     if !transfer.compressed {
         builder = builder.no_gzip().no_brotli().no_deflate();
     }
@@ -311,7 +320,8 @@ fn build_client(transfer: &TransferConfig, cookie_jar: Option<Arc<CookieJar>>) -
     }
 
     for entry in &transfer.resolve {
-        if let Some((host, addrs)) = parse_resolve_entry(entry)? {
+        if let Some((host, mut addrs)) = parse_resolve_entry(entry)? {
+            addrs.retain(|addr| socket_addr_matches_ip_version(addr, transfer.ip_version));
             builder = builder.resolve_to_addrs(&host, &addrs);
         }
     }
@@ -355,6 +365,26 @@ fn reqwest_tls_version(version: SslVersionPreference) -> reqwest::tls::Version {
         SslVersionPreference::TlsV1_1 => reqwest::tls::Version::TLS_1_1,
         SslVersionPreference::TlsV1_2 => reqwest::tls::Version::TLS_1_2,
         SslVersionPreference::TlsV1_3 => reqwest::tls::Version::TLS_1_3,
+    }
+}
+
+struct IpFamilyResolver {
+    ip_version: IpVersionPreference,
+}
+
+impl reqwest::dns::Resolve for IpFamilyResolver {
+    fn resolve(&self, name: reqwest::dns::Name) -> reqwest::dns::Resolving {
+        let host = name.as_str().to_string();
+        let ip_version = self.ip_version;
+        Box::pin(async move {
+            let addrs = tokio::net::lookup_host((host.as_str(), 0))
+                .await
+                .map_err(|error| Box::new(error) as Box<dyn std::error::Error + Send + Sync>)?;
+            let filtered = addrs
+                .filter(|addr| socket_addr_matches_ip_version(addr, ip_version))
+                .collect::<Vec<_>>();
+            Ok(Box::new(filtered.into_iter()) as reqwest::dns::Addrs)
+        })
     }
 }
 
@@ -1683,9 +1713,7 @@ fn ssh_connect(transfer: &TransferConfig, url: &Url) -> Result<Session> {
 }
 
 fn ssh_tcp_connect(host: &str, port: u16, transfer: &TransferConfig) -> Result<StdTcpStream> {
-    let addresses = (host, port)
-        .to_socket_addrs()
-        .map_err(|error| CurlError::Transfer(error.to_string()))?;
+    let addresses = resolve_std_socket_addrs(host, port, transfer.ip_version)?;
     let mut last_error = None;
     for address in addresses {
         let stream = if let Some(timeout) = transfer.connect_timeout {
@@ -2283,18 +2311,19 @@ async fn run_tftp_exchange(
         )
     };
 
-    let bind_addr = if url.has_host()
-        && url
-            .host()
-            .is_some_and(|host| matches!(host, url::Host::Ipv6(_)))
-    {
+    let peer_addr = resolve_tokio_socket_addrs(host, port, transfer.ip_version)
+        .await?
+        .into_iter()
+        .next()
+        .ok_or_else(|| CurlError::Transfer("could not resolve host".to_string()))?;
+    let bind_addr = if peer_addr.is_ipv6() {
         "[::]:0"
     } else {
         "0.0.0.0:0"
     };
     let socket = UdpSocket::bind(bind_addr).await.map_err(tcp_io_error)?;
     socket
-        .send_to(&request, (host, port))
+        .send_to(&request, peer_addr)
         .await
         .map_err(tcp_io_error)?;
 
@@ -4480,23 +4509,74 @@ async fn run_gopher_transfer(
 
 async fn connect_tcp(host: &str, port: u16, transfer: &TransferConfig) -> Result<TcpStream> {
     let connect = async move {
-        let literal_host = host
-            .strip_prefix('[')
-            .and_then(|host| host.strip_suffix(']'))
-            .unwrap_or(host);
-        if let Ok(ip) = literal_host.parse::<IpAddr>() {
-            TcpStream::connect(SocketAddr::new(ip, port)).await
-        } else {
-            TcpStream::connect((host, port)).await
+        let addresses = resolve_tokio_socket_addrs(host, port, transfer.ip_version).await?;
+        let mut last_error = None;
+        for address in addresses {
+            match TcpStream::connect(address).await {
+                Ok(stream) => return Ok(stream),
+                Err(error) => last_error = Some(error),
+            }
         }
+        Err(last_error
+            .map(tcp_io_error)
+            .unwrap_or_else(|| CurlError::Transfer("could not resolve host".to_string())))
     };
     if let Some(timeout) = transfer.connect_timeout {
         tokio::time::timeout(timeout, connect)
             .await
             .map_err(|_| CurlError::Transfer("connection timed out".to_string()))?
-            .map_err(tcp_io_error)
     } else {
-        connect.await.map_err(tcp_io_error)
+        connect.await
+    }
+}
+
+fn resolve_std_socket_addrs(
+    host: &str,
+    port: u16,
+    ip_version: IpVersionPreference,
+) -> Result<Vec<SocketAddr>> {
+    if let Some(ip) = parse_literal_ip(host) {
+        return Ok(vec![SocketAddr::new(ip, port)]);
+    }
+
+    let addrs = (host, port)
+        .to_socket_addrs()
+        .map_err(|error| CurlError::Transfer(error.to_string()))?
+        .filter(|addr| socket_addr_matches_ip_version(addr, ip_version))
+        .collect();
+    Ok(addrs)
+}
+
+async fn resolve_tokio_socket_addrs(
+    host: &str,
+    port: u16,
+    ip_version: IpVersionPreference,
+) -> Result<Vec<SocketAddr>> {
+    if let Some(ip) = parse_literal_ip(host) {
+        return Ok(vec![SocketAddr::new(ip, port)]);
+    }
+
+    let addrs = tokio::net::lookup_host((host, port))
+        .await
+        .map_err(tcp_io_error)?
+        .filter(|addr| socket_addr_matches_ip_version(addr, ip_version))
+        .collect();
+    Ok(addrs)
+}
+
+fn parse_literal_ip(host: &str) -> Option<IpAddr> {
+    let literal_host = host
+        .strip_prefix('[')
+        .and_then(|host| host.strip_suffix(']'))
+        .unwrap_or(host);
+    literal_host.parse().ok()
+}
+
+fn socket_addr_matches_ip_version(address: &SocketAddr, ip_version: IpVersionPreference) -> bool {
+    match ip_version {
+        IpVersionPreference::Any => true,
+        IpVersionPreference::Ipv4 => address.is_ipv4(),
+        IpVersionPreference::Ipv6 => address.is_ipv6(),
     }
 }
 
@@ -6596,9 +6676,12 @@ fn proxy_url_credentials(proxy: &Url) -> Option<String> {
 
 async fn run_raw_http_proxy_transfer(context: RawHttpProxyContext<'_>) -> Result<HttpAttempt> {
     let request = raw_http_proxy_request(&context)?;
-    let mut stream = TcpStream::connect((context.proxy.host.as_str(), context.proxy.port))
-        .await
-        .map_err(tcp_io_error)?;
+    let mut stream = connect_tcp(
+        context.proxy.host.as_str(),
+        context.proxy.port,
+        context.transfer,
+    )
+    .await?;
     stream.write_all(&request).await.map_err(tcp_io_error)?;
     raw_http_read_response(
         &mut stream,
@@ -6616,9 +6699,7 @@ async fn run_raw_http_direct_transfer(context: RawHttpDirectContext<'_>) -> Resu
         .host_str()
         .ok_or_else(|| CurlError::Url("URL is missing a host".to_string()))?;
     let port = context.url.port_or_known_default().unwrap_or(80);
-    let mut stream = TcpStream::connect((host, port))
-        .await
-        .map_err(tcp_io_error)?;
+    let mut stream = connect_tcp(host, port, context.transfer).await?;
     stream.write_all(&request).await.map_err(tcp_io_error)?;
     raw_http_read_response(
         &mut stream,

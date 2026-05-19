@@ -4,7 +4,10 @@ use std::path::Path;
 
 use url::Url;
 
-use crate::cli::{Config, ContinueAt, HttpVersionPreference, SslVersionPreference, TransferConfig};
+use crate::cli::{
+    Config, ContinueAt, HttpVersionPreference, IpVersionPreference, SslVersionPreference,
+    TransferConfig,
+};
 use crate::data::{self, PreparedBody};
 use crate::error::{CurlError, Result};
 use crate::{glob, ipfs, transfer};
@@ -334,6 +337,7 @@ fn write_request(out: &mut String, render: &RenderTransfer<'_>, url: &str) -> Re
     }
     emit_http_version(out, transfer.http_version);
     emit_ssl_version(out, transfer.ssl_version);
+    emit_ip_version(out, transfer.ip_version);
     emit_long_setopt(out, "CURLOPT_TCP_KEEPALIVE", 1);
     out.push('\n');
     writeln!(out, "  result = curl_easy_perform(curl);").unwrap();
@@ -461,6 +465,15 @@ fn emit_ssl_version(out: &mut String, version: Option<SslVersionPreference>) {
         None => return,
     };
     emit_raw_setopt(out, "CURLOPT_SSLVERSION", value);
+}
+
+fn emit_ip_version(out: &mut String, version: IpVersionPreference) {
+    let value = match version {
+        IpVersionPreference::Any => return,
+        IpVersionPreference::Ipv4 => "CURL_IPRESOLVE_V4",
+        IpVersionPreference::Ipv6 => "CURL_IPRESOLVE_V6",
+    };
+    emit_raw_setopt(out, "CURLOPT_IPRESOLVE", value);
 }
 
 fn emit_slist_append(out: &mut String, slist: &str, value: &str) {
