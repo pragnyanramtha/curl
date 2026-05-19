@@ -92,6 +92,16 @@ struct RawHttpProxyContext<'a> {
     proxy: &'a ExplicitHttpProxy,
 }
 
+struct RawHttpDirectContext<'a> {
+    transfer: &'a TransferConfig,
+    url: &'a Url,
+    method: &'a Method,
+    prepared_body: Option<&'a PreparedBody>,
+    upload_body: Option<&'a [u8]>,
+    resume_from: u64,
+    referer: Option<&'a str>,
+}
+
 struct HttpAttempt {
     status: StatusCode,
     version: Version,
@@ -2640,10 +2650,9 @@ fn rtsp_options_request(transfer: &TransferConfig) -> Result<Vec<u8>> {
         request.extend_from_slice(format!("Referer: {referer}\r\n").as_bytes());
     }
     for (name, value) in parsed_headers {
-        request.extend_from_slice(name.as_str().as_bytes());
-        request.extend_from_slice(b": ");
-        request.extend_from_slice(value.as_bytes());
-        request.extend_from_slice(b"\r\n");
+        if let Some(value) = value {
+            append_raw_header(&mut request, &name, &value);
+        }
     }
     request.extend_from_slice(b"\r\n");
     Ok(request)
@@ -3018,10 +3027,9 @@ fn ws_handshake_request(transfer: &TransferConfig, url: &Url) -> Result<Vec<u8>>
     request.extend_from_slice(format!("Sec-WebSocket-Key: {WS_KEY}\r\n").as_bytes());
     request.extend_from_slice(b"Connection: Upgrade\r\n");
     for (name, value) in parsed_headers {
-        request.extend_from_slice(name.as_str().as_bytes());
-        request.extend_from_slice(b": ");
-        request.extend_from_slice(value.as_bytes());
-        request.extend_from_slice(b"\r\n");
+        if let Some(value) = value {
+            append_raw_header(&mut request, &name, &value);
+        }
     }
     request.extend_from_slice(b"\r\n");
     Ok(request)
@@ -6239,7 +6247,8 @@ async fn run_http_transfer(
     };
     let mut redirects = 0usize;
 
-    if let Some(proxy) = explicit_http_proxy(transfer)?
+    let explicit_proxy = explicit_http_proxy(transfer)?;
+    if let Some(proxy) = explicit_proxy.as_ref()
         && raw_http_proxy_supported(transfer, &url, has_multipart)
     {
         let attempt = run_raw_http_proxy_transfer(RawHttpProxyContext {
@@ -6250,7 +6259,40 @@ async fn run_http_transfer(
             upload_body: upload_body.as_deref(),
             resume_from,
             referer: custom_referer.as_deref().or(current_referer.as_deref()),
-            proxy: &proxy,
+            proxy,
+        })
+        .await?;
+        metrics.url_effective = attempt.final_url.to_string();
+        metrics.response_code = Some(attempt.status.as_u16());
+        metrics.referer = custom_referer.clone().or_else(|| current_referer.clone());
+        metrics.content_type = attempt
+            .headers
+            .get(CONTENT_TYPE)
+            .and_then(|value| value.to_str().ok())
+            .map(ToString::to_string);
+        metrics.redirect_url = attempt
+            .headers
+            .get(LOCATION)
+            .and_then(|value| value.to_str().ok())
+            .map(ToString::to_string);
+        metrics.headers = attempt.headers.clone();
+        check_http_content_length_max_filesize(transfer, &attempt.headers, method == Method::HEAD)?;
+        metrics.size_download = attempt.body.len() as u64;
+        return Ok(attempt);
+    }
+
+    if explicit_proxy.is_none()
+        && raw_http_direct_supported(transfer, &url, has_multipart)
+        && needs_raw_custom_header_wire_semantics(transfer)?
+    {
+        let attempt = run_raw_http_direct_transfer(RawHttpDirectContext {
+            transfer,
+            url: &url,
+            method: &method,
+            prepared_body: prepared_body.as_ref(),
+            upload_body: upload_body.as_deref(),
+            resume_from,
+            referer: custom_referer.as_deref().or(current_referer.as_deref()),
         })
         .await?;
         metrics.url_effective = attempt.final_url.to_string();
@@ -6389,6 +6431,18 @@ fn raw_http_proxy_supported(transfer: &TransferConfig, url: &Url, has_multipart:
         )
 }
 
+fn raw_http_direct_supported(transfer: &TransferConfig, url: &Url, has_multipart: bool) -> bool {
+    raw_http_proxy_supported(transfer, url, has_multipart)
+}
+
+fn needs_raw_custom_header_wire_semantics(transfer: &TransferConfig) -> Result<bool> {
+    Ok(parse_headers(&transfer.headers)?.iter().any(|(_, value)| {
+        value
+            .as_ref()
+            .is_none_or(|value| value.as_bytes().is_empty())
+    }))
+}
+
 fn explicit_http_proxy(transfer: &TransferConfig) -> Result<Option<ExplicitHttpProxy>> {
     if transfer.noproxy.as_deref().is_some_and(is_global_noproxy) {
         return Ok(None);
@@ -6441,6 +6495,130 @@ async fn run_raw_http_proxy_transfer(context: RawHttpProxyContext<'_>) -> Result
         context.resume_from,
     )
     .await
+}
+
+async fn run_raw_http_direct_transfer(context: RawHttpDirectContext<'_>) -> Result<HttpAttempt> {
+    let request = raw_http_direct_request(&context)?;
+    let host = context
+        .url
+        .host_str()
+        .ok_or_else(|| CurlError::Url("URL is missing a host".to_string()))?;
+    let port = context.url.port_or_known_default().unwrap_or(80);
+    let mut stream = TcpStream::connect((host, port))
+        .await
+        .map_err(tcp_io_error)?;
+    stream.write_all(&request).await.map_err(tcp_io_error)?;
+    raw_http_read_response(
+        &mut stream,
+        context.method,
+        context.url,
+        context.resume_from,
+    )
+    .await
+}
+
+fn raw_http_direct_request(context: &RawHttpDirectContext<'_>) -> Result<Vec<u8>> {
+    let parsed_headers = parse_headers(&context.transfer.headers)?;
+    let has_header = |name: &str| {
+        parsed_headers
+            .iter()
+            .any(|(header_name, _)| header_name.as_str().eq_ignore_ascii_case(name))
+    };
+    let body = raw_http_body(context.transfer, context.prepared_body, context.upload_body);
+    let mut request = Vec::new();
+    request.extend_from_slice(
+        format!(
+            "{} {} HTTP/1.1\r\n",
+            context.method.as_str(),
+            http_request_target(context.url)
+        )
+        .as_bytes(),
+    );
+    if !has_header("host") {
+        request
+            .extend_from_slice(format!("Host: {}\r\n", http_host_header(context.url)).as_bytes());
+    }
+    if !has_header("user-agent")
+        && let Some(user_agent) = effective_user_agent(context.transfer)
+    {
+        request.extend_from_slice(format!("User-Agent: {user_agent}\r\n").as_bytes());
+    }
+    if !has_header("accept") {
+        if context.prepared_body.is_some_and(|body| body.is_json) {
+            request.extend_from_slice(b"Accept: application/json\r\n");
+        } else {
+            request.extend_from_slice(b"Accept: */*\r\n");
+        }
+    }
+    if context.transfer.compressed && !has_header("accept-encoding") {
+        request.extend_from_slice(b"Accept-Encoding: deflate, gzip, br\r\n");
+    }
+    if let Some(cookie) = &context.transfer.cookie
+        && !has_header("cookie")
+    {
+        request.extend_from_slice(format!("Cookie: {cookie}\r\n").as_bytes());
+    }
+    if let Some(token) = &context.transfer.oauth2_bearer
+        && !has_header("authorization")
+    {
+        request.extend_from_slice(format!("Authorization: Bearer {token}\r\n").as_bytes());
+    } else if let Some(user) = &context.transfer.user
+        && context.transfer.oauth2_bearer.is_none()
+        && !has_header("authorization")
+    {
+        request.extend_from_slice(
+            format!(
+                "Authorization: Basic {}\r\n",
+                base64_padded(user.as_bytes())
+            )
+            .as_bytes(),
+        );
+    }
+    if let Some(path) = &context.transfer.etag_compare
+        && !has_header("if-none-match")
+    {
+        request.extend_from_slice(
+            format!("If-None-Match: {}\r\n", load_etag_compare(path)?).as_bytes(),
+        );
+    }
+    if let Some(time_cond) = &context.transfer.time_cond {
+        let (name, value) = time_condition_header(time_cond);
+        if !has_header(name.as_str()) {
+            request.extend_from_slice(name.as_str().as_bytes());
+            request.extend_from_slice(b": ");
+            request.extend_from_slice(value.as_bytes());
+            request.extend_from_slice(b"\r\n");
+        }
+    }
+    if let Some(referer) = context.referer
+        && !has_header("referer")
+    {
+        request.extend_from_slice(format!("Referer: {referer}\r\n").as_bytes());
+    }
+    if let Some(range) = effective_range(context.transfer, context.resume_from)
+        && !has_header("range")
+    {
+        request.extend_from_slice(format!("Range: {}\r\n", range_header_value(&range)).as_bytes());
+    }
+    if context.prepared_body.is_some_and(|body| body.is_json) && !has_header("content-type") {
+        request.extend_from_slice(b"Content-Type: application/json\r\n");
+    }
+    if let Some(body) = body
+        && !body.is_empty()
+        && !has_header("content-length")
+    {
+        request.extend_from_slice(format!("Content-Length: {}\r\n", body.len()).as_bytes());
+    }
+    for (name, value) in parsed_headers {
+        if let Some(value) = value {
+            append_raw_header(&mut request, &name, &value);
+        }
+    }
+    request.extend_from_slice(b"\r\n");
+    if let Some(body) = body {
+        request.extend_from_slice(body);
+    }
+    Ok(request)
 }
 
 fn raw_http_proxy_request(context: &RawHttpProxyContext<'_>) -> Result<Vec<u8>> {
@@ -6539,13 +6717,9 @@ fn raw_http_proxy_request(context: &RawHttpProxyContext<'_>) -> Result<Vec<u8>> 
         request.extend_from_slice(b"Proxy-Connection: Keep-Alive\r\n");
     }
     for (name, value) in parsed_headers {
-        if value.is_empty() {
-            continue;
+        if let Some(value) = value {
+            append_raw_header(&mut request, &name, &value);
         }
-        request.extend_from_slice(name.as_str().as_bytes());
-        request.extend_from_slice(b": ");
-        request.extend_from_slice(value.as_bytes());
-        request.extend_from_slice(b"\r\n");
     }
     request.extend_from_slice(b"\r\n");
     if let Some(body) = body {
@@ -6669,6 +6843,19 @@ fn http_host_header(url: &Url) -> String {
     match url.port() {
         Some(port) if Some(port) != url.port_or_known_default() => format!("{host}:{port}"),
         _ => host,
+    }
+}
+
+fn http_request_target(url: &Url) -> String {
+    let path = if url.path().is_empty() {
+        "/"
+    } else {
+        url.path()
+    };
+    if let Some(query) = url.query() {
+        format!("{path}?{query}")
+    } else {
+        path.to_string()
     }
 }
 
@@ -7083,7 +7270,9 @@ fn apply_headers(
     }
 
     for (name, value) in parsed_headers {
-        request = request.header(name, value);
+        if let Some(value) = value {
+            request = request.header(name, value);
+        }
     }
 
     Ok(request)
@@ -7124,7 +7313,7 @@ fn auto_referer_value(previous: &Url) -> String {
     referer.to_string()
 }
 
-fn parse_headers(headers: &[String]) -> Result<Vec<(HeaderName, HeaderValue)>> {
+fn parse_headers(headers: &[String]) -> Result<Vec<(HeaderName, Option<HeaderValue>)>> {
     let mut parsed = Vec::new();
     for header in headers {
         if let Some(path) = header.strip_prefix('@') {
@@ -7144,20 +7333,49 @@ fn explicit_header_value(headers: &[String], name: &str) -> Result<Option<String
         .into_iter()
         .rev()
         .find(|(header_name, _)| header_name.as_str().eq_ignore_ascii_case(name))
-        .and_then(|(_, value)| value.to_str().ok().map(ToString::to_string)))
+        .map(|(_, value)| {
+            value
+                .and_then(|value| value.to_str().ok().map(ToString::to_string))
+                .unwrap_or_default()
+        }))
 }
 
-fn parse_header(header: &str) -> Result<(HeaderName, HeaderValue)> {
+fn parse_header(header: &str) -> Result<(HeaderName, Option<HeaderValue>)> {
+    if let Some(name) = header.strip_suffix(';')
+        && !name.contains(':')
+    {
+        return Ok((parse_header_name(name)?, Some(HeaderValue::from_static(""))));
+    }
     let Some((name, value)) = header.split_once(':') else {
         return Err(CurlError::Usage(format!(
             "header {header:?} is missing ':'"
         )));
     };
+    let name = parse_header_name(name)?;
+    if value.trim().is_empty() {
+        return Ok((name, None));
+    }
+    let value = HeaderValue::from_str(value.trim_start()).map_err(|error| {
+        CurlError::Usage(format!("bad header value for {}: {error}", name.as_str()))
+    })?;
+    Ok((name, Some(value)))
+}
+
+fn parse_header_name(name: &str) -> Result<HeaderName> {
     let name = HeaderName::from_bytes(name.trim().as_bytes())
         .map_err(|error| CurlError::Usage(format!("bad header name {name:?}: {error}")))?;
-    let value = HeaderValue::from_str(value.trim_start())
-        .map_err(|error| CurlError::Usage(format!("bad header value for {name}: {error}")))?;
-    Ok((name, value))
+    Ok(name)
+}
+
+fn append_raw_header(request: &mut Vec<u8>, name: &HeaderName, value: &HeaderValue) {
+    request.extend_from_slice(name.as_str().as_bytes());
+    if value.as_bytes().is_empty() {
+        request.extend_from_slice(b":\r\n");
+    } else {
+        request.extend_from_slice(b": ");
+        request.extend_from_slice(value.as_bytes());
+        request.extend_from_slice(b"\r\n");
+    }
 }
 
 fn apply_auth(

@@ -1842,6 +1842,49 @@ fn custom_user_agent_and_accept_headers_suppress_defaults() {
 }
 
 #[test]
+fn empty_custom_headers_suppress_defaults_and_semicolon_sends_blank() {
+    let (url, rx) = spawn_server(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok");
+
+    let mut command = Command::cargo_bin("curl").unwrap();
+    command.args([
+        "-q",
+        "-sS",
+        "-H",
+        "Accept:",
+        "-H",
+        "User-Agent:",
+        "-H",
+        "Host:",
+        "-H",
+        "X-Blank;",
+        &url,
+    ]);
+    command.assert().success().stdout("ok");
+
+    let request = rx.recv().unwrap();
+    assert_eq!(header(&request, "accept"), None);
+    assert_eq!(header(&request, "user-agent"), None);
+    assert_eq!(header(&request, "host"), None);
+    assert_eq!(header(&request, "x-blank"), Some(""));
+}
+
+#[test]
+fn header_file_uses_empty_and_semicolon_custom_header_semantics() {
+    let temp = tempdir().unwrap();
+    let headers = temp.path().join("headers.txt");
+    std::fs::write(&headers, "Accept:\nX-File-Blank;\n").unwrap();
+    let (url, rx) = spawn_server(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok");
+
+    let mut command = Command::cargo_bin("curl").unwrap();
+    command.args(["-q", "-sS", "-H", &format!("@{}", headers.display()), &url]);
+    command.assert().success().stdout("ok");
+
+    let request = rx.recv().unwrap();
+    assert_eq!(header(&request, "accept"), None);
+    assert_eq!(header(&request, "x-file-blank"), Some(""));
+}
+
+#[test]
 fn user_agent_option_sets_header_and_empty_value_suppresses_default() {
     let (custom_url, custom_rx) =
         spawn_server(b"HTTP/1.1 200 OK\r\nContent-Length: 6\r\n\r\ncustom");
@@ -5628,6 +5671,37 @@ fn raw_proxy_uses_user_agent_option_and_empty_value_suppresses_default() {
     let empty_request = empty_rx.recv().unwrap();
     assert_eq!(header(&empty_request, "user-agent"), None);
     assert_eq!(header(&empty_request, "accept"), Some("*/*"));
+}
+
+#[test]
+fn raw_proxy_empty_custom_headers_suppress_defaults_and_semicolon_sends_blank() {
+    let (proxy_url, rx) = spawn_server(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok");
+
+    let mut command = Command::cargo_bin("curl").unwrap();
+    command.args([
+        "-q",
+        "-sS",
+        "-x",
+        &proxy_url,
+        "-H",
+        "Accept:",
+        "-H",
+        "User-Agent:",
+        "-H",
+        "X-Blank;",
+        "http://example.test/resource",
+    ]);
+    command.assert().success().stdout("ok");
+
+    let request = rx.recv().unwrap();
+    assert!(
+        request
+            .start_line
+            .starts_with("GET http://example.test/resource HTTP/1.1")
+    );
+    assert_eq!(header(&request, "accept"), None);
+    assert_eq!(header(&request, "user-agent"), None);
+    assert_eq!(header(&request, "x-blank"), Some(""));
 }
 
 #[test]
