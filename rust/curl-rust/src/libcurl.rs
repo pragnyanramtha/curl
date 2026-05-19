@@ -7,7 +7,7 @@ use url::Url;
 use crate::cli::{Config, ContinueAt, HttpVersionPreference, TransferConfig};
 use crate::data::{self, PreparedBody};
 use crate::error::{CurlError, Result};
-use crate::{glob, ipfs};
+use crate::{glob, ipfs, transfer};
 
 pub fn write_source(path: &Path, config: &Config) -> Result<()> {
     let source = render_source(config)?;
@@ -330,11 +330,7 @@ fn write_request(out: &mut String, render: &RenderTransfer<'_>, url: &str) -> Re
     if let Some(user_agent) = &transfer.user_agent {
         emit_string_setopt(out, "CURLOPT_USERAGENT", user_agent);
     } else {
-        emit_string_setopt(
-            out,
-            "CURLOPT_USERAGENT",
-            concat!("curl-rust/", env!("CARGO_PKG_VERSION")),
-        );
+        emit_string_setopt(out, "CURLOPT_USERAGENT", &transfer::default_user_agent());
     }
     emit_http_version(out, transfer.http_version);
     emit_long_setopt(out, "CURLOPT_TCP_KEEPALIVE", 1);

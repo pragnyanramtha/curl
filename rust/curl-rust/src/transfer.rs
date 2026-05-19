@@ -2631,17 +2631,8 @@ fn rtsp_options_request(transfer: &TransferConfig) -> Result<Vec<u8>> {
 
     let mut request = Vec::new();
     request.extend_from_slice(b"OPTIONS * RTSP/1.0\r\nCSeq: 1\r\n");
-    if !has_user_agent {
-        request.extend_from_slice(
-            format!(
-                "User-Agent: {}\r\n",
-                transfer
-                    .user_agent
-                    .as_deref()
-                    .unwrap_or(concat!("curl-rust/", env!("CARGO_PKG_VERSION")))
-            )
-            .as_bytes(),
-        );
+    if !has_user_agent && let Some(user_agent) = effective_user_agent(transfer) {
+        request.extend_from_slice(format!("User-Agent: {user_agent}\r\n").as_bytes());
     }
     if let Some(referer) = &transfer.referer
         && !has_referer
@@ -3014,17 +3005,10 @@ fn ws_handshake_request(transfer: &TransferConfig, url: &Url) -> Result<Vec<u8>>
     if !has_header("host") {
         request.extend_from_slice(format!("Host: {}\r\n", ws_host_header(url)).as_bytes());
     }
-    if !has_header("user-agent") {
-        request.extend_from_slice(
-            format!(
-                "User-Agent: {}\r\n",
-                transfer
-                    .user_agent
-                    .as_deref()
-                    .unwrap_or(concat!("curl-rust/", env!("CARGO_PKG_VERSION")))
-            )
-            .as_bytes(),
-        );
+    if !has_header("user-agent")
+        && let Some(user_agent) = effective_user_agent(transfer)
+    {
+        request.extend_from_slice(format!("User-Agent: {user_agent}\r\n").as_bytes());
     }
     if !has_header("accept") {
         request.extend_from_slice(b"Accept: */*\r\n");
@@ -6480,8 +6464,10 @@ fn raw_http_proxy_request(context: &RawHttpProxyContext<'_>) -> Result<Vec<u8>> 
     {
         request.extend_from_slice(format!("Proxy-Authorization: {authorization}\r\n").as_bytes());
     }
-    if !has_header("user-agent") {
-        request.extend_from_slice(format!("User-Agent: {}\r\n", default_user_agent()).as_bytes());
+    if !has_header("user-agent")
+        && let Some(user_agent) = effective_user_agent(context.transfer)
+    {
+        request.extend_from_slice(format!("User-Agent: {user_agent}\r\n").as_bytes());
     }
     if !has_header("accept") {
         if context.prepared_body.is_some_and(|body| body.is_json) {
@@ -6686,8 +6672,16 @@ fn http_host_header(url: &Url) -> String {
     }
 }
 
-fn default_user_agent() -> String {
+pub(crate) fn default_user_agent() -> String {
     format!("curl/{}", curl_compat_version())
+}
+
+fn effective_user_agent(transfer: &TransferConfig) -> Option<String> {
+    match &transfer.user_agent {
+        Some(user_agent) if user_agent.is_empty() => None,
+        Some(user_agent) => Some(user_agent.clone()),
+        None => Some(default_user_agent()),
+    }
 }
 
 fn curl_compat_version() -> &'static str {
@@ -7025,6 +7019,9 @@ fn apply_headers(
     let has_accept = parsed_headers
         .iter()
         .any(|(name, _)| name.as_str().eq_ignore_ascii_case("accept"));
+    let has_user_agent = parsed_headers
+        .iter()
+        .any(|(name, _)| name.as_str().eq_ignore_ascii_case("user-agent"));
     let has_content_type = parsed_headers
         .iter()
         .any(|(name, _)| name.as_str().eq_ignore_ascii_case("content-type"));
@@ -7032,16 +7029,24 @@ fn apply_headers(
         .iter()
         .any(|(name, _)| name.as_str().eq_ignore_ascii_case("referer"));
 
-    request = request.header(
-        USER_AGENT,
-        transfer
-            .user_agent
-            .as_deref()
-            .unwrap_or(concat!("curl-rust/", env!("CARGO_PKG_VERSION"))),
-    );
+    if !has_user_agent && let Some(user_agent) = effective_user_agent(transfer) {
+        request = request.header(USER_AGENT, user_agent);
+    }
 
     if transfer.compressed {
         request = request.header(ACCEPT_ENCODING, "deflate, gzip, br");
+    }
+
+    let body_is_json = body.is_some_and(|body| body.is_json);
+    if !has_accept {
+        request = request.header(
+            ACCEPT,
+            if body_is_json {
+                "application/json"
+            } else {
+                "*/*"
+            },
+        );
     }
 
     if let Some(cookie) = &transfer.cookie
@@ -7073,13 +7078,8 @@ fn apply_headers(
         request = request.header(RANGE, range_header_value(&range));
     }
 
-    if body.is_some_and(|body| body.is_json) {
-        if !has_content_type {
-            request = request.header(CONTENT_TYPE, "application/json");
-        }
-        if !has_accept {
-            request = request.header(ACCEPT, "application/json");
-        }
+    if body_is_json && !has_content_type {
+        request = request.header(CONTENT_TYPE, "application/json");
     }
 
     for (name, value) in parsed_headers {

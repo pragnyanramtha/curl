@@ -1783,6 +1783,14 @@ fn header<'a>(request: &'a RequestRecord, name: &str) -> Option<&'a str> {
         .map(|(_, value)| value.as_str())
 }
 
+fn header_count(request: &RequestRecord, name: &str) -> usize {
+    request
+        .headers
+        .iter()
+        .filter(|(header_name, _)| header_name == name)
+        .count()
+}
+
 fn expected_dict_request(command: &[u8]) -> Vec<u8> {
     let mut request = Vec::new();
     request.extend_from_slice(
@@ -1805,12 +1813,52 @@ fn downloads_http_and_renders_writeout() {
 
     let request = rx.recv().unwrap();
     assert!(request.start_line.starts_with("GET /resource HTTP/1.1"));
-    assert!(
-        header(&request, "user-agent")
-            .unwrap()
-            .starts_with("curl-rust/")
-    );
+    assert!(header(&request, "user-agent").unwrap().starts_with("curl/"));
+    assert_eq!(header(&request, "accept"), Some("*/*"));
     assert_eq!(header(&request, "accept-encoding"), None);
+}
+
+#[test]
+fn custom_user_agent_and_accept_headers_suppress_defaults() {
+    let (url, rx) = spawn_server(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok");
+
+    let mut command = Command::cargo_bin("curl").unwrap();
+    command.args([
+        "-q",
+        "-sS",
+        "-H",
+        "User-Agent: fixture-agent",
+        "-H",
+        "Accept: application/xml",
+        &url,
+    ]);
+    command.assert().success().stdout("ok");
+
+    let request = rx.recv().unwrap();
+    assert_eq!(header(&request, "user-agent"), Some("fixture-agent"));
+    assert_eq!(header_count(&request, "user-agent"), 1);
+    assert_eq!(header(&request, "accept"), Some("application/xml"));
+    assert_eq!(header_count(&request, "accept"), 1);
+}
+
+#[test]
+fn user_agent_option_sets_header_and_empty_value_suppresses_default() {
+    let (custom_url, custom_rx) =
+        spawn_server(b"HTTP/1.1 200 OK\r\nContent-Length: 6\r\n\r\ncustom");
+
+    let mut custom = Command::cargo_bin("curl").unwrap();
+    custom.args(["-q", "-sS", "-A", "fixture-agent", &custom_url]);
+    custom.assert().success().stdout("custom");
+    let custom_request = custom_rx.recv().unwrap();
+    assert_eq!(header(&custom_request, "user-agent"), Some("fixture-agent"));
+    assert_eq!(header_count(&custom_request, "user-agent"), 1);
+
+    let (empty_url, empty_rx) = spawn_server(b"HTTP/1.1 200 OK\r\nContent-Length: 5\r\n\r\nempty");
+
+    let mut empty = Command::cargo_bin("curl").unwrap();
+    empty.args(["-q", "-sS", "-A", "", &empty_url]);
+    empty.assert().success().stdout("empty");
+    assert_eq!(header(&empty_rx.recv().unwrap(), "user-agent"), None);
 }
 
 #[test]
@@ -3830,11 +3878,7 @@ fn rtsp_default_options_sends_star_uri_and_cseq() {
     let request = rx.recv().unwrap();
     assert_eq!(request.start_line, "OPTIONS * RTSP/1.0");
     assert_eq!(header(&request, "cseq"), Some("1"));
-    assert!(
-        header(&request, "user-agent")
-            .unwrap()
-            .starts_with("curl-rust/")
-    );
+    assert!(header(&request, "user-agent").unwrap().starts_with("curl/"));
     assert_eq!(header(&request, "session"), None);
     assert_eq!(header(&request, "transport"), None);
     assert!(request.body.is_empty());
@@ -4933,7 +4977,7 @@ fn ws_handshake_sends_upgrade_request() {
     assert!(
         header(&record.request, "user-agent")
             .unwrap()
-            .starts_with("curl-rust/")
+            .starts_with("curl/")
     );
     assert_eq!(header(&record.request, "accept"), Some("*/*"));
     assert_eq!(header(&record.request, "upgrade"), Some("websocket"));
@@ -5542,6 +5586,51 @@ fn proxy_user_sets_proxy_authorization_header() {
 }
 
 #[test]
+fn raw_proxy_uses_user_agent_option_and_empty_value_suppresses_default() {
+    let (custom_proxy_url, custom_rx) =
+        spawn_server(b"HTTP/1.1 200 OK\r\nContent-Length: 6\r\n\r\ncustom");
+
+    let mut custom = Command::cargo_bin("curl").unwrap();
+    custom.args([
+        "-q",
+        "-sS",
+        "-x",
+        &custom_proxy_url,
+        "-A",
+        "proxy-agent",
+        "http://example.test/resource",
+    ]);
+    custom.assert().success().stdout("custom");
+    let custom_request = custom_rx.recv().unwrap();
+    assert!(
+        custom_request
+            .start_line
+            .starts_with("GET http://example.test/resource HTTP/1.1")
+    );
+    assert_eq!(header(&custom_request, "user-agent"), Some("proxy-agent"));
+    assert_eq!(header_count(&custom_request, "user-agent"), 1);
+    assert_eq!(header(&custom_request, "accept"), Some("*/*"));
+
+    let (empty_proxy_url, empty_rx) =
+        spawn_server(b"HTTP/1.1 200 OK\r\nContent-Length: 5\r\n\r\nempty");
+
+    let mut empty = Command::cargo_bin("curl").unwrap();
+    empty.args([
+        "-q",
+        "-sS",
+        "-x",
+        &empty_proxy_url,
+        "-A",
+        "",
+        "http://example.test/resource",
+    ]);
+    empty.assert().success().stdout("empty");
+    let empty_request = empty_rx.recv().unwrap();
+    assert_eq!(header(&empty_request, "user-agent"), None);
+    assert_eq!(header(&empty_request, "accept"), Some("*/*"));
+}
+
+#[test]
 fn noproxy_bypasses_configured_proxy() {
     let (target_url, target_rx) =
         spawn_server(b"HTTP/1.1 200 OK\r\nContent-Length: 6\r\n\r\ntarget");
@@ -5889,6 +5978,23 @@ fn libcurl_writes_source_file_for_supported_options() {
     )));
     assert!(text.contains("CURLOPT_COOKIESESSION, 1"));
     assert!(text.contains("curl_easy_perform(curl);"));
+}
+
+#[test]
+fn libcurl_writes_curl_compatible_default_user_agent() {
+    let (url, rx) = spawn_server(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok");
+    let temp = tempdir().unwrap();
+    let source = temp.path().join("client.c");
+
+    let mut command = Command::cargo_bin("curl").unwrap();
+    command.args(["-q", "-sS", "--libcurl", source.to_str().unwrap(), &url]);
+    command.assert().success().stdout("ok");
+
+    let request = rx.recv().unwrap();
+    assert!(header(&request, "user-agent").unwrap().starts_with("curl/"));
+    let text = std::fs::read_to_string(source).unwrap();
+    assert!(text.contains("CURLOPT_USERAGENT, \"curl/"));
+    assert!(!text.contains("CURLOPT_USERAGENT, \"curl-rust/"));
 }
 
 #[test]
