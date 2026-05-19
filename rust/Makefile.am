@@ -43,7 +43,10 @@ check-local: rust-test rust-corpus-test
 rust-test:
 	CARGO_TARGET_DIR="$(RUST_CARGO_TARGET_DIR)" $(CARGO) test --locked --manifest-path "$(abs_srcdir)/curl-rust/Cargo.toml"
 
-rust-corpus-test: rust-curl
+rust-testdeps:
+	$(MAKE) -C "$(abs_top_builddir)/tests" all
+
+rust-corpus-test: rust-curl rust-testdeps
 	@(cd "$(abs_top_builddir)/tests" && \
 	  srcdir="$(abs_top_srcdir)/tests" $(PERL) "$(abs_top_srcdir)/tests/runtests.pl" \
 	    -n -a -s -c "$(RUST_CURL_SIDECAR)" \
@@ -52,4 +55,4 @@ rust-corpus-test: rust-curl
 clean-local:
 	rm -rf "$(RUST_CARGO_TARGET_DIR)" "$(abs_builddir)/bin"
 
-.PHONY: rust-curl rust-test rust-corpus-test
+.PHONY: rust-curl rust-test rust-testdeps rust-corpus-test

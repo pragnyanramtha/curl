@@ -11,6 +11,7 @@ set(_curl_rust_sidecar "${CMAKE_CURRENT_BINARY_DIR}/bin/curl-rust${CMAKE_EXECUTA
 file(GLOB_RECURSE _curl_rust_sources CONFIGURE_DEPENDS
   "${PROJECT_SOURCE_DIR}/Cargo.toml"
   "${PROJECT_SOURCE_DIR}/Cargo.lock"
+  "${PROJECT_SOURCE_DIR}/include/curl/curlver.h"
   "${CMAKE_CURRENT_SOURCE_DIR}/curl-rust/Cargo.toml"
   "${CMAKE_CURRENT_SOURCE_DIR}/curl-rust/src/*.rs"
   "${CMAKE_CURRENT_SOURCE_DIR}/curl-rust/tests/*.rs"
