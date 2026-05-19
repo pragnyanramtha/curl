@@ -102,6 +102,7 @@ pub struct TransferConfig {
     pub show_error: bool,
     pub globoff: bool,
     pub create_dirs: bool,
+    pub http09_allowed: bool,
     pub http_version: HttpVersionPreference,
     pub ssl_version: Option<SslVersionPreference>,
     pub ip_version: IpVersionPreference,
@@ -229,6 +230,7 @@ impl Default for TransferConfig {
             show_error: false,
             globoff: false,
             create_dirs: false,
+            http09_allowed: false,
             http_version: HttpVersionPreference::Any,
             ssl_version: None,
             ip_version: IpVersionPreference::Any,
@@ -645,6 +647,7 @@ impl Parser {
             "show-error" => self.current().show_error = true,
             "globoff" => self.current().globoff = true,
             "create-dirs" => self.current().create_dirs = true,
+            "http0.9" => self.current().http09_allowed = true,
             "http1.0" => self.current().http_version = HttpVersionPreference::Http10,
             "http1.1" => self.current().http_version = HttpVersionPreference::Http11,
             "http2" => {
@@ -705,6 +708,7 @@ impl Parser {
             "show-error" => self.current().show_error = false,
             "globoff" => self.current().globoff = false,
             "create-dirs" => self.current().create_dirs = false,
+            "http0.9" => self.current().http09_allowed = false,
             other => return Err(CurlError::Usage(format!("unknown option --no-{other}"))),
         }
         Ok(())
@@ -1220,6 +1224,7 @@ impl TransferConfig {
             || self.show_error
             || self.globoff
             || self.create_dirs
+            || self.http09_allowed
             || self.http_version != HttpVersionPreference::Any
             || self.ssl_version.is_some()
             || self.ip_version != IpVersionPreference::Any
@@ -1734,6 +1739,7 @@ fn print_common_help() {
                --variable <name=data>  Set command-line variable\n\
                --expand-* <value>      Expand variables in option value\n\
                --libcurl <file>        Generate libcurl code\n\
+               --http0.9              Allow HTTP/0.9 responses\n\
            -X, --request <method>      Specify request method\n\
                --request-target <path> Specify request target\n\
            -u, --user <user:pass>      Server user and password\n\
@@ -1984,6 +1990,16 @@ mod tests {
     }
 
     #[test]
+    fn parses_http09_boolean_option() {
+        let config = parse_args(["-q", "--http0.9", "https://example.com"]).unwrap();
+        assert!(config.transfers[0].http09_allowed);
+
+        let config =
+            parse_args(["-q", "--http0.9", "--no-http0.9", "https://example.com"]).unwrap();
+        assert!(!config.transfers[0].http09_allowed);
+    }
+
+    #[test]
     fn config_files_parse_request_target_option() {
         let temp = tempdir().unwrap();
         let config_file = temp.path().join("curlrc");
@@ -1995,6 +2011,20 @@ mod tests {
 
         let config = parse_args(["-q", "--config", config_file.to_str().unwrap()]).unwrap();
         assert_eq!(config.transfers[0].request_target.as_deref(), Some("*"));
+    }
+
+    #[test]
+    fn config_files_parse_http09_boolean_option() {
+        let temp = tempdir().unwrap();
+        let config_file = temp.path().join("curlrc");
+        std::fs::write(
+            &config_file,
+            "http0.9\nno-http0.9\nurl = https://example.com\n",
+        )
+        .unwrap();
+
+        let config = parse_args(["-q", "--config", config_file.to_str().unwrap()]).unwrap();
+        assert!(!config.transfers[0].http09_allowed);
     }
 
     #[test]

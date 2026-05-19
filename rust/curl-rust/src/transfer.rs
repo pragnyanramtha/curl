@@ -1,3 +1,4 @@
+use std::error::Error as StdError;
 use std::io::{self, Read, Write};
 use std::net::{IpAddr, SocketAddr, TcpStream as StdTcpStream, ToSocketAddrs};
 use std::path::{Path, PathBuf};
@@ -107,7 +108,7 @@ struct RawHttpDirectContext<'a> {
 
 struct HttpAttempt {
     method: Method,
-    status: StatusCode,
+    status: Option<StatusCode>,
     version: Version,
     final_url: Url,
     headers: reqwest::header::HeaderMap,
@@ -293,6 +294,10 @@ fn build_client(transfer: &TransferConfig, cookie_jar: Option<Arc<CookieJar>>) -
         .redirect(redirect)
         .referer(false)
         .danger_accept_invalid_certs(transfer.insecure);
+
+    if transfer.http09_allowed {
+        builder = builder.http09_responses();
+    }
 
     if let Some(version) = transfer.ssl_version {
         builder = builder.min_tls_version(reqwest_tls_version(version));
@@ -6452,7 +6457,7 @@ async fn run_http_transfer(
         })
         .await?;
         metrics.url_effective = attempt.final_url.to_string();
-        metrics.response_code = Some(attempt.status.as_u16());
+        metrics.response_code = attempt.status.map(|status| status.as_u16());
         metrics.referer = custom_referer.clone().or_else(|| current_referer.clone());
         metrics.content_type = attempt
             .headers
@@ -6485,7 +6490,7 @@ async fn run_http_transfer(
         })
         .await?;
         metrics.url_effective = attempt.final_url.to_string();
-        metrics.response_code = Some(attempt.status.as_u16());
+        metrics.response_code = attempt.status.map(|status| status.as_u16());
         metrics.referer = custom_referer.clone().or_else(|| current_referer.clone());
         metrics.content_type = attempt
             .headers
@@ -6556,11 +6561,17 @@ async fn run_http_transfer(
             eprintln!("> {} {}", current_method.as_str(), url);
         }
 
-        let response = request.send().await.transfer_err()?;
+        let response = request
+            .send()
+            .await
+            .map_err(|error| http_send_error(error, transfer))?;
         let status = response.status();
         let version = response.version();
         let final_url = response.url().clone();
         let headers = response.headers().clone();
+        if version == Version::HTTP_09 && current_method == Method::HEAD {
+            return Err(CurlError::WeirdServerReply);
+        }
 
         if transfer.verbose {
             eprintln!("< {}", status_line(version, status));
@@ -6599,7 +6610,8 @@ async fn run_http_transfer(
         }
 
         metrics.url_effective = final_url.to_string();
-        metrics.response_code = Some(status.as_u16());
+        let attempt_status = (version != Version::HTTP_09).then_some(status);
+        metrics.response_code = attempt_status.map(|status| status.as_u16());
         metrics.referer = custom_referer.clone().or_else(|| current_referer.clone());
         metrics.content_type = headers
             .get(CONTENT_TYPE)
@@ -6626,7 +6638,7 @@ async fn run_http_transfer(
 
         return Ok(HttpAttempt {
             method: current_method,
-            status,
+            status: attempt_status,
             version,
             final_url,
             headers,
@@ -6715,6 +6727,7 @@ async fn run_raw_http_proxy_transfer(context: RawHttpProxyContext<'_>) -> Result
         context.method,
         context.url,
         context.resume_from,
+        context.transfer.http09_allowed,
     )
     .await
 }
@@ -6733,6 +6746,7 @@ async fn run_raw_http_direct_transfer(context: RawHttpDirectContext<'_>) -> Resu
         context.method,
         context.url,
         context.resume_from,
+        context.transfer.http09_allowed,
     )
     .await
 }
@@ -6970,15 +6984,33 @@ async fn raw_http_read_response(
     method: &Method,
     final_url: &Url,
     resume_from: u64,
+    http09_allowed: bool,
 ) -> Result<HttpAttempt> {
     let mut header_bytes = Vec::new();
     let mut byte = [0_u8; 1];
     loop {
         let read = stream.read(&mut byte).await.map_err(tcp_io_error)?;
         if read == 0 {
+            if !header_bytes.is_empty() {
+                return raw_http09_attempt(
+                    method,
+                    final_url,
+                    resume_from,
+                    http09_allowed,
+                    header_bytes,
+                );
+            }
             return Err(CurlError::GotNothing);
         }
         header_bytes.push(byte[0]);
+        if !raw_http_header_prefix_possible(&header_bytes) {
+            if http09_allowed {
+                let mut body = header_bytes;
+                stream.read_to_end(&mut body).await.map_err(tcp_io_error)?;
+                return raw_http09_attempt(method, final_url, resume_from, true, body);
+            }
+            return Err(CurlError::UnsupportedProtocol("HTTP/0.9".to_string()));
+        }
         if header_bytes.ends_with(b"\r\n\r\n") || header_bytes.ends_with(b"\n\n") {
             break;
         }
@@ -7008,13 +7040,47 @@ async fn raw_http_read_response(
 
     Ok(HttpAttempt {
         method: method.clone(),
-        status,
+        status: Some(status),
         version,
         final_url: final_url.clone(),
         headers,
         header_bytes: Some(header_bytes),
         body,
         retry_after,
+        resume_from,
+    })
+}
+
+fn raw_http_header_prefix_possible(bytes: &[u8]) -> bool {
+    bytes.starts_with(b"HTTP/") || b"HTTP/".starts_with(bytes)
+}
+
+fn raw_http09_attempt(
+    method: &Method,
+    final_url: &Url,
+    resume_from: u64,
+    http09_allowed: bool,
+    body: Vec<u8>,
+) -> Result<HttpAttempt> {
+    if !http09_allowed {
+        return Err(CurlError::UnsupportedProtocol("HTTP/0.9".to_string()));
+    }
+    if method == Method::HEAD {
+        return Err(CurlError::WeirdServerReply);
+    }
+    Ok(HttpAttempt {
+        method: method.clone(),
+        status: None,
+        version: Version::HTTP_09,
+        final_url: final_url.clone(),
+        headers: reqwest::header::HeaderMap::new(),
+        header_bytes: Some(Vec::new()),
+        body: if method == Method::HEAD {
+            Vec::new()
+        } else {
+            body
+        },
+        retry_after: None,
         resume_from,
     })
 }
@@ -7058,6 +7124,31 @@ fn parse_raw_http_headers(
     Ok((version, status, headers))
 }
 
+fn http_send_error(error: reqwest::Error, transfer: &TransferConfig) -> CurlError {
+    if !transfer.http09_allowed && reqwest_error_is_http09_denial(&error) {
+        CurlError::UnsupportedProtocol("HTTP/0.9".to_string())
+    } else {
+        CurlError::Transfer(error.to_string())
+    }
+}
+
+fn reqwest_error_is_http09_denial(error: &reqwest::Error) -> bool {
+    let debug = format!("{error:?}");
+    if debug.contains("Parse(Version)") || debug.contains("invalid HTTP version") {
+        return true;
+    }
+
+    let mut source = StdError::source(error);
+    while let Some(error) = source {
+        let message = error.to_string();
+        if message.contains("invalid HTTP version") {
+            return true;
+        }
+        source = error.source();
+    }
+    false
+}
+
 fn http_host_header(url: &Url) -> String {
     let host = url.host_str().unwrap_or("");
     let host = if host.contains(':') && !host.starts_with('[') {
@@ -7065,8 +7156,13 @@ fn http_host_header(url: &Url) -> String {
     } else {
         host.to_string()
     };
+    let default_port = match url.scheme() {
+        "http" | "ws" => Some(80),
+        "https" | "wss" => Some(443),
+        _ => None,
+    };
     match url.port() {
-        Some(port) if Some(port) != url.port_or_known_default() => format!("{host}:{port}"),
+        Some(port) if Some(port) != default_port => format!("{host}:{port}"),
         _ => host,
     }
 }
@@ -7124,7 +7220,7 @@ async fn run_http_with_retries(
                     && retry_delay_for_next(transfer, metrics, retry_started, attempt.retry_after)
                         .is_some()
                 {
-                    if transfer.fail_with_body && is_http_error_status(attempt.status) {
+                    if transfer.fail_with_body && attempt.status.is_some_and(is_http_error_status) {
                         let _ = write_http_attempt_output(
                             transfer,
                             expanded,
@@ -7176,11 +7272,13 @@ fn finish_http_transfer(
     }
 
     if transfer.fail
-        && is_http_error_status(attempt.status)
-        && !is_resume_416(&attempt.method, attempt.resume_from, attempt.status)
+        && attempt.status.is_some_and(is_http_error_status)
+        && !attempt
+            .status
+            .is_some_and(|status| is_resume_416(&attempt.method, attempt.resume_from, status))
     {
         return Err(CurlError::HttpStatus {
-            status: attempt.status.as_u16(),
+            status: attempt.status.expect("checked HTTP error status").as_u16(),
         });
     }
 
@@ -7196,7 +7294,10 @@ fn write_http_attempt_output(
     persist_headers: bool,
 ) -> Result<bool> {
     let header_bytes = attempt.header_bytes.clone().unwrap_or_else(|| {
-        output::render_headers(attempt.version, attempt.status, &attempt.headers)
+        attempt
+            .status
+            .map(|status| output::render_headers(attempt.version, status, &attempt.headers))
+            .unwrap_or_default()
     });
     if persist_headers && let Some(path) = &transfer.dump_header {
         output::dump_headers(path, &header_bytes, transfer.create_dirs)?;
@@ -7205,7 +7306,7 @@ fn write_http_attempt_output(
         save_etag(path, &attempt.headers, transfer.create_dirs)?;
     }
 
-    let is_error = is_http_error_status(attempt.status);
+    let is_error = attempt.status.is_some_and(is_http_error_status);
     let write_headers = transfer.include_headers || transfer.head;
     let write_body =
         method.as_str() != "HEAD" && (!is_error || !transfer.fail || transfer.fail_with_body);
@@ -7277,13 +7378,16 @@ fn is_http_error_status(status: StatusCode) -> bool {
 }
 
 fn should_retry_http_attempt(transfer: &TransferConfig, attempt: &HttpAttempt) -> bool {
-    if is_retryable_http_status(attempt.status) {
+    let Some(status) = attempt.status else {
+        return false;
+    };
+    if is_retryable_http_status(status) {
         return true;
     }
 
     transfer.retry_all_errors
         && transfer.fail
-        && (attempt.status.is_client_error() || attempt.status.is_server_error())
+        && (status.is_client_error() || status.is_server_error())
 }
 
 fn should_retry_transfer_error(transfer: &TransferConfig, error: &CurlError) -> bool {

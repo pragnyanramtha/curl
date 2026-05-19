@@ -2088,6 +2088,138 @@ fn request_target_sets_direct_http_request_line() {
 }
 
 #[test]
+fn http09_allows_headerless_response() {
+    let (url, rx) = spawn_server(b"hello http09");
+
+    let mut command = Command::cargo_bin("curl").unwrap();
+    command.args([
+        "-q",
+        "-sS",
+        "--http0.9",
+        "-w",
+        " %{response_code} %{size_download}",
+        &url,
+    ]);
+    command.assert().success().stdout("hello http09 000 12");
+
+    let request = rx.recv().unwrap();
+    assert!(request.start_line.starts_with("GET /resource HTTP/1.1"));
+}
+
+#[test]
+fn http09_response_is_denied_by_default() {
+    let (url, rx) = spawn_server(b"hello http09");
+
+    let mut command = Command::cargo_bin("curl").unwrap();
+    command.args(["-q", "-sS", &url]);
+    command.assert().failure().code(1).stdout("");
+
+    let request = rx.recv().unwrap();
+    assert!(request.start_line.starts_with("GET /resource HTTP/1.1"));
+}
+
+#[test]
+fn no_http09_denies_headerless_response_after_enable() {
+    let (url, rx) = spawn_server(b"hello http09");
+
+    let mut command = Command::cargo_bin("curl").unwrap();
+    command.args(["-q", "-sS", "--http0.9", "--no-http0.9", &url]);
+    command.assert().failure().code(1).stdout("");
+
+    let request = rx.recv().unwrap();
+    assert!(request.start_line.starts_with("GET /resource HTTP/1.1"));
+}
+
+#[test]
+fn http09_denial_with_writeout_uses_unsupported_protocol_exit() {
+    let (url, rx) = spawn_server(b"hello http09");
+
+    let mut command = Command::cargo_bin("curl").unwrap();
+    command.args([
+        "-q",
+        "-sS",
+        "-w",
+        " code=%{response_code} exit=%{exitcode}",
+        &url,
+    ]);
+    command
+        .assert()
+        .failure()
+        .code(1)
+        .stdout(" code=000 exit=1");
+
+    let request = rx.recv().unwrap();
+    assert!(request.start_line.starts_with("GET /resource HTTP/1.1"));
+}
+
+#[test]
+fn default_http_get_decodes_chunked_response() {
+    let (url, rx) = spawn_server(
+        b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n5\r\nhello\r\n0\r\n\r\n",
+    );
+
+    let mut command = Command::cargo_bin("curl").unwrap();
+    command.args(["-q", "-sS", &url]);
+    command.assert().success().stdout("hello");
+
+    let request = rx.recv().unwrap();
+    assert!(request.start_line.starts_with("GET /resource HTTP/1.1"));
+}
+
+#[test]
+fn raw_http09_response_requires_opt_in() {
+    let (url, rx) = spawn_server(b"raw http09");
+
+    let mut command = Command::cargo_bin("curl").unwrap();
+    command.args(["-q", "-sS", "--request-target", "*", "-X", "OPTIONS", &url]);
+    command.assert().failure().code(1).stdout("");
+
+    let request = rx.recv().unwrap();
+    assert_eq!(request.start_line, "OPTIONS * HTTP/1.1");
+}
+
+#[test]
+fn raw_http09_allows_headerless_response() {
+    let (url, rx) = spawn_server(b"raw http09");
+
+    let mut command = Command::cargo_bin("curl").unwrap();
+    command.args([
+        "-q",
+        "-sS",
+        "--http0.9",
+        "--request-target",
+        "*",
+        "-X",
+        "OPTIONS",
+        &url,
+    ]);
+    command.assert().success().stdout("raw http09");
+
+    let request = rx.recv().unwrap();
+    assert_eq!(request.start_line, "OPTIONS * HTTP/1.1");
+}
+
+#[test]
+fn raw_http09_head_is_weird_reply() {
+    let (url, rx) = spawn_server(b"raw http09");
+
+    let mut command = Command::cargo_bin("curl").unwrap();
+    command.args([
+        "-q",
+        "-sS",
+        "--http0.9",
+        "--request-target",
+        "*",
+        "-I",
+        &url,
+    ]);
+    command.assert().failure().code(8).stdout("");
+
+    let request = rx.recv().unwrap();
+    assert_eq!(request.start_line, "HEAD * HTTP/1.1");
+}
+
+#[test]
 fn resolve_maps_host_to_address() {
     let (url, rx) = spawn_server(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok");
     let port = Url::parse(&url).unwrap().port().unwrap();
@@ -6312,6 +6444,7 @@ fn libcurl_writes_request_target_option() {
         "-sS",
         "--libcurl",
         source.to_str().unwrap(),
+        "--http0.9",
         "--request-target",
         "*",
         "-X",
@@ -6325,6 +6458,7 @@ fn libcurl_writes_request_target_option() {
 
     let text = std::fs::read_to_string(source).unwrap();
     assert!(text.contains("CURLOPT_CUSTOMREQUEST, \"OPTIONS\""));
+    assert!(text.contains("CURLOPT_HTTP09_ALLOWED, 1"));
     assert!(text.contains("CURLOPT_REQUEST_TARGET, \"*\""));
 }
 

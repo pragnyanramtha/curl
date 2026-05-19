@@ -317,6 +317,9 @@ fn write_request(out: &mut String, render: &RenderTransfer<'_>, url: &str) -> Re
     if transfer.follow_location {
         emit_long_setopt(out, "CURLOPT_FOLLOWLOCATION", 1);
     }
+    if transfer.http09_allowed {
+        emit_long_setopt(out, "CURLOPT_HTTP09_ALLOWED", 1);
+    }
     emit_long_setopt(out, "CURLOPT_MAXREDIRS", transfer.max_redirs as i64);
     if let Some(cookie) = &transfer.cookie {
         emit_string_setopt(out, "CURLOPT_COOKIE", cookie);
