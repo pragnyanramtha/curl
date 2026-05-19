@@ -245,6 +245,7 @@ struct FtpServerOptions {
     pwd_denied: bool,
     cwd_denied: bool,
     type_denied: bool,
+    rest_denied: bool,
     retr_denied: bool,
     size: Option<u64>,
     mdtm: Option<&'static str>,
@@ -411,6 +412,7 @@ fn ftp_options(data: impl Into<Vec<u8>>) -> FtpServerOptions {
         pwd_denied: false,
         cwd_denied: false,
         type_denied: false,
+        rest_denied: false,
         retr_denied: false,
         size,
         mdtm: Some("20030409102659"),
@@ -429,6 +431,7 @@ fn spawn_ftp_server(path: &str, options: FtpServerOptions) -> (String, Receiver<
         let mut commands = Vec::new();
         let mut data_connections = 0_usize;
         let mut passive_listener: Option<TcpListener> = None;
+        let mut restart_offset = 0_usize;
 
         while let Some(line) = read_pop3_client_line(&mut stream) {
             commands.extend_from_slice(&line);
@@ -508,8 +511,15 @@ fn spawn_ftp_server(path: &str, options: FtpServerOptions) -> (String, Receiver<
                 } else {
                     stream.write_all(b"550 MDTM failed\r\n").unwrap();
                 }
-            } else if command == "REST 0" {
-                stream.write_all(b"350 Restarting at 0\r\n").unwrap();
+            } else if let Some(offset) = command.strip_prefix("REST ") {
+                if options.rest_denied {
+                    stream.write_all(b"500 REST failed\r\n").unwrap();
+                    continue;
+                }
+                restart_offset = offset.parse::<usize>().unwrap();
+                stream
+                    .write_all(format!("350 Restarting at {restart_offset}\r\n").as_bytes())
+                    .unwrap();
             } else if command.starts_with("RETR ") || command == "LIST" || command == "NLST" {
                 if options.retr_denied {
                     stream.write_all(b"550 File unavailable\r\n").unwrap();
@@ -520,9 +530,11 @@ fn spawn_ftp_server(path: &str, options: FtpServerOptions) -> (String, Receiver<
                     .unwrap();
                 let listener = passive_listener.take().expect("passive listener");
                 let (mut data_stream, _) = listener.accept().unwrap();
-                data_stream.write_all(&options.data).unwrap();
+                let body = options.data.get(restart_offset..).unwrap_or_default();
+                data_stream.write_all(body).unwrap();
                 let _ = data_stream.shutdown(Shutdown::Both);
                 data_connections += 1;
+                restart_offset = 0;
                 stream.write_all(b"226 Transfer complete\r\n").unwrap();
             } else if command == "QUIT" {
                 let _ = stream.write_all(b"221 Bye\r\n");
@@ -3040,6 +3052,158 @@ fn ftp_writeout_reports_transfer_code_and_download_size() {
     command.assert().success().stdout("abcdef code=226 size=6");
 
     rx.recv().unwrap();
+}
+
+#[test]
+fn ftp_continue_at_fixed_offset_sends_rest_and_appends_output() {
+    let temp = tempdir().unwrap();
+    let output = temp.path().join("download.txt");
+    std::fs::write(&output, "hel").unwrap();
+    let (url, rx) = spawn_ftp_server("/file.txt", ftp_options(b"hello"));
+
+    let mut command = Command::cargo_bin("curl").unwrap();
+    command.args(["-q", "-sS", "-C", "3", "-o", output.to_str().unwrap(), &url]);
+    command.assert().success().stdout("");
+
+    assert_eq!(std::fs::read_to_string(&output).unwrap(), "hello");
+    let record = rx.recv().unwrap();
+    assert_eq!(
+        record.commands,
+        b"USER anonymous\r\nPASS ftp@example.com\r\nPWD\r\nEPSV\r\nTYPE I\r\nSIZE file.txt\r\nREST 3\r\nRETR file.txt\r\nQUIT\r\n"
+    );
+    assert_eq!(record.data_connections, 1);
+}
+
+#[test]
+fn ftp_continue_at_auto_uses_existing_output_size() {
+    let temp = tempdir().unwrap();
+    let output = temp.path().join("download.txt");
+    std::fs::write(&output, "he").unwrap();
+    let (url, rx) = spawn_ftp_server("/file.txt", ftp_options(b"hello"));
+
+    let mut command = Command::cargo_bin("curl").unwrap();
+    command.args([
+        "-q",
+        "-sS",
+        "--continue-at",
+        "-",
+        "-o",
+        output.to_str().unwrap(),
+        &url,
+    ]);
+    command.assert().success().stdout("");
+
+    assert_eq!(std::fs::read_to_string(&output).unwrap(), "hello");
+    let record = rx.recv().unwrap();
+    assert_eq!(
+        record.commands,
+        b"USER anonymous\r\nPASS ftp@example.com\r\nPWD\r\nEPSV\r\nTYPE I\r\nSIZE file.txt\r\nREST 2\r\nRETR file.txt\r\nQUIT\r\n"
+    );
+}
+
+#[test]
+fn ftp_continue_at_fixed_offset_to_stdout_sends_rest() {
+    let (url, rx) = spawn_ftp_server("/file.txt", ftp_options(b"hello"));
+
+    let mut command = Command::cargo_bin("curl").unwrap();
+    command.args(["-q", "-sS", "-C", "2", &url]);
+    command.assert().success().stdout("llo");
+
+    let record = rx.recv().unwrap();
+    assert_eq!(
+        record.commands,
+        b"USER anonymous\r\nPASS ftp@example.com\r\nPWD\r\nEPSV\r\nTYPE I\r\nSIZE file.txt\r\nREST 2\r\nRETR file.txt\r\nQUIT\r\n"
+    );
+}
+
+#[test]
+fn ftp_continue_at_auto_to_stdout_uses_zero_offset() {
+    let (url, rx) = spawn_ftp_server("/file.txt", ftp_options(b"hello"));
+
+    let mut command = Command::cargo_bin("curl").unwrap();
+    command.args(["-q", "-sS", "-C", "-", &url]);
+    command.assert().success().stdout("hello");
+
+    let record = rx.recv().unwrap();
+    assert_eq!(
+        record.commands,
+        b"USER anonymous\r\nPASS ftp@example.com\r\nPWD\r\nEPSV\r\nTYPE I\r\nSIZE file.txt\r\nRETR file.txt\r\nQUIT\r\n"
+    );
+}
+
+#[test]
+fn ftp_continue_at_without_size_still_sends_rest() {
+    let mut options = ftp_options(b"hello");
+    options.size = None;
+    let (url, rx) = spawn_ftp_server("/file.txt", options);
+
+    let mut command = Command::cargo_bin("curl").unwrap();
+    command.args(["-q", "-sS", "-C", "2", &url]);
+    command.assert().success().stdout("llo");
+
+    let record = rx.recv().unwrap();
+    assert_eq!(
+        record.commands,
+        b"USER anonymous\r\nPASS ftp@example.com\r\nPWD\r\nEPSV\r\nTYPE I\r\nSIZE file.txt\r\nREST 2\r\nRETR file.txt\r\nQUIT\r\n"
+    );
+}
+
+#[test]
+fn ftp_continue_at_complete_skips_retr() {
+    let temp = tempdir().unwrap();
+    let output = temp.path().join("download.txt");
+    std::fs::write(&output, "hello").unwrap();
+    let (url, rx) = spawn_ftp_server("/file.txt", ftp_options(b"hello"));
+
+    let mut command = Command::cargo_bin("curl").unwrap();
+    command.args(["-q", "-sS", "-C", "-", "-o", output.to_str().unwrap(), &url]);
+    command.assert().success().stdout("");
+
+    assert_eq!(std::fs::read_to_string(&output).unwrap(), "hello");
+    let record = rx.recv().unwrap();
+    assert_eq!(
+        record.commands,
+        b"USER anonymous\r\nPASS ftp@example.com\r\nPWD\r\nEPSV\r\nTYPE I\r\nSIZE file.txt\r\nQUIT\r\n"
+    );
+    assert_eq!(record.data_connections, 0);
+}
+
+#[test]
+fn ftp_continue_at_rest_failure_returns_rest_error() {
+    let temp = tempdir().unwrap();
+    let output = temp.path().join("download.txt");
+    std::fs::write(&output, "he").unwrap();
+    let mut options = ftp_options(b"hello");
+    options.rest_denied = true;
+    let (url, rx) = spawn_ftp_server("/file.txt", options);
+
+    let mut command = Command::cargo_bin("curl").unwrap();
+    command.args(["-q", "-sS", "-C", "2", "-o", output.to_str().unwrap(), &url]);
+    command.assert().failure().code(31).stdout("");
+
+    assert_eq!(std::fs::read_to_string(&output).unwrap(), "he");
+    let record = rx.recv().unwrap();
+    assert_eq!(
+        record.commands,
+        b"USER anonymous\r\nPASS ftp@example.com\r\nPWD\r\nEPSV\r\nTYPE I\r\nSIZE file.txt\r\nREST 2\r\nQUIT\r\n"
+    );
+    assert_eq!(record.data_connections, 0);
+}
+
+#[test]
+fn ftp_continue_at_beyond_size_returns_bad_resume() {
+    let (url, rx) = spawn_ftp_server("/file.txt", ftp_options(b"hello"));
+
+    let mut command = Command::cargo_bin("curl").unwrap();
+    command.args(["-q", "-sS", "-C", "10", &url]);
+    command.assert().failure().code(36).stdout("");
+
+    let record = rx.recv().unwrap();
+    assert_eq!(
+        record.commands,
+        b"USER anonymous\r\nPASS ftp@example.com\r\nPWD\r\nEPSV\r\nTYPE I\r\nSIZE file.txt\r\nQUIT\r\n"
+    );
+    assert_eq!(record.data_connections, 0);
 }
 
 #[test]

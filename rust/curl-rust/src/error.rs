@@ -40,6 +40,8 @@ pub enum CurlError {
     FtpCouldntSetType,
     #[error("FTP could not retrieve file")]
     FtpCouldntRetrFile,
+    #[error("FTP: command REST failed")]
+    FtpCouldntUseRest,
     #[error("remote access denied")]
     RemoteAccessDenied,
     #[error("quote command failed")]
@@ -56,6 +58,8 @@ pub enum CurlError {
     HttpStatus { status: u16 },
     #[error("HTTP server does not seem to support byte ranges. Cannot resume.")]
     RangeError,
+    #[error("Cannot resume transfer")]
+    BadDownloadResume,
     #[error("Maximum file size exceeded")]
     FileSizeExceeded,
     #[error("Login denied")]
@@ -107,10 +111,12 @@ impl CurlError {
             Self::FtpWeirdPasvReply => 13,
             Self::FtpCouldntSetType => 17,
             Self::FtpCouldntRetrFile => 19,
+            Self::FtpCouldntUseRest => 31,
             Self::QuoteError => 21,
             Self::TooManyRedirects { .. } => 47,
             Self::HttpStatus { .. } => 22,
             Self::RangeError => 33,
+            Self::BadDownloadResume => 36,
             Self::FileSizeExceeded => 63,
             Self::LoginDenied | Self::UrlCredentialsProhibited => 67,
             Self::PeerVerificationFailed => 60,

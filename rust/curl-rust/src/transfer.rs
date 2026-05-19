@@ -822,9 +822,9 @@ async fn run_ftp_transfer(
             "--oauth2-bearer for ftp:// URLs".to_string(),
         ));
     }
-    if transfer.range.is_some() || transfer.continue_at.is_some() {
+    if transfer.range.is_some() {
         return Err(CurlError::Unsupported(
-            "FTP range/resume in the Rust sidecar".to_string(),
+            "FTP range requests in the Rust sidecar".to_string(),
         ));
     }
 
@@ -853,7 +853,18 @@ async fn run_ftp_exchange(
         .ok_or_else(|| CurlError::Url("FTP URL is missing a host".to_string()))?;
     let port = url.port().unwrap_or(FTP_DEFAULT_PORT);
     let path = ftp_path(&url)?;
+    if transfer.continue_at.is_some() && (transfer.list_only || path.file.is_none()) {
+        return Err(CurlError::Unsupported(
+            "FTP resume for directory listings in the Rust sidecar".to_string(),
+        ));
+    }
     let (user, password) = ftp_credentials(transfer, &url)?;
+    let resume_from = resume_offset(
+        transfer,
+        &url,
+        &reqwest::header::HeaderMap::new(),
+        &expanded.variables,
+    )?;
 
     let mut stream = connect_tcp(host, port, transfer).await?;
     let mut control_headers = Vec::new();
@@ -913,6 +924,7 @@ async fn run_ftp_exchange(
             &path,
             metrics,
             &mut control_headers,
+            resume_from,
         )
         .await
         {
@@ -963,7 +975,7 @@ async fn run_ftp_exchange(
         &reqwest::header::HeaderMap::new(),
         &expanded.variables,
         body_bytes,
-        false,
+        resume_from > 0,
     )?;
     metrics.filename_effective = filename.map(|path| path.display().to_string());
     if max_filesize_exceeded {
@@ -1028,6 +1040,7 @@ async fn ftp_download_body(
     path: &FtpPath,
     metrics: &mut writeout::Metrics,
     control_headers: &mut Vec<u8>,
+    resume_from: u64,
 ) -> Result<Vec<u8>> {
     let (data_host, data_port) = ftp_enter_passive(stream, host, metrics, control_headers).await?;
     let mut data_stream = connect_tcp(&data_host, data_port, transfer).await?;
@@ -1044,12 +1057,31 @@ async fn ftp_download_body(
         let mut size_command = Vec::from(&b"SIZE "[..]);
         size_command.extend_from_slice(file);
         let response = ftp_command(stream, &size_command, metrics, control_headers).await?;
+        let remote_size = if response.code == 213 {
+            ftp_size_value(&response)
+        } else {
+            None
+        };
         if response.code == 213
-            && let (Some(max), Some(size)) = (transfer.max_filesize, ftp_size_value(&response))
+            && let (Some(max), Some(size)) = (transfer.max_filesize, remote_size)
             && max > 0
             && size > max
         {
             return Err(CurlError::FileSizeExceeded);
+        }
+        if let Some(size) = remote_size {
+            if resume_from > size {
+                return Err(CurlError::BadDownloadResume);
+            }
+            if resume_from == size && resume_from > 0 {
+                return Ok(Vec::new());
+            }
+        }
+        if resume_from > 0 {
+            let rest_command = format!("REST {resume_from}");
+            let response =
+                ftp_command(stream, rest_command.as_bytes(), metrics, control_headers).await?;
+            ftp_require_code(&response, &[350], CurlError::FtpCouldntUseRest)?;
         }
     }
 
