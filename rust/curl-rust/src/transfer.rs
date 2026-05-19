@@ -106,6 +106,7 @@ struct RawHttpDirectContext<'a> {
 }
 
 struct HttpAttempt {
+    method: Method,
     status: StatusCode,
     version: Version,
     final_url: Url,
@@ -6502,14 +6503,25 @@ async fn run_http_transfer(
         return Ok(attempt);
     }
 
+    let mut current_method = method;
+    let mut send_request_body = true;
+
     loop {
-        let multipart = data::prepare_multipart(&transfer.forms)?;
-        let mut request = client.request(method.clone(), url.clone());
+        metrics.method = current_method.as_str().to_string();
+        let request_body = send_request_body
+            .then_some(prepared_body.as_ref())
+            .flatten();
+        let multipart = if send_request_body {
+            data::prepare_multipart(&transfer.forms)?
+        } else {
+            None
+        };
+        let mut request = client.request(current_method.clone(), url.clone());
         request = apply_version(request, transfer, &url);
         let applied_headers = apply_headers(
             request,
             transfer,
-            prepared_body.as_ref(),
+            request_body,
             resume_from,
             current_referer.as_deref(),
         )?;
@@ -6518,12 +6530,13 @@ async fn run_http_transfer(
 
         if let Some(form) = multipart {
             request = request.multipart(form);
-        } else if let Some(body) = upload_body.as_ref() {
+        } else if send_request_body && let Some(body) = upload_body.as_ref() {
             if !applied_headers.has_content_length {
                 request = request.header(CONTENT_LENGTH, body.len());
             }
             request = request.body(body.clone());
-        } else if !transfer.get
+        } else if send_request_body
+            && !transfer.get
             && let Some(body) = prepared_body.as_ref()
         {
             if !applied_headers.has_content_length {
@@ -6533,7 +6546,7 @@ async fn run_http_transfer(
         }
 
         if transfer.verbose {
-            eprintln!("> {} {}", method.as_str(), url);
+            eprintln!("> {} {}", current_method.as_str(), url);
         }
 
         let response = request.send().await.transfer_err()?;
@@ -6569,6 +6582,10 @@ async fn run_http_transfer(
             if custom_referer.is_none() {
                 current_referer = Some(auto_referer_value(&final_url));
             }
+            if let Some(next_method) = redirect_followup_method(status, &current_method) {
+                current_method = next_method;
+                send_request_body = false;
+            }
             url = next_url;
             redirects += 1;
             continue;
@@ -6587,10 +6604,12 @@ async fn run_http_transfer(
             .map(ToString::to_string);
         metrics.headers = headers.clone();
 
-        check_http_content_length_max_filesize(transfer, &headers, method == Method::HEAD)?;
-        let resume_action = http_resume_action(&method, resume_from, status, &headers)?;
+        check_http_content_length_max_filesize(transfer, &headers, current_method == Method::HEAD)?;
+        let resume_action = http_resume_action(&current_method, resume_from, status, &headers)?;
 
-        let body = if method == Method::HEAD || resume_action == HttpResumeAction::AlreadyComplete {
+        let body = if current_method == Method::HEAD
+            || resume_action == HttpResumeAction::AlreadyComplete
+        {
             Vec::new()
         } else {
             response.bytes().await.transfer_err()?.to_vec()
@@ -6599,6 +6618,7 @@ async fn run_http_transfer(
         let retry_after = retry_after_delay(&headers);
 
         return Ok(HttpAttempt {
+            method: current_method,
             status,
             version,
             final_url,
@@ -6977,6 +6997,7 @@ async fn raw_http_read_response(
     };
 
     Ok(HttpAttempt {
+        method: method.clone(),
         status,
         version,
         final_url: final_url.clone(),
@@ -7095,13 +7116,18 @@ async fn run_http_with_retries(
                 {
                     if transfer.fail_with_body && is_http_error_status(attempt.status) {
                         let _ = write_http_attempt_output(
-                            transfer, expanded, &method, metrics, &attempt, false,
+                            transfer,
+                            expanded,
+                            &attempt.method,
+                            metrics,
+                            &attempt,
+                            false,
                         )?;
                     }
                     schedule_retry(transfer, metrics, retry_started, attempt.retry_after).await;
                     continue;
                 }
-                return finish_http_transfer(transfer, expanded, method, metrics, attempt);
+                return finish_http_transfer(transfer, expanded, metrics, attempt);
             }
             Err(error) => {
                 if should_retry_transfer_error(transfer, &error)
@@ -7130,19 +7156,18 @@ fn reset_attempt_metrics(metrics: &mut writeout::Metrics) {
 fn finish_http_transfer(
     transfer: &TransferConfig,
     expanded: &glob::ExpandedUrl,
-    method: Method,
     metrics: &mut writeout::Metrics,
     attempt: HttpAttempt,
 ) -> Result<()> {
     let max_filesize_exceeded =
-        write_http_attempt_output(transfer, expanded, &method, metrics, &attempt, true)?;
+        write_http_attempt_output(transfer, expanded, &attempt.method, metrics, &attempt, true)?;
     if max_filesize_exceeded {
         return Err(CurlError::FileSizeExceeded);
     }
 
     if transfer.fail
         && is_http_error_status(attempt.status)
-        && !is_resume_416(&method, attempt.resume_from, attempt.status)
+        && !is_resume_416(&attempt.method, attempt.resume_from, attempt.status)
     {
         return Err(CurlError::HttpStatus {
             status: attempt.status.as_u16(),
@@ -7494,6 +7519,20 @@ fn is_followed_redirect(status: StatusCode) -> bool {
             | StatusCode::TEMPORARY_REDIRECT
             | StatusCode::PERMANENT_REDIRECT
     )
+}
+
+fn redirect_followup_method(status: StatusCode, method: &Method) -> Option<Method> {
+    if *method == Method::HEAD {
+        return None;
+    }
+
+    match status {
+        StatusCode::MOVED_PERMANENTLY | StatusCode::FOUND if *method == Method::POST => {
+            Some(Method::GET)
+        }
+        StatusCode::SEE_OTHER if *method != Method::GET => Some(Method::GET),
+        _ => None,
+    }
 }
 
 fn redirect_location(
