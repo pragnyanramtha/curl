@@ -3253,7 +3253,7 @@ fn smtp_recipient_failure_returns_send_error() {
     let record = rx.recv().unwrap();
     assert_eq!(
         record.commands,
-        b"EHLO send.example\r\nMAIL FROM:<sender@example.com>\r\nRCPT TO:<bad@example.com>\r\n"
+        b"EHLO send.example\r\nMAIL FROM:<sender@example.com>\r\nRCPT TO:<bad@example.com>\r\nQUIT\r\n"
     );
     assert!(record.upload.is_empty());
 }

@@ -1951,27 +1951,28 @@ async fn run_smtp_exchange(
 
     let capabilities = smtp_greet(&mut stream, &ehlo_domain, metrics).await?;
 
-    let body = if let Some(upload) = upload {
-        smtp_send_mail(transfer, &mut stream, &capabilities, &upload, metrics).await?;
-        Vec::new()
+    let body_result = if let Some(upload) = upload {
+        smtp_send_mail(transfer, &mut stream, &capabilities, &upload, metrics)
+            .await
+            .map(|()| Vec::new())
     } else {
         let command = smtp_command(transfer)?;
         smtp_send_line(&mut stream, &command).await?;
         let response = smtp_read_response(&mut stream).await?;
         metrics.response_code = Some(response.code);
         if !smtp_success(response.code) {
-            return Err(CurlError::WeirdServerReply);
-        }
-        if transfer.head || method == "HEAD" {
-            Vec::new()
+            Err(CurlError::WeirdServerReply)
+        } else if transfer.head || method == "HEAD" {
+            Ok(Vec::new())
         } else {
-            response.lines.concat()
+            Ok(response.lines.concat())
         }
     };
 
     let _ = smtp_send_line(&mut stream, b"QUIT").await;
     let _ = smtp_read_response(&mut stream).await;
 
+    let body = body_result?;
     metrics.url_effective = url.to_string();
     let (body_bytes, max_filesize_exceeded) = if transfer.head || method == "HEAD" {
         (&body[..0], false)
