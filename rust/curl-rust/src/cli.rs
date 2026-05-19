@@ -37,6 +37,7 @@ pub struct TransferConfig {
     pub head: bool,
     pub get: bool,
     pub list_only: bool,
+    pub ftp_append: bool,
     pub include_headers: bool,
     pub headers: Vec<String>,
     pub data: Vec<DataSpec>,
@@ -165,6 +166,7 @@ impl Default for TransferConfig {
             head: false,
             get: false,
             list_only: false,
+            ftp_append: false,
             include_headers: false,
             headers: Vec::new(),
             data: Vec::new(),
@@ -396,6 +398,7 @@ impl Parser {
             "head" => self.current().head = true,
             "get" => self.current().get = true,
             "list-only" => self.current().list_only = true,
+            "append" => self.current().ftp_append = true,
             "include" => self.current().include_headers = true,
             "header" => {
                 let value = self.value_for(name, inline_value)?;
@@ -678,6 +681,7 @@ impl Parser {
             "head" => self.current().head = false,
             "get" => self.current().get = false,
             "list-only" => self.current().list_only = false,
+            "append" => self.current().ftp_append = false,
             "include" => self.current().include_headers = false,
             "parallel" => self.config.parallel = false,
             "parallel-immediate" => self.config.parallel_immediate = false,
@@ -745,6 +749,7 @@ impl Parser {
                 'I' => self.current().head = true,
                 'G' => self.current().get = true,
                 'l' => self.current().list_only = true,
+                'a' => self.current().ftp_append = true,
                 'i' => self.current().include_headers = true,
                 'H' => {
                     let value = self.short_value('H', rest)?;
@@ -1160,6 +1165,7 @@ impl TransferConfig {
             || self.head
             || self.get
             || self.list_only
+            || self.ftp_append
             || self.include_headers
             || !self.headers.is_empty()
             || !self.data.is_empty()
@@ -1704,6 +1710,7 @@ fn print_common_help() {
                --data-urlencode <data> Percent-encode POST data\n\
            -F, --form <name=content>   Specify multipart form data\n\
            -T, --upload-file <file>    Transfer local file to remote URL\n\
+           -a, --append                Append to target file when uploading\n\
                --mail-from <address>   Mail from this address\n\
                --mail-rcpt <address>   Mail to this address\n\
                --key <file>            SSH private key file\n\
@@ -2113,6 +2120,16 @@ mod tests {
         ])
         .unwrap();
         assert!(!config.transfers[0].list_only);
+    }
+
+    #[test]
+    fn parses_append_option() {
+        let config = parse_args(["-q", "-a", "ftp://example.com/file"]).unwrap();
+        assert!(config.transfers[0].ftp_append);
+
+        let config =
+            parse_args(["-q", "--append", "--no-append", "ftp://example.com/file"]).unwrap();
+        assert!(!config.transfers[0].ftp_append);
     }
 
     #[test]

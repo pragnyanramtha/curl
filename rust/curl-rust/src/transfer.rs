@@ -806,7 +806,18 @@ async fn run_ftp_transfer(
             "custom FTP requests in the Rust sidecar".to_string(),
         ));
     }
-    if method != "GET" && method != "HEAD" {
+    if transfer.upload_file.is_some() {
+        if method == "HEAD" || (transfer.method.is_some() && method != "GET") {
+            return Err(CurlError::Unsupported(format!(
+                "{method} requests for ftp:// uploads"
+            )));
+        }
+        if transfer.head {
+            return Err(CurlError::Unsupported(
+                "--upload-file combined with --head for ftp:// URLs".to_string(),
+            ));
+        }
+    } else if method != "GET" && method != "HEAD" {
         return Err(CurlError::Unsupported(format!(
             "{method} requests for ftp:// URLs"
         )));
@@ -816,7 +827,6 @@ async fn run_ftp_transfer(
             "data/form/query request bodies for ftp:// URLs".to_string(),
         ));
     }
-    reject_upload_file_for_scheme(transfer, "ftp://")?;
     if transfer.oauth2_bearer.is_some() {
         return Err(CurlError::Unsupported(
             "--oauth2-bearer for ftp:// URLs".to_string(),
@@ -846,25 +856,46 @@ async fn run_ftp_exchange(
     method: &str,
     metrics: &mut writeout::Metrics,
 ) -> Result<()> {
-    let url = Url::parse(&expanded.url).map_err(|error| CurlError::Url(error.to_string()))?;
-    output::validate_output_target(transfer, &url)?;
+    let mut url = Url::parse(&expanded.url).map_err(|error| CurlError::Url(error.to_string()))?;
+    let upload = transfer
+        .upload_file
+        .as_deref()
+        .map(data::read_upload_body)
+        .transpose()?;
+    if upload.is_some() {
+        data::append_upload_filename_to_url(&mut url, transfer.upload_file.as_deref());
+    } else {
+        output::validate_output_target(transfer, &url)?;
+    }
     let host = url
         .host_str()
         .ok_or_else(|| CurlError::Url("FTP URL is missing a host".to_string()))?;
     let port = url.port().unwrap_or(FTP_DEFAULT_PORT);
     let path = ftp_path(&url)?;
-    if transfer.continue_at.is_some() && (transfer.list_only || path.file.is_none()) {
+    if upload.is_none()
+        && transfer.continue_at.is_some()
+        && (transfer.list_only || path.file.is_none())
+    {
         return Err(CurlError::Unsupported(
             "FTP resume for directory listings in the Rust sidecar".to_string(),
         ));
     }
+    if upload.is_some() && path.file.is_none() {
+        return Err(CurlError::Url(
+            "FTP upload requires a remote filename".to_string(),
+        ));
+    }
     let (user, password) = ftp_credentials(transfer, &url)?;
-    let resume_from = resume_offset(
-        transfer,
-        &url,
-        &reqwest::header::HeaderMap::new(),
-        &expanded.variables,
-    )?;
+    let resume_from = if upload.is_none() {
+        resume_offset(
+            transfer,
+            &url,
+            &reqwest::header::HeaderMap::new(),
+            &expanded.variables,
+        )?
+    } else {
+        0
+    };
 
     let mut stream = connect_tcp(host, port, transfer).await?;
     let mut control_headers = Vec::new();
@@ -907,7 +938,21 @@ async fn run_ftp_exchange(
 
     let mut synthetic_headers = reqwest::header::HeaderMap::new();
     let mut body = Vec::new();
-    let transfer_result = if method == "HEAD" || transfer.head {
+    let mut uploaded = false;
+    let transfer_result = if let Some(upload) = upload.as_deref() {
+        uploaded = true;
+        ftp_upload_body(
+            transfer,
+            &mut stream,
+            host,
+            &path,
+            metrics,
+            &mut control_headers,
+            upload,
+        )
+        .await
+        .map(|_| ())
+    } else if method == "HEAD" || transfer.head {
         ftp_head_file(
             &mut stream,
             &path,
@@ -947,6 +992,11 @@ async fn run_ftp_exchange(
     transfer_result?;
 
     metrics.url_effective = url.to_string();
+    if uploaded {
+        metrics.size_download = 0;
+        metrics.headers = reqwest::header::HeaderMap::new();
+        return Ok(());
+    }
     if method == "HEAD" || transfer.head {
         metrics.headers = synthetic_headers.clone();
         let header_bytes = if synthetic_headers.is_empty() {
@@ -1103,6 +1153,69 @@ async fn ftp_download_body(
     let response = ftp_read_response(stream, metrics, control_headers).await?;
     ftp_require_positive(&response, CurlError::FtpCouldntRetrFile)?;
     Ok(body)
+}
+
+async fn ftp_upload_body(
+    transfer: &TransferConfig,
+    stream: &mut TcpStream,
+    host: &str,
+    path: &FtpPath,
+    metrics: &mut writeout::Metrics,
+    control_headers: &mut Vec<u8>,
+    upload: &[u8],
+) -> Result<usize> {
+    let file = path
+        .file
+        .as_ref()
+        .ok_or_else(|| CurlError::Url("FTP upload requires a remote filename".to_string()))?;
+    let (data_host, data_port) = ftp_enter_passive(stream, host, metrics, control_headers).await?;
+    let mut data_stream = connect_tcp(&data_host, data_port, transfer).await?;
+    ftp_set_type(stream, b'I', metrics, control_headers).await?;
+
+    let mut offset = 0_usize;
+    let mut append = transfer.ftp_append;
+    match transfer.continue_at {
+        Some(ContinueAt::Offset(value)) => {
+            offset = usize::try_from(value).unwrap_or(usize::MAX);
+            append |= offset > 0;
+        }
+        Some(ContinueAt::Auto) => {
+            let mut size_command = Vec::from(&b"SIZE "[..]);
+            size_command.extend_from_slice(file);
+            let response = ftp_command(stream, &size_command, metrics, control_headers).await?;
+            if response.code == 213
+                && let Some(size) = ftp_size_value(&response)
+            {
+                offset = usize::try_from(size).unwrap_or(usize::MAX);
+                append |= offset > 0;
+            }
+        }
+        None => {}
+    }
+
+    if transfer.continue_at.is_some() && offset > 0 && offset >= upload.len() {
+        return Ok(0);
+    }
+    let body = upload.get(offset..).unwrap_or_default();
+    let mut command = Vec::from(if append { &b"APPE "[..] } else { &b"STOR "[..] });
+    command.extend_from_slice(file);
+    let response = ftp_command(stream, &command, metrics, control_headers).await?;
+    if response.code / 100 != 1 {
+        return Err(CurlError::FtpUploadFailed);
+    }
+
+    data_stream
+        .write_all(body)
+        .await
+        .map_err(|_| CurlError::SendError)?;
+    data_stream.shutdown().await.map_err(tcp_io_error)?;
+    let response = ftp_read_response(stream, metrics, control_headers).await?;
+    match response.code {
+        226 | 250 => {}
+        552 => return Err(CurlError::RemoteDiskFull),
+        _ => return Err(CurlError::PartialFile),
+    }
+    Ok(body.len())
 }
 
 async fn ftp_enter_passive(

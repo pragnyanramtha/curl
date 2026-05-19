@@ -73,6 +73,7 @@ struct TftpUploadRecord {
 struct FtpRecord {
     commands: Vec<u8>,
     data_connections: usize,
+    upload: Vec<u8>,
 }
 
 #[derive(Debug)]
@@ -247,6 +248,8 @@ struct FtpServerOptions {
     type_denied: bool,
     rest_denied: bool,
     retr_denied: bool,
+    stor_denied: bool,
+    stor_final: &'static [u8],
     size: Option<u64>,
     mdtm: Option<&'static str>,
 }
@@ -414,6 +417,8 @@ fn ftp_options(data: impl Into<Vec<u8>>) -> FtpServerOptions {
         type_denied: false,
         rest_denied: false,
         retr_denied: false,
+        stor_denied: false,
+        stor_final: b"226 Transfer complete\r\n",
         size,
         mdtm: Some("20030409102659"),
     }
@@ -429,6 +434,7 @@ fn spawn_ftp_server(path: &str, options: FtpServerOptions) -> (String, Receiver<
         stream.write_all(options.greeting).unwrap();
 
         let mut commands = Vec::new();
+        let mut upload = Vec::new();
         let mut data_connections = 0_usize;
         let mut passive_listener: Option<TcpListener> = None;
         let mut restart_offset = 0_usize;
@@ -536,6 +542,19 @@ fn spawn_ftp_server(path: &str, options: FtpServerOptions) -> (String, Receiver<
                 data_connections += 1;
                 restart_offset = 0;
                 stream.write_all(b"226 Transfer complete\r\n").unwrap();
+            } else if command.starts_with("STOR ") || command.starts_with("APPE ") {
+                if options.stor_denied {
+                    stream.write_all(b"550 Upload denied\r\n").unwrap();
+                    continue;
+                }
+                stream
+                    .write_all(b"150 Opening data connection\r\n")
+                    .unwrap();
+                let listener = passive_listener.take().expect("passive listener");
+                let (mut data_stream, _) = listener.accept().unwrap();
+                data_stream.read_to_end(&mut upload).unwrap();
+                data_connections += 1;
+                stream.write_all(options.stor_final).unwrap();
             } else if command == "QUIT" {
                 let _ = stream.write_all(b"221 Bye\r\n");
                 break;
@@ -547,6 +566,7 @@ fn spawn_ftp_server(path: &str, options: FtpServerOptions) -> (String, Receiver<
         tx.send(FtpRecord {
             commands,
             data_connections,
+            upload,
         })
         .unwrap();
     });
@@ -3052,6 +3072,227 @@ fn ftp_writeout_reports_transfer_code_and_download_size() {
     command.assert().success().stdout("abcdef code=226 size=6");
 
     rx.recv().unwrap();
+}
+
+#[test]
+fn ftp_upload_file_sends_stor_and_body() {
+    let temp = tempdir().unwrap();
+    let upload = temp.path().join("payload.txt");
+    std::fs::write(&upload, b"uploaded over ftp\n").unwrap();
+    let (url, rx) = spawn_ftp_server("/target.txt", ftp_options(Vec::new()));
+
+    let mut command = Command::cargo_bin("curl").unwrap();
+    command.args(["-q", "-sS", "-T", upload.to_str().unwrap(), &url]);
+    command.assert().success().stdout("");
+
+    let record = rx.recv().unwrap();
+    assert_eq!(
+        record.commands,
+        b"USER anonymous\r\nPASS ftp@example.com\r\nPWD\r\nEPSV\r\nTYPE I\r\nSTOR target.txt\r\nQUIT\r\n"
+    );
+    assert_eq!(record.upload, b"uploaded over ftp\n");
+    assert_eq!(record.data_connections, 1);
+}
+
+#[test]
+fn ftp_upload_to_directory_url_appends_local_filename() {
+    let temp = tempdir().unwrap();
+    let upload = temp.path().join("client-name.txt");
+    std::fs::write(&upload, b"directory upload\n").unwrap();
+    let (url, rx) = spawn_ftp_server("/incoming/", ftp_options(Vec::new()));
+
+    let mut command = Command::cargo_bin("curl").unwrap();
+    command.args(["-q", "-sS", "-T", upload.to_str().unwrap(), &url]);
+    command.assert().success().stdout("");
+
+    let record = rx.recv().unwrap();
+    assert_eq!(
+        record.commands,
+        b"USER anonymous\r\nPASS ftp@example.com\r\nPWD\r\nCWD incoming\r\nEPSV\r\nTYPE I\r\nSTOR client-name.txt\r\nQUIT\r\n"
+    );
+    assert_eq!(record.upload, b"directory upload\n");
+}
+
+#[test]
+fn ftp_upload_stdin_uses_explicit_remote_filename() {
+    let (url, rx) = spawn_ftp_server("/stdin.txt", ftp_options(Vec::new()));
+
+    let mut command = Command::cargo_bin("curl").unwrap();
+    command.args(["-q", "-sS", "-T", "-", &url]);
+    command.write_stdin("stdin upload\n");
+    command.assert().success().stdout("");
+
+    let record = rx.recv().unwrap();
+    assert_eq!(
+        record.commands,
+        b"USER anonymous\r\nPASS ftp@example.com\r\nPWD\r\nEPSV\r\nTYPE I\r\nSTOR stdin.txt\r\nQUIT\r\n"
+    );
+    assert_eq!(record.upload, b"stdin upload\n");
+}
+
+#[test]
+fn ftp_upload_append_uses_appe() {
+    let temp = tempdir().unwrap();
+    let upload = temp.path().join("payload.txt");
+    std::fs::write(&upload, b"append me").unwrap();
+    let (url, rx) = spawn_ftp_server("/target.txt", ftp_options(Vec::new()));
+
+    let mut command = Command::cargo_bin("curl").unwrap();
+    command.args([
+        "-q",
+        "-sS",
+        "--append",
+        "-T",
+        upload.to_str().unwrap(),
+        &url,
+    ]);
+    command.assert().success().stdout("");
+
+    let record = rx.recv().unwrap();
+    assert_eq!(
+        record.commands,
+        b"USER anonymous\r\nPASS ftp@example.com\r\nPWD\r\nEPSV\r\nTYPE I\r\nAPPE target.txt\r\nQUIT\r\n"
+    );
+    assert_eq!(record.upload, b"append me");
+}
+
+#[test]
+fn ftp_upload_continue_at_fixed_offset_skips_local_bytes_and_appends() {
+    let temp = tempdir().unwrap();
+    let upload = temp.path().join("payload.txt");
+    std::fs::write(&upload, b"hello").unwrap();
+    let (url, rx) = spawn_ftp_server("/target.txt", ftp_options(Vec::new()));
+
+    let mut command = Command::cargo_bin("curl").unwrap();
+    command.args(["-q", "-sS", "-C", "2", "-T", upload.to_str().unwrap(), &url]);
+    command.assert().success().stdout("");
+
+    let record = rx.recv().unwrap();
+    assert_eq!(
+        record.commands,
+        b"USER anonymous\r\nPASS ftp@example.com\r\nPWD\r\nEPSV\r\nTYPE I\r\nAPPE target.txt\r\nQUIT\r\n"
+    );
+    assert_eq!(record.upload, b"llo");
+}
+
+#[test]
+fn ftp_upload_continue_at_auto_uses_remote_size_and_appends() {
+    let temp = tempdir().unwrap();
+    let upload = temp.path().join("payload.txt");
+    std::fs::write(&upload, b"hello").unwrap();
+    let mut options = ftp_options(Vec::new());
+    options.size = Some(2);
+    let (url, rx) = spawn_ftp_server("/target.txt", options);
+
+    let mut command = Command::cargo_bin("curl").unwrap();
+    command.args(["-q", "-sS", "-C", "-", "-T", upload.to_str().unwrap(), &url]);
+    command.assert().success().stdout("");
+
+    let record = rx.recv().unwrap();
+    assert_eq!(
+        record.commands,
+        b"USER anonymous\r\nPASS ftp@example.com\r\nPWD\r\nEPSV\r\nTYPE I\r\nSIZE target.txt\r\nAPPE target.txt\r\nQUIT\r\n"
+    );
+    assert_eq!(record.upload, b"llo");
+}
+
+#[test]
+fn ftp_upload_continue_at_auto_zero_size_uses_stor() {
+    let temp = tempdir().unwrap();
+    let upload = temp.path().join("payload.txt");
+    std::fs::write(&upload, b"hello").unwrap();
+    let mut options = ftp_options(Vec::new());
+    options.size = Some(0);
+    let (url, rx) = spawn_ftp_server("/target.txt", options);
+
+    let mut command = Command::cargo_bin("curl").unwrap();
+    command.args(["-q", "-sS", "-C", "-", "-T", upload.to_str().unwrap(), &url]);
+    command.assert().success().stdout("");
+
+    let record = rx.recv().unwrap();
+    assert_eq!(
+        record.commands,
+        b"USER anonymous\r\nPASS ftp@example.com\r\nPWD\r\nEPSV\r\nTYPE I\r\nSIZE target.txt\r\nSTOR target.txt\r\nQUIT\r\n"
+    );
+    assert_eq!(record.upload, b"hello");
+}
+
+#[test]
+fn ftp_upload_continue_at_zero_empty_file_still_sends_stor() {
+    let temp = tempdir().unwrap();
+    let upload = temp.path().join("empty.txt");
+    std::fs::write(&upload, b"").unwrap();
+    let (url, rx) = spawn_ftp_server("/target.txt", ftp_options(Vec::new()));
+
+    let mut command = Command::cargo_bin("curl").unwrap();
+    command.args(["-q", "-sS", "-C", "0", "-T", upload.to_str().unwrap(), &url]);
+    command.assert().success().stdout("");
+
+    let record = rx.recv().unwrap();
+    assert_eq!(
+        record.commands,
+        b"USER anonymous\r\nPASS ftp@example.com\r\nPWD\r\nEPSV\r\nTYPE I\r\nSTOR target.txt\r\nQUIT\r\n"
+    );
+    assert!(record.upload.is_empty());
+    assert_eq!(record.data_connections, 1);
+}
+
+#[test]
+fn ftp_upload_continue_at_complete_skips_stor() {
+    let temp = tempdir().unwrap();
+    let upload = temp.path().join("payload.txt");
+    std::fs::write(&upload, b"hello").unwrap();
+    let (url, rx) = spawn_ftp_server("/target.txt", ftp_options(Vec::new()));
+
+    let mut command = Command::cargo_bin("curl").unwrap();
+    command.args(["-q", "-sS", "-C", "5", "-T", upload.to_str().unwrap(), &url]);
+    command.assert().success().stdout("");
+
+    let record = rx.recv().unwrap();
+    assert_eq!(
+        record.commands,
+        b"USER anonymous\r\nPASS ftp@example.com\r\nPWD\r\nEPSV\r\nTYPE I\r\nQUIT\r\n"
+    );
+    assert!(record.upload.is_empty());
+    assert_eq!(record.data_connections, 0);
+}
+
+#[test]
+fn ftp_upload_stor_failure_returns_upload_failed() {
+    let temp = tempdir().unwrap();
+    let upload = temp.path().join("payload.txt");
+    std::fs::write(&upload, b"not sent").unwrap();
+    let mut options = ftp_options(Vec::new());
+    options.stor_denied = true;
+    let (url, rx) = spawn_ftp_server("/target.txt", options);
+
+    let mut command = Command::cargo_bin("curl").unwrap();
+    command.args(["-q", "-sS", "-T", upload.to_str().unwrap(), &url]);
+    command.assert().failure().code(25).stdout("");
+
+    let record = rx.recv().unwrap();
+    assert_eq!(
+        record.commands,
+        b"USER anonymous\r\nPASS ftp@example.com\r\nPWD\r\nEPSV\r\nTYPE I\r\nSTOR target.txt\r\nQUIT\r\n"
+    );
+    assert!(record.upload.is_empty());
+}
+
+#[test]
+fn ftp_upload_final_552_returns_remote_disk_full() {
+    let temp = tempdir().unwrap();
+    let upload = temp.path().join("payload.txt");
+    std::fs::write(&upload, b"full disk").unwrap();
+    let mut options = ftp_options(Vec::new());
+    options.stor_final = b"552 Disk full\r\n";
+    let (url, rx) = spawn_ftp_server("/target.txt", options);
+
+    let mut command = Command::cargo_bin("curl").unwrap();
+    command.args(["-q", "-sS", "-T", upload.to_str().unwrap(), &url]);
+    command.assert().failure().code(70).stdout("");
+
+    let record = rx.recv().unwrap();
+    assert_eq!(record.upload, b"full disk");
 }
 
 #[test]
@@ -6742,6 +6983,37 @@ fn libcurl_writes_tftp_upload_directory_url() {
     );
     let text = std::fs::read_to_string(source).unwrap();
     assert!(text.contains(&format!("CURLOPT_URL, \"{}client.bin\"", url)));
+}
+
+#[test]
+fn libcurl_writes_ftp_upload_append_options() {
+    let temp = tempdir().unwrap();
+    let upload = temp.path().join("payload.txt");
+    let source = temp.path().join("ftp-upload-client.c");
+    std::fs::write(&upload, b"append").unwrap();
+    let (url, rx) = spawn_ftp_server("/target.txt", ftp_options(Vec::new()));
+
+    let mut command = Command::cargo_bin("curl").unwrap();
+    command.args([
+        "-q",
+        "-sS",
+        "--libcurl",
+        source.to_str().unwrap(),
+        "--append",
+        "-T",
+        upload.to_str().unwrap(),
+        &url,
+    ]);
+    command.assert().success().stdout("");
+
+    let record = rx.recv().unwrap();
+    assert_eq!(
+        record.commands,
+        b"USER anonymous\r\nPASS ftp@example.com\r\nPWD\r\nEPSV\r\nTYPE I\r\nAPPE target.txt\r\nQUIT\r\n"
+    );
+    let text = std::fs::read_to_string(source).unwrap();
+    assert!(text.contains("CURLOPT_UPLOAD, 1L"));
+    assert!(text.contains("CURLOPT_APPEND, 1L"));
 }
 
 #[test]

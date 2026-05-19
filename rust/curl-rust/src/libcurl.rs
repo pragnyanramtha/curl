@@ -209,6 +209,9 @@ fn write_request(out: &mut String, render: &RenderTransfer<'_>, url: &str) -> Re
     }
     if let Some(upload_file) = &transfer.upload_file {
         emit_long_setopt(out, "CURLOPT_UPLOAD", 1);
+        if transfer.ftp_append {
+            emit_long_setopt(out, "CURLOPT_APPEND", 1);
+        }
         if upload_file != "-"
             && let Ok(metadata) = std::fs::metadata(upload_file)
             && metadata.is_file()
@@ -394,7 +397,7 @@ fn effective_urls(
                     .unwrap_or(expanded.url);
             let mut url =
                 Url::parse(&effective_url).map_err(|error| CurlError::Url(error.to_string()))?;
-            if matches!(url.scheme(), "http" | "https" | "sftp" | "tftp") {
+            if matches!(url.scheme(), "http" | "https" | "ftp" | "sftp" | "tftp") {
                 data::append_upload_filename_to_url(&mut url, transfer.upload_file.as_deref());
             }
             if let Some(query) = query.filter(|query| !query.is_empty()) {

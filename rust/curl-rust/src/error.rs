@@ -28,6 +28,8 @@ pub enum CurlError {
     ReadError(String),
     #[error("transfer failed: {0}")]
     Transfer(String),
+    #[error("transferred a partial file")]
+    PartialFile,
     #[error("weird server reply")]
     WeirdServerReply,
     #[error("server returned nothing")]
@@ -40,6 +42,8 @@ pub enum CurlError {
     FtpCouldntSetType,
     #[error("FTP could not retrieve file")]
     FtpCouldntRetrFile,
+    #[error("FTP upload failed")]
+    FtpUploadFailed,
     #[error("FTP: command REST failed")]
     FtpCouldntUseRest,
     #[error("remote access denied")]
@@ -62,6 +66,8 @@ pub enum CurlError {
     BadDownloadResume,
     #[error("Maximum file size exceeded")]
     FileSizeExceeded,
+    #[error("Remote disk full")]
+    RemoteDiskFull,
     #[error("Login denied")]
     LoginDenied,
     #[error("URL rejected: Credentials was passed in the URL when prohibited")]
@@ -104,6 +110,7 @@ impl CurlError {
             Self::Url(_) => 3,
             Self::OptionSyntax(_) | Self::ResolveParse(_) | Self::ConnectToPortSyntax(_) => 49,
             Self::Transfer(_) => 7,
+            Self::PartialFile => 18,
             Self::WeirdServerReply => 8,
             Self::GotNothing => 52,
             Self::RecvError => 56,
@@ -111,6 +118,7 @@ impl CurlError {
             Self::FtpWeirdPasvReply => 13,
             Self::FtpCouldntSetType => 17,
             Self::FtpCouldntRetrFile => 19,
+            Self::FtpUploadFailed => 25,
             Self::FtpCouldntUseRest => 31,
             Self::QuoteError => 21,
             Self::TooManyRedirects { .. } => 47,
@@ -118,6 +126,7 @@ impl CurlError {
             Self::RangeError => 33,
             Self::BadDownloadResume => 36,
             Self::FileSizeExceeded => 63,
+            Self::RemoteDiskFull => 70,
             Self::LoginDenied | Self::UrlCredentialsProhibited => 67,
             Self::PeerVerificationFailed => 60,
             Self::LdapCannotBind => 38,
