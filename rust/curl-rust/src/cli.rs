@@ -38,6 +38,7 @@ pub struct TransferConfig {
     pub get: bool,
     pub list_only: bool,
     pub ftp_append: bool,
+    pub ftp_create_dirs: bool,
     pub ftp_disable_epsv: bool,
     pub ftp_skip_pasv_ip: Option<bool>,
     pub include_headers: bool,
@@ -169,6 +170,7 @@ impl Default for TransferConfig {
             get: false,
             list_only: false,
             ftp_append: false,
+            ftp_create_dirs: false,
             ftp_disable_epsv: false,
             ftp_skip_pasv_ip: None,
             include_headers: false,
@@ -403,6 +405,7 @@ impl Parser {
             "get" => self.current().get = true,
             "list-only" => self.current().list_only = true,
             "append" => self.current().ftp_append = true,
+            "ftp-create-dirs" => self.current().ftp_create_dirs = true,
             "disable-epsv" => self.current().ftp_disable_epsv = true,
             "epsv" => self.current().ftp_disable_epsv = false,
             "ftp-pasv" => {}
@@ -690,6 +693,7 @@ impl Parser {
             "get" => self.current().get = false,
             "list-only" => self.current().list_only = false,
             "append" => self.current().ftp_append = false,
+            "ftp-create-dirs" => self.current().ftp_create_dirs = false,
             "disable-epsv" => self.current().ftp_disable_epsv = false,
             "epsv" => self.current().ftp_disable_epsv = true,
             "ftp-skip-pasv-ip" => self.current().ftp_skip_pasv_ip = Some(false),
@@ -1177,6 +1181,7 @@ impl TransferConfig {
             || self.get
             || self.list_only
             || self.ftp_append
+            || self.ftp_create_dirs
             || self.ftp_disable_epsv
             || self.ftp_skip_pasv_ip.is_some()
             || self.include_headers
@@ -2143,6 +2148,21 @@ mod tests {
         let config =
             parse_args(["-q", "--append", "--no-append", "ftp://example.com/file"]).unwrap();
         assert!(!config.transfers[0].ftp_append);
+    }
+
+    #[test]
+    fn parses_ftp_create_dirs_option() {
+        let config = parse_args(["-q", "--ftp-create-dirs", "ftp://example.com/file"]).unwrap();
+        assert!(config.transfers[0].ftp_create_dirs);
+
+        let config = parse_args([
+            "-q",
+            "--ftp-create-dirs",
+            "--no-ftp-create-dirs",
+            "ftp://example.com/file",
+        ])
+        .unwrap();
+        assert!(!config.transfers[0].ftp_create_dirs);
     }
 
     #[test]

@@ -924,16 +924,15 @@ async fn run_ftp_exchange(
 
     let _ = ftp_command(&mut stream, b"PWD", metrics, &mut control_headers).await?;
 
-    for directory in &path.directories {
-        let mut command = Vec::from(&b"CWD "[..]);
-        command.extend_from_slice(directory);
-        let response = ftp_command(&mut stream, &command, metrics, &mut control_headers).await?;
-        if !ftp_positive_code(response.code) {
+    if let Err(error) =
+        ftp_change_directories(transfer, &mut stream, &path, metrics, &mut control_headers).await
+    {
+        if matches!(error, CurlError::RemoteAccessDenied) {
             let response_code_before_quit = metrics.response_code;
             let _ = ftp_command(&mut stream, b"QUIT", metrics, &mut control_headers).await;
             metrics.response_code = response_code_before_quit;
-            return Err(CurlError::RemoteAccessDenied);
         }
+        return Err(error);
     }
 
     let mut synthetic_headers = reqwest::header::HeaderMap::new();
@@ -1046,6 +1045,52 @@ struct FtpPath {
 struct FtpResponse {
     code: u16,
     lines: Vec<Vec<u8>>,
+}
+
+async fn ftp_change_directories(
+    transfer: &TransferConfig,
+    stream: &mut TcpStream,
+    path: &FtpPath,
+    metrics: &mut writeout::Metrics,
+    control_headers: &mut Vec<u8>,
+) -> Result<()> {
+    for directory in &path.directories {
+        let response = ftp_cwd(stream, directory, metrics, control_headers).await?;
+        if ftp_positive_code(response.code) {
+            continue;
+        }
+        if transfer.ftp_create_dirs {
+            ftp_mkd(stream, directory, metrics, control_headers).await?;
+            let response = ftp_cwd(stream, directory, metrics, control_headers).await?;
+            if ftp_positive_code(response.code) {
+                continue;
+            }
+        }
+        return Err(CurlError::RemoteAccessDenied);
+    }
+    Ok(())
+}
+
+async fn ftp_cwd(
+    stream: &mut TcpStream,
+    directory: &[u8],
+    metrics: &mut writeout::Metrics,
+    control_headers: &mut Vec<u8>,
+) -> Result<FtpResponse> {
+    let mut command = Vec::from(&b"CWD "[..]);
+    command.extend_from_slice(directory);
+    ftp_command(stream, &command, metrics, control_headers).await
+}
+
+async fn ftp_mkd(
+    stream: &mut TcpStream,
+    directory: &[u8],
+    metrics: &mut writeout::Metrics,
+    control_headers: &mut Vec<u8>,
+) -> Result<FtpResponse> {
+    let mut command = Vec::from(&b"MKD "[..]);
+    command.extend_from_slice(directory);
+    ftp_command(stream, &command, metrics, control_headers).await
 }
 
 async fn ftp_head_file(

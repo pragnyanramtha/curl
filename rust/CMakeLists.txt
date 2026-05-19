@@ -54,6 +54,8 @@ set(_curl_rust_corpus_tests
   136
   137
   138
+  147
+  148
   200
   201
   202

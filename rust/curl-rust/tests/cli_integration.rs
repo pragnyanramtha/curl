@@ -248,6 +248,8 @@ struct FtpServerOptions {
     login_denied: bool,
     pwd_denied: bool,
     cwd_denied: bool,
+    missing_directories: Vec<&'static str>,
+    mkd_denied: bool,
     type_denied: bool,
     rest_denied: bool,
     retr_denied: bool,
@@ -420,6 +422,8 @@ fn ftp_options(data: impl Into<Vec<u8>>) -> FtpServerOptions {
         login_denied: false,
         pwd_denied: false,
         cwd_denied: false,
+        missing_directories: Vec::new(),
+        mkd_denied: false,
         type_denied: false,
         rest_denied: false,
         retr_denied: false,
@@ -461,6 +465,7 @@ fn spawn_ftp_server_with_listener(
         let mut data_connections = 0_usize;
         let mut passive_listener: Option<TcpListener> = None;
         let mut restart_offset = 0_usize;
+        let mut created_directories: Vec<String> = Vec::new();
 
         while let Some(line) = read_pop3_client_line(&mut stream) {
             commands.extend_from_slice(&line);
@@ -484,13 +489,30 @@ fn spawn_ftp_server_with_listener(
                     .write_all(b"257 \"/\" is the current directory\r\n")
                     .unwrap();
             } else if command.starts_with("CWD ") {
-                if options.cwd_denied {
+                let directory = command.strip_prefix("CWD ").unwrap();
+                if options.cwd_denied
+                    || (options.missing_directories.contains(&directory)
+                        && !created_directories
+                            .iter()
+                            .any(|created| created.as_str() == directory))
+                {
                     stream
                         .write_all(b"550 Failed to change directory\r\n")
                         .unwrap();
                     continue;
                 }
                 stream.write_all(b"250 Directory changed\r\n").unwrap();
+            } else if let Some(directory) = command.strip_prefix("MKD ") {
+                if options.mkd_denied {
+                    stream
+                        .write_all(b"550 Failed to create directory\r\n")
+                        .unwrap();
+                    continue;
+                }
+                created_directories.push(directory.to_string());
+                stream
+                    .write_all(b"257 Created your requested directory\r\n")
+                    .unwrap();
             } else if command == "EPSV" {
                 if options.epsv_fails {
                     stream.write_all(b"500 EPSV unsupported\r\n").unwrap();
@@ -3549,6 +3571,67 @@ fn ftp_cwd_failure_returns_remote_access_denied() {
         rx.recv().unwrap().commands,
         b"USER anonymous\r\nPASS ftp@example.com\r\nPWD\r\nCWD private\r\nQUIT\r\n"
     );
+}
+
+#[test]
+fn ftp_create_dirs_makes_missing_directory_and_retries_cwd() {
+    let mut options = ftp_options(b"created path");
+    options.missing_directories = vec!["first"];
+    let (url, rx) = spawn_ftp_server("/first/dir/here/file.txt", options);
+
+    let mut command = Command::cargo_bin("curl").unwrap();
+    command.args(["-q", "-sS", "--ftp-create-dirs", &url]);
+    command.assert().success().stdout("created path");
+
+    assert_eq!(
+        rx.recv().unwrap().commands,
+        b"USER anonymous\r\nPASS ftp@example.com\r\nPWD\r\nCWD first\r\nMKD first\r\nCWD first\r\nCWD dir\r\nCWD here\r\nEPSV\r\nTYPE I\r\nSIZE file.txt\r\nRETR file.txt\r\nQUIT\r\n"
+    );
+}
+
+#[test]
+fn ftp_create_dirs_retries_cwd_after_failed_mkd_then_returns_9() {
+    let mut options = ftp_options(Vec::new());
+    options.missing_directories = vec!["attempt"];
+    options.mkd_denied = true;
+    let (url, rx) = spawn_ftp_server("/attempt/to/get/this/file.txt", options);
+
+    let mut command = Command::cargo_bin("curl").unwrap();
+    command.args(["-q", "-sS", "--ftp-create-dirs", &url]);
+    command.assert().failure().code(9).stdout("");
+
+    assert_eq!(
+        rx.recv().unwrap().commands,
+        b"USER anonymous\r\nPASS ftp@example.com\r\nPWD\r\nCWD attempt\r\nMKD attempt\r\nCWD attempt\r\nQUIT\r\n"
+    );
+}
+
+#[test]
+fn ftp_upload_create_dirs_makes_missing_directory_before_stor() {
+    let temp = tempdir().unwrap();
+    let upload = temp.path().join("payload.txt");
+    std::fs::write(&upload, b"upload into created path").unwrap();
+    let mut options = ftp_options(Vec::new());
+    options.missing_directories = vec!["incoming"];
+    let (url, rx) = spawn_ftp_server("/incoming/nested/file.txt", options);
+
+    let mut command = Command::cargo_bin("curl").unwrap();
+    command.args([
+        "-q",
+        "-sS",
+        "--ftp-create-dirs",
+        "-T",
+        upload.to_str().unwrap(),
+        &url,
+    ]);
+    command.assert().success().stdout("");
+
+    let record = rx.recv().unwrap();
+    assert_eq!(
+        record.commands,
+        b"USER anonymous\r\nPASS ftp@example.com\r\nPWD\r\nCWD incoming\r\nMKD incoming\r\nCWD incoming\r\nCWD nested\r\nEPSV\r\nTYPE I\r\nSTOR file.txt\r\nQUIT\r\n"
+    );
+    assert_eq!(record.upload, b"upload into created path");
 }
 
 #[test]
@@ -7195,6 +7278,33 @@ fn libcurl_writes_ftp_passive_options() {
     let text = std::fs::read_to_string(source).unwrap();
     assert!(text.contains("CURLOPT_FTP_USE_EPSV, 0L"));
     assert!(text.contains("CURLOPT_FTP_SKIP_PASV_IP, 1L"));
+}
+
+#[test]
+fn libcurl_writes_ftp_create_dirs_option() {
+    let temp = tempdir().unwrap();
+    let source = temp.path().join("ftp-create-dirs-client.c");
+    let mut options = ftp_options(b"downloaded");
+    options.missing_directories = vec!["first"];
+    let (url, rx) = spawn_ftp_server("/first/file.txt", options);
+
+    let mut command = Command::cargo_bin("curl").unwrap();
+    command.args([
+        "-q",
+        "-sS",
+        "--libcurl",
+        source.to_str().unwrap(),
+        "--ftp-create-dirs",
+        &url,
+    ]);
+    command.assert().success().stdout("downloaded");
+
+    assert_eq!(
+        rx.recv().unwrap().commands,
+        b"USER anonymous\r\nPASS ftp@example.com\r\nPWD\r\nCWD first\r\nMKD first\r\nCWD first\r\nEPSV\r\nTYPE I\r\nSIZE file.txt\r\nRETR file.txt\r\nQUIT\r\n"
+    );
+    let text = std::fs::read_to_string(source).unwrap();
+    assert!(text.contains("CURLOPT_FTP_CREATE_MISSING_DIRS, CURLFTP_CREATE_DIR_RETRY"));
 }
 
 #[test]

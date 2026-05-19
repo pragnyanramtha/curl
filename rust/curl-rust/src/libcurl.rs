@@ -176,6 +176,13 @@ fn write_request(out: &mut String, render: &RenderTransfer<'_>, url: &str) -> Re
     if transfer.list_only {
         emit_long_setopt(out, "CURLOPT_DIRLISTONLY", 1);
     }
+    if transfer.ftp_create_dirs {
+        emit_raw_setopt(
+            out,
+            "CURLOPT_FTP_CREATE_MISSING_DIRS",
+            "CURLFTP_CREATE_DIR_RETRY",
+        );
+    }
     if transfer.ftp_disable_epsv {
         emit_long_setopt(out, "CURLOPT_FTP_USE_EPSV", 0);
     }
