@@ -381,6 +381,9 @@ impl Parser {
                 self.append_url_value(value)?;
             }
             "next" => {
+                if self.current().urls.is_empty() {
+                    return Err(CurlError::Usage("missing URL before --next".to_string()));
+                }
                 self.config.transfers.push(TransferConfig::default());
             }
             "parallel" => self.config.parallel = true,
@@ -1863,33 +1866,29 @@ fn tokenize_config(text: &str) -> Result<Vec<String>> {
             continue;
         }
 
-        let mut parts = shell_words(line)?;
-        if parts.is_empty() {
+        if line.starts_with('-') {
+            tokens.extend(shell_words(line, true)?);
             continue;
         }
 
-        if parts[0].starts_with('-') {
-            tokens.extend(parts);
-            continue;
-        }
-
-        let key = parts.remove(0);
-        let key = key.trim_end_matches('=');
+        let (key, rest) = split_config_key_value(line);
         if key.is_empty() {
             continue;
         }
         tokens.push(format!("--{key}"));
 
-        if let Some(first) = parts.first_mut() {
-            if first == "=" {
-                parts.remove(0);
-            } else if let Some(value) = first.strip_prefix('=') {
-                *first = value.to_string();
-            }
+        let rest = rest.trim_start_matches(|ch: char| ch.is_whitespace() || ch == '=' || ch == ':');
+        if !rest.is_empty() {
+            tokens.extend(shell_words(rest, false)?);
         }
-        tokens.extend(parts);
     }
     Ok(tokens)
+}
+
+fn split_config_key_value(line: &str) -> (&str, &str) {
+    line.char_indices()
+        .find(|(_, ch)| ch.is_whitespace() || *ch == '=' || *ch == ':')
+        .map_or((line, ""), |(index, _)| (&line[..index], &line[index..]))
 }
 
 fn strip_config_comment(line: &str) -> &str {
@@ -1913,7 +1912,7 @@ fn strip_config_comment(line: &str) -> &str {
     line
 }
 
-fn shell_words(line: &str) -> Result<Vec<String>> {
+fn shell_words(line: &str, split_equals: bool) -> Result<Vec<String>> {
     let mut words = Vec::new();
     let mut current = String::new();
     let mut in_single = false;
@@ -1939,7 +1938,7 @@ fn shell_words(line: &str) -> Result<Vec<String>> {
                 in_double = !in_double;
                 has_word = true;
             }
-            '=' if !in_single && !in_double => {
+            '=' if split_equals && !in_single && !in_double => {
                 if has_word {
                     words.push(std::mem::take(&mut current));
                 }
@@ -2453,6 +2452,8 @@ mod tests {
             # comment
             silent
             header = "Accept: application/json"
+            url: https://colon.example
+            url:https://attached.example/?q=a=b
             --url https://example.com
             "#,
         )
@@ -2465,9 +2466,19 @@ mod tests {
                 "--header",
                 "Accept: application/json",
                 "--url",
+                "https://colon.example",
+                "--url",
+                "https://attached.example/?q=a=b",
+                "--url",
                 "https://example.com"
             ]
         );
+    }
+
+    #[test]
+    fn dashed_config_options_do_not_use_colon_separator() {
+        let tokens = tokenize_config("--url: https://example.com").unwrap();
+        assert_eq!(tokens, ["--url:", "https://example.com"]);
     }
 
     #[test]
@@ -2953,18 +2964,17 @@ mod tests {
     }
 
     #[test]
-    fn libcurl_does_not_retain_empty_next_group() {
-        let config = parse_args([
+    fn next_requires_url_before_new_group() {
+        let error = parse_args([
             "-q",
             "--libcurl",
             "client.c",
             "--next",
             "https://example.com",
         ])
-        .unwrap();
+        .unwrap_err();
 
-        assert_eq!(config.transfers.len(), 1);
-        assert_eq!(config.transfers[0].urls, ["https://example.com"]);
+        assert!(error.to_string().contains("missing URL before --next"));
     }
 
     #[test]
@@ -3038,8 +3048,8 @@ mod tests {
     }
 
     #[test]
-    fn parallel_options_do_not_retain_empty_groups() {
-        let config = parse_args([
+    fn next_rejects_global_options_without_url() {
+        let error = parse_args([
             "-q",
             "--parallel",
             "--parallel-max",
@@ -3047,10 +3057,9 @@ mod tests {
             "--next",
             "https://example.com",
         ])
-        .unwrap();
+        .unwrap_err();
 
-        assert_eq!(config.transfers.len(), 1);
-        assert_eq!(config.transfers[0].urls, ["https://example.com"]);
+        assert!(error.to_string().contains("missing URL before --next"));
     }
 
     #[test]
