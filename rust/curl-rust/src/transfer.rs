@@ -113,6 +113,12 @@ struct HttpAttempt {
     resume_from: u64,
 }
 
+struct AppliedHttpHeaders {
+    request: reqwest::RequestBuilder,
+    has_authorization: bool,
+    has_content_length: bool,
+}
+
 pub async fn run(config: Config) -> Result<i32> {
     if config.parallel {
         return run_parallel(config).await;
@@ -6318,27 +6324,30 @@ async fn run_http_transfer(
         let multipart = data::prepare_multipart(&transfer.forms)?;
         let mut request = client.request(method.clone(), url.clone());
         request = apply_version(request, transfer, &url);
-        request = apply_headers(
+        let applied_headers = apply_headers(
             request,
             transfer,
             prepared_body.as_ref(),
             resume_from,
             current_referer.as_deref(),
         )?;
-        request = apply_auth(request, transfer);
+        request = applied_headers.request;
+        request = apply_auth(request, transfer, applied_headers.has_authorization);
 
         if let Some(form) = multipart {
             request = request.multipart(form);
         } else if let Some(body) = upload_body.as_ref() {
-            request = request
-                .header(CONTENT_LENGTH, body.len())
-                .body(body.clone());
+            if !applied_headers.has_content_length {
+                request = request.header(CONTENT_LENGTH, body.len());
+            }
+            request = request.body(body.clone());
         } else if !transfer.get
             && let Some(body) = prepared_body.as_ref()
         {
-            request = request
-                .header(CONTENT_LENGTH, body.bytes.len())
-                .body(body.bytes.clone());
+            if !applied_headers.has_content_length {
+                request = request.header(CONTENT_LENGTH, body.bytes.len());
+            }
+            request = request.body(body.bytes.clone());
         }
 
         if transfer.verbose {
@@ -7201,31 +7210,28 @@ fn apply_headers(
     body: Option<&PreparedBody>,
     resume_from: u64,
     referer: Option<&str>,
-) -> Result<reqwest::RequestBuilder> {
+) -> Result<AppliedHttpHeaders> {
     let parsed_headers = parse_headers(&transfer.headers)?;
-    let has_accept = parsed_headers
-        .iter()
-        .any(|(name, _)| name.as_str().eq_ignore_ascii_case("accept"));
-    let has_user_agent = parsed_headers
-        .iter()
-        .any(|(name, _)| name.as_str().eq_ignore_ascii_case("user-agent"));
-    let has_content_type = parsed_headers
-        .iter()
-        .any(|(name, _)| name.as_str().eq_ignore_ascii_case("content-type"));
-    let has_referer = parsed_headers
-        .iter()
-        .any(|(name, _)| name.as_str().eq_ignore_ascii_case("referer"));
+    let has_header = |header: &str| {
+        parsed_headers
+            .iter()
+            .any(|(name, _)| name.as_str().eq_ignore_ascii_case(header))
+    };
+    let has_authorization = has_header("authorization");
+    let has_content_length = has_header("content-length");
 
-    if !has_user_agent && let Some(user_agent) = effective_user_agent(transfer) {
+    if !has_header("user-agent")
+        && let Some(user_agent) = effective_user_agent(transfer)
+    {
         request = request.header(USER_AGENT, user_agent);
     }
 
-    if transfer.compressed {
+    if transfer.compressed && !has_header("accept-encoding") {
         request = request.header(ACCEPT_ENCODING, "deflate, gzip, br");
     }
 
     let body_is_json = body.is_some_and(|body| body.is_json);
-    if !has_accept {
+    if !has_header("accept") {
         request = request.header(
             ACCEPT,
             if body_is_json {
@@ -7238,34 +7244,43 @@ fn apply_headers(
 
     if let Some(cookie) = &transfer.cookie
         && !cookie_engine_active(transfer)
+        && !has_header("cookie")
     {
         request = request.header(COOKIE, cookie);
     }
 
-    if let Some(token) = &transfer.oauth2_bearer {
+    if let Some(token) = &transfer.oauth2_bearer
+        && !has_authorization
+    {
         request = request.header(AUTHORIZATION, format!("Bearer {token}"));
     }
 
-    if let Some(path) = &transfer.etag_compare {
+    if let Some(path) = &transfer.etag_compare
+        && !has_header("if-none-match")
+    {
         request = request.header(IF_NONE_MATCH, load_etag_compare(path)?);
     }
 
     if let Some(time_cond) = &transfer.time_cond {
         let (name, value) = time_condition_header(time_cond);
-        request = request.header(name, value);
+        if !has_header(name.as_str()) {
+            request = request.header(name, value);
+        }
     }
 
     if let Some(referer) = referer
-        && !has_referer
+        && !has_header("referer")
     {
         request = request.header(REFERER, referer);
     }
 
-    if let Some(range) = effective_range(transfer, resume_from) {
+    if let Some(range) = effective_range(transfer, resume_from)
+        && !has_header("range")
+    {
         request = request.header(RANGE, range_header_value(&range));
     }
 
-    if body_is_json && !has_content_type {
+    if body_is_json && !has_header("content-type") {
         request = request.header(CONTENT_TYPE, "application/json");
     }
 
@@ -7275,7 +7290,11 @@ fn apply_headers(
         }
     }
 
-    Ok(request)
+    Ok(AppliedHttpHeaders {
+        request,
+        has_authorization,
+        has_content_length,
+    })
 }
 
 fn is_followed_redirect(status: StatusCode) -> bool {
@@ -7381,12 +7400,13 @@ fn append_raw_header(request: &mut Vec<u8>, name: &HeaderName, value: &HeaderVal
 fn apply_auth(
     request: reqwest::RequestBuilder,
     transfer: &TransferConfig,
+    has_authorization: bool,
 ) -> reqwest::RequestBuilder {
     let Some(user) = &transfer.user else {
         return request;
     };
 
-    if transfer.oauth2_bearer.is_some() {
+    if transfer.oauth2_bearer.is_some() || has_authorization {
         return request;
     }
 

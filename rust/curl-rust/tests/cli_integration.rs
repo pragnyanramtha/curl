@@ -1885,6 +1885,84 @@ fn header_file_uses_empty_and_semicolon_custom_header_semantics() {
 }
 
 #[test]
+fn generated_headers_respect_non_empty_custom_overrides() {
+    let temp = tempdir().unwrap();
+    let etag = temp.path().join("etag.txt");
+    std::fs::write(&etag, "\"generated\"\n").unwrap();
+    let (url, rx) = spawn_server(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok");
+
+    let mut command = Command::cargo_bin("curl").unwrap();
+    command.args([
+        "-q",
+        "-sS",
+        "--compressed",
+        "-b",
+        "tool=curl",
+        "--oauth2-bearer",
+        "generated-token",
+        "--etag-compare",
+        etag.to_str().unwrap(),
+        "--data",
+        "a",
+        "-H",
+        "Accept-Encoding: identity",
+        "-H",
+        "Authorization: Custom auth",
+        "-H",
+        "Cookie: explicit=yes",
+        "-H",
+        "If-None-Match: \"override\"",
+        "-H",
+        "Content-Length: 1",
+        &url,
+    ]);
+    command.assert().success().stdout("ok");
+
+    let request = rx.recv().unwrap();
+    assert_eq!(header(&request, "accept-encoding"), Some("identity"));
+    assert_eq!(header_count(&request, "accept-encoding"), 1);
+    assert_eq!(header(&request, "authorization"), Some("Custom auth"));
+    assert_eq!(header_count(&request, "authorization"), 1);
+    assert_eq!(header(&request, "cookie"), Some("explicit=yes"));
+    assert_eq!(header_count(&request, "cookie"), 1);
+    assert_eq!(header(&request, "if-none-match"), Some("\"override\""));
+    assert_eq!(header_count(&request, "if-none-match"), 1);
+    assert_eq!(header(&request, "content-length"), Some("1"));
+    assert_eq!(header_count(&request, "content-length"), 1);
+    assert_eq!(request.body, b"a");
+}
+
+#[test]
+fn range_and_time_condition_headers_respect_custom_overrides() {
+    let (url, rx) = spawn_server(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok");
+
+    let mut command = Command::cargo_bin("curl").unwrap();
+    command.args([
+        "-q",
+        "-sS",
+        "-r",
+        "2-5",
+        "-z",
+        "Wed, 21 Oct 2015 07:28:00 GMT",
+        "-H",
+        "Range: bytes=0-0",
+        "-H",
+        "If-Modified-Since: Thu, 01 Jan 1970 00:00:00 GMT",
+        &url,
+    ]);
+    command.assert().success().stdout("ok");
+
+    let request = rx.recv().unwrap();
+    assert_eq!(header(&request, "range"), Some("bytes=0-0"));
+    assert_eq!(header_count(&request, "range"), 1);
+    assert_eq!(
+        header(&request, "if-modified-since"),
+        Some("Thu, 01 Jan 1970 00:00:00 GMT")
+    );
+    assert_eq!(header_count(&request, "if-modified-since"), 1);
+}
+
+#[test]
 fn user_agent_option_sets_header_and_empty_value_suppresses_default() {
     let (custom_url, custom_rx) =
         spawn_server(b"HTTP/1.1 200 OK\r\nContent-Length: 6\r\n\r\ncustom");
