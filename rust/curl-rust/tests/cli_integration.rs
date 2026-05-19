@@ -5743,6 +5743,202 @@ fn scp_downloads_file_with_known_hosts() {
     command.assert().success().stdout("ssh fixture body\n");
 }
 
+fn sftp_range_fixture_file(fixture: &SshdFixture) -> PathBuf {
+    let path = fixture.root.join("range-data.txt");
+    std::fs::write(&path, b"Test data\nfor ssh test\n").unwrap();
+    path
+}
+
+#[test]
+fn sftp_download_range_fixed_outputs_requested_bytes() {
+    let Some(fixture) = SshdFixture::new() else {
+        return;
+    };
+    let path = sftp_range_fixture_file(&fixture);
+    let url = fixture.url_for("sftp", &path);
+
+    let mut command = Command::cargo_bin("curl").unwrap();
+    command.args(["-q", "-sS", "--range", "5-9"]);
+    command.args(fixture.auth_args());
+    command.arg(url);
+    command.assert().success().stdout("data\n");
+}
+
+#[test]
+fn sftp_download_range_end_past_eof_clamps_to_file_size() {
+    let Some(fixture) = SshdFixture::new() else {
+        return;
+    };
+    let path = sftp_range_fixture_file(&fixture);
+    let url = fixture.url_for("sftp", &path);
+
+    let mut command = Command::cargo_bin("curl").unwrap();
+    command.args(["-q", "-sS", "--range", "5-99"]);
+    command.args(fixture.auth_args());
+    command.arg(url);
+    command.assert().success().stdout("data\nfor ssh test\n");
+}
+
+#[test]
+fn sftp_download_range_suffix_outputs_tail() {
+    let Some(fixture) = SshdFixture::new() else {
+        return;
+    };
+    let path = sftp_range_fixture_file(&fixture);
+    let url = fixture.url_for("sftp", &path);
+
+    let mut command = Command::cargo_bin("curl").unwrap();
+    command.args(["-q", "-sS", "--range", "-9"]);
+    command.args(fixture.auth_args());
+    command.arg(url);
+    command.assert().success().stdout("ssh test\n");
+}
+
+#[test]
+fn sftp_download_range_open_ended_outputs_to_eof() {
+    let Some(fixture) = SshdFixture::new() else {
+        return;
+    };
+    let path = sftp_range_fixture_file(&fixture);
+    let url = fixture.url_for("sftp", &path);
+
+    let mut command = Command::cargo_bin("curl").unwrap();
+    command.args(["-q", "-sS", "--range", "5-"]);
+    command.args(fixture.auth_args());
+    command.arg(url);
+    command.assert().success().stdout("data\nfor ssh test\n");
+}
+
+#[test]
+fn sftp_download_range_start_past_eof_returns_33() {
+    let Some(fixture) = SshdFixture::new() else {
+        return;
+    };
+    let path = sftp_range_fixture_file(&fixture);
+    let url = fixture.url_for("sftp", &path);
+
+    let mut command = Command::cargo_bin("curl").unwrap();
+    command.args(["-q", "-sS", "--range", "99-"]);
+    command.args(fixture.auth_args());
+    command.arg(url);
+    command.assert().failure().code(33).stdout("");
+}
+
+#[test]
+fn sftp_download_continue_at_fixed_to_stdout_outputs_tail() {
+    let Some(fixture) = SshdFixture::new() else {
+        return;
+    };
+    let url = fixture.url_for("sftp", &fixture.root.join("data.txt"));
+
+    let mut command = Command::cargo_bin("curl").unwrap();
+    command.args(["-q", "-sS", "--continue-at", "4"]);
+    command.args(fixture.auth_args());
+    command.arg(url);
+    command.assert().success().stdout("fixture body\n");
+}
+
+#[test]
+fn sftp_download_continue_at_fixed_appends_to_output() {
+    let Some(fixture) = SshdFixture::new() else {
+        return;
+    };
+    let temp = tempdir().unwrap();
+    let output = temp.path().join("out.txt");
+    std::fs::write(&output, b"ssh ").unwrap();
+    let url = fixture.url_for("sftp", &fixture.root.join("data.txt"));
+
+    let mut command = Command::cargo_bin("curl").unwrap();
+    command.args([
+        "-q",
+        "-sS",
+        "--continue-at",
+        "4",
+        "-o",
+        output.to_str().unwrap(),
+    ]);
+    command.args(fixture.auth_args());
+    command.arg(url);
+    command.assert().success().stdout("");
+
+    assert_eq!(std::fs::read(output).unwrap(), b"ssh fixture body\n");
+}
+
+#[test]
+fn sftp_download_continue_at_auto_uses_existing_output_size() {
+    let Some(fixture) = SshdFixture::new() else {
+        return;
+    };
+    let temp = tempdir().unwrap();
+    let output = temp.path().join("out.txt");
+    std::fs::write(&output, b"ssh ").unwrap();
+    let url = fixture.url_for("sftp", &fixture.root.join("data.txt"));
+
+    let mut command = Command::cargo_bin("curl").unwrap();
+    command.args([
+        "-q",
+        "-sS",
+        "--continue-at",
+        "-",
+        "-o",
+        output.to_str().unwrap(),
+    ]);
+    command.args(fixture.auth_args());
+    command.arg(url);
+    command.assert().success().stdout("");
+
+    assert_eq!(std::fs::read(output).unwrap(), b"ssh fixture body\n");
+}
+
+#[test]
+fn sftp_download_continue_at_complete_skips_body() {
+    let Some(fixture) = SshdFixture::new() else {
+        return;
+    };
+    let temp = tempdir().unwrap();
+    let output = temp.path().join("out.txt");
+    std::fs::write(&output, b"ssh fixture body\n").unwrap();
+    let url = fixture.url_for("sftp", &fixture.root.join("data.txt"));
+
+    let mut command = Command::cargo_bin("curl").unwrap();
+    command.args([
+        "-q",
+        "-sS",
+        "--continue-at",
+        "-",
+        "-o",
+        output.to_str().unwrap(),
+    ]);
+    command.args(fixture.auth_args());
+    command.arg(url);
+    command.assert().success().stdout("");
+
+    assert_eq!(std::fs::read(output).unwrap(), b"ssh fixture body\n");
+}
+
+#[test]
+fn sftp_download_continue_at_beyond_remote_size_returns_36() {
+    let Some(fixture) = SshdFixture::new() else {
+        return;
+    };
+    let temp = tempdir().unwrap();
+    let output = temp.path().join("out.txt");
+    let url = fixture.url_for("sftp", &fixture.root.join("data.txt"));
+
+    let mut command = Command::cargo_bin("curl").unwrap();
+    command.args([
+        "-q",
+        "-sS",
+        "--continue-at",
+        "100",
+        "-o",
+        output.to_str().unwrap(),
+    ]);
+    command.args(fixture.auth_args());
+    command.arg(url);
+    command.assert().failure().code(36).stdout("");
+}
+
 #[test]
 fn scp_quote_options_are_ignored() {
     let Some(fixture) = SshdFixture::new() else {

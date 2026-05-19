@@ -1697,6 +1697,7 @@ struct SshDownload {
     body: Vec<u8>,
     headers: reqwest::header::HeaderMap,
     quote_headers: Vec<u8>,
+    resume_from: u64,
 }
 
 struct SshPostquoteContext {
@@ -1752,6 +1753,16 @@ async fn run_ssh_transfer(
         .as_deref()
         .map(data::read_upload_body)
         .transpose()?;
+    let resume_from = if upload_body.is_none() && protocol == SshProtocol::Sftp {
+        resume_offset(
+            transfer,
+            &url,
+            &reqwest::header::HeaderMap::new(),
+            &expanded.variables,
+        )?
+    } else {
+        0
+    };
 
     let transfer_for_task = transfer.clone();
     let url_for_task = url.to_string();
@@ -1763,6 +1774,7 @@ async fn run_ssh_transfer(
             &method_for_task,
             protocol,
             upload_body,
+            resume_from,
         )
     });
     let download = if let Some(timeout) = transfer.max_time {
@@ -1828,7 +1840,7 @@ async fn run_ssh_transfer(
         &download.headers,
         &expanded.variables,
         &bytes,
-        false,
+        download.resume_from > 0,
     )?;
     metrics.filename_effective = filename.map(|path| path.display().to_string());
     if max_filesize_exceeded {
@@ -1904,14 +1916,14 @@ fn validate_ssh_transfer(
             "--oauth2-bearer for {scheme} URLs"
         )));
     }
-    if transfer.range.is_some() {
+    let is_upload = transfer.upload_file.is_some();
+    let is_sftp_download = protocol == SshProtocol::Sftp && !is_upload;
+    if transfer.range.is_some() && !is_sftp_download {
         return Err(CurlError::Unsupported(format!(
             "range/resume for {scheme} URLs"
         )));
     }
-    if transfer.continue_at.is_some()
-        && !(protocol == SshProtocol::Sftp && transfer.upload_file.is_some())
-    {
+    if transfer.continue_at.is_some() && protocol != SshProtocol::Sftp {
         return Err(CurlError::Unsupported(format!(
             "range/resume for {scheme} URLs"
         )));
@@ -1930,6 +1942,7 @@ fn run_ssh_blocking(
     method: &str,
     protocol: SshProtocol,
     upload_body: Option<Vec<u8>>,
+    resume_from: u64,
 ) -> Result<SshTransferResult> {
     let url = Url::parse(url).map_err(|error| CurlError::Url(error.to_string()))?;
     let path = ssh_url_path(&url, protocol)?;
@@ -1965,7 +1978,7 @@ fn run_ssh_blocking(
             })
         }
         SshProtocol::Sftp => {
-            ssh_sftp_download(transfer, &session, &path, method).map(|mut download| {
+            ssh_sftp_download(transfer, &session, &path, method, resume_from).map(|mut download| {
                 download.quote_headers = quote_headers;
                 SshTransferResult::Download {
                     download,
@@ -1995,6 +2008,7 @@ fn ssh_scp_download(session: &Session, path: &str, method: &str) -> Result<SshDo
         body,
         headers,
         quote_headers: Vec::new(),
+        resume_from: 0,
     })
 }
 
@@ -2003,9 +2017,15 @@ fn ssh_sftp_download(
     session: &Session,
     path: &str,
     method: &str,
+    resume_from: u64,
 ) -> Result<SshDownload> {
     let sftp = session.sftp().map_err(ssh_error_to_curl)?;
     if path.ends_with('/') {
+        if transfer.range.is_some() || resume_from > 0 {
+            return Err(CurlError::Unsupported(
+                "range/resume for SFTP directory listings".to_string(),
+            ));
+        }
         let entries = sftp.readdir(Path::new(path)).map_err(ssh_error_to_curl)?;
         let body = if method == "HEAD" {
             Vec::new()
@@ -2016,22 +2036,122 @@ fn ssh_sftp_download(
             body,
             headers: reqwest::header::HeaderMap::new(),
             quote_headers: Vec::new(),
+            resume_from: 0,
         });
     }
 
     let stat = sftp.stat(Path::new(path)).map_err(ssh_error_to_curl)?;
     let headers = sftp_file_headers(&stat);
+    let plan = sftp_download_read_plan(transfer, stat.size, resume_from)?;
     let mut body = Vec::new();
-    if method != "HEAD" {
+    if method != "HEAD" && plan.length != Some(0) {
         let mut file = sftp.open(Path::new(path)).map_err(ssh_error_to_curl)?;
-        file.read_to_end(&mut body)
-            .map_err(|error| CurlError::Transfer(error.to_string()))?;
+        if plan.start > 0 {
+            file.seek(SeekFrom::Start(plan.start))
+                .map_err(|_| sftp_seek_error(transfer, resume_from))?;
+        }
+        if let Some(length) = plan.length {
+            file.take(length)
+                .read_to_end(&mut body)
+                .map_err(|error| CurlError::Transfer(error.to_string()))?;
+        } else {
+            file.read_to_end(&mut body)
+                .map_err(|error| CurlError::Transfer(error.to_string()))?;
+        }
     }
     Ok(SshDownload {
         body,
         headers,
         quote_headers: Vec::new(),
+        resume_from,
     })
+}
+
+#[derive(Clone, Copy)]
+struct SftpDownloadReadPlan {
+    start: u64,
+    length: Option<u64>,
+}
+
+fn sftp_download_read_plan(
+    transfer: &TransferConfig,
+    remote_size: Option<u64>,
+    resume_from: u64,
+) -> Result<SftpDownloadReadPlan> {
+    let Some(remote_size) = remote_size.filter(|size| *size > 0) else {
+        if resume_from > 0 {
+            return Err(CurlError::BadDownloadResume);
+        }
+        return Ok(SftpDownloadReadPlan {
+            start: 0,
+            length: None,
+        });
+    };
+
+    if let Some(range) = transfer.range.as_deref() {
+        let (start, length) = sftp_parse_byte_range(range, remote_size)?;
+        return Ok(SftpDownloadReadPlan {
+            start,
+            length: Some(length),
+        });
+    }
+
+    if resume_from > remote_size {
+        return Err(CurlError::BadDownloadResume);
+    }
+
+    Ok(SftpDownloadReadPlan {
+        start: resume_from,
+        length: Some(remote_size - resume_from),
+    })
+}
+
+fn sftp_parse_byte_range(range: &str, remote_size: u64) -> Result<(u64, u64)> {
+    let range = range
+        .strip_prefix("bytes=")
+        .or_else(|| range.strip_prefix("BYTES="))
+        .unwrap_or(range);
+    if range.contains(',') {
+        return Err(CurlError::RangeError);
+    }
+    let Some((start, end)) = range.split_once('-') else {
+        return Err(CurlError::RangeError);
+    };
+
+    let (from, to) = if start.is_empty() {
+        let suffix = end.parse::<u64>().map_err(|_| CurlError::RangeError)?;
+        if suffix == 0 {
+            return Err(CurlError::RangeError);
+        }
+        let suffix = suffix.min(remote_size);
+        (remote_size - suffix, remote_size - 1)
+    } else {
+        let from = start.parse::<u64>().map_err(|_| CurlError::RangeError)?;
+        if from > remote_size {
+            return Err(CurlError::RangeError);
+        }
+        let to = if end.is_empty() {
+            remote_size - 1
+        } else {
+            end.parse::<u64>()
+                .map_err(|_| CurlError::RangeError)?
+                .min(remote_size - 1)
+        };
+        (from, to)
+    };
+
+    if from > to {
+        return Err(CurlError::RangeError);
+    }
+    Ok((from, to - from + 1))
+}
+
+fn sftp_seek_error(transfer: &TransferConfig, resume_from: u64) -> CurlError {
+    if resume_from > 0 && transfer.range.is_none() {
+        CurlError::BadDownloadResume
+    } else {
+        CurlError::RangeError
+    }
 }
 
 fn ssh_sftp_run_quote_commands(
