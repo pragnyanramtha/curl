@@ -54,6 +54,8 @@ pub enum CurlError {
     TooManyRedirects { max: usize },
     #[error("HTTP response code said error: {status}")]
     HttpStatus { status: u16 },
+    #[error("HTTP server does not seem to support byte ranges. Cannot resume.")]
+    RangeError,
     #[error("Maximum file size exceeded")]
     FileSizeExceeded,
     #[error("Login denied")]
@@ -108,6 +110,7 @@ impl CurlError {
             Self::QuoteError => 21,
             Self::TooManyRedirects { .. } => 47,
             Self::HttpStatus { .. } => 22,
+            Self::RangeError => 33,
             Self::FileSizeExceeded => 63,
             Self::LoginDenied | Self::UrlCredentialsProhibited => 67,
             Self::PeerVerificationFailed => 60,

@@ -6474,7 +6474,9 @@ fn file_urls_accept_uppercase_scheme_and_single_slash() {
 
 #[test]
 fn continue_at_fixed_offset_sends_range_and_appends_output() {
-    let (url, rx) = spawn_server(b"HTTP/1.1 206 Partial Content\r\nContent-Length: 3\r\n\r\nllo");
+    let (url, rx) = spawn_server(
+        b"HTTP/1.1 206 Partial Content\r\nContent-Range: bytes 2-4/5\r\nContent-Length: 3\r\n\r\nllo",
+    );
     let temp = tempdir().unwrap();
     let output = temp.path().join("download.txt");
     std::fs::write(&output, "he").unwrap();
@@ -6490,7 +6492,9 @@ fn continue_at_fixed_offset_sends_range_and_appends_output() {
 
 #[test]
 fn continue_at_fixed_offset_to_stdout_sends_range() {
-    let (url, rx) = spawn_server(b"HTTP/1.1 206 Partial Content\r\nContent-Length: 2\r\n\r\nlo");
+    let (url, rx) = spawn_server(
+        b"HTTP/1.1 206 Partial Content\r\nContent-Range: bytes 3-4/5\r\nContent-Length: 2\r\n\r\nlo",
+    );
 
     let mut command = Command::cargo_bin("curl").unwrap();
     command.args(["-q", "-sS", "-C3", &url]);
@@ -6502,7 +6506,9 @@ fn continue_at_fixed_offset_to_stdout_sends_range() {
 
 #[test]
 fn continue_at_auto_uses_existing_output_size() {
-    let (url, rx) = spawn_server(b"HTTP/1.1 206 Partial Content\r\nContent-Length: 2\r\n\r\nlo");
+    let (url, rx) = spawn_server(
+        b"HTTP/1.1 206 Partial Content\r\nContent-Range: bytes 3-4/5\r\nContent-Length: 2\r\n\r\nlo",
+    );
     let temp = tempdir().unwrap();
     let output = temp.path().join("download.txt");
     std::fs::write(&output, "hel").unwrap();
@@ -6522,6 +6528,81 @@ fn continue_at_auto_uses_existing_output_size() {
     let request = rx.recv().unwrap();
     assert_eq!(header(&request, "range"), Some("bytes=3-"));
     assert_eq!(std::fs::read_to_string(output).unwrap(), "hello");
+}
+
+#[test]
+fn continue_at_http_200_without_content_range_fails_without_appending() {
+    let (url, rx) = spawn_server(b"HTTP/1.1 200 OK\r\nContent-Length: 5\r\n\r\nhello");
+    let temp = tempdir().unwrap();
+    let output = temp.path().join("download.txt");
+    std::fs::write(&output, "he").unwrap();
+
+    let mut command = Command::cargo_bin("curl").unwrap();
+    command.args([
+        "-q",
+        "-sS",
+        "-C",
+        "2",
+        "-o",
+        output.to_str().unwrap(),
+        "-w",
+        " %{exitcode} %{errormsg} %{size_download}",
+        &url,
+    ]);
+    command
+        .assert()
+        .failure()
+        .code(33)
+        .stdout(" 33 HTTP server does not seem to support byte ranges. Cannot resume. 0");
+
+    let request = rx.recv().unwrap();
+    assert_eq!(header(&request, "range"), Some("bytes=2-"));
+    assert_eq!(std::fs::read_to_string(output).unwrap(), "he");
+}
+
+#[test]
+fn continue_at_http_200_matching_existing_length_is_already_complete() {
+    let (url, rx) = spawn_server(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nhe");
+    let temp = tempdir().unwrap();
+    let output = temp.path().join("download.txt");
+    std::fs::write(&output, "he").unwrap();
+
+    let mut command = Command::cargo_bin("curl").unwrap();
+    command.args(["-q", "-sS", "-C", "2", "-o", output.to_str().unwrap(), &url]);
+    command.assert().success().stdout("");
+
+    let request = rx.recv().unwrap();
+    assert_eq!(header(&request, "range"), Some("bytes=2-"));
+    assert_eq!(std::fs::read_to_string(output).unwrap(), "he");
+}
+
+#[test]
+fn continue_at_http_416_with_fail_is_already_complete() {
+    let (url, rx) = spawn_server(
+        b"HTTP/1.1 416 Invalid range\r\nContent-Range: */2\r\nContent-Length: 5\r\n\r\nerror",
+    );
+    let temp = tempdir().unwrap();
+    let output = temp.path().join("download.txt");
+    std::fs::write(&output, "he").unwrap();
+
+    let mut command = Command::cargo_bin("curl").unwrap();
+    command.args([
+        "-q",
+        "-sS",
+        "-f",
+        "-C",
+        "2",
+        "-o",
+        output.to_str().unwrap(),
+        "-w",
+        " %{exitcode} %{http_code} %{size_download}",
+        &url,
+    ]);
+    command.assert().success().stdout(" 0 416 0");
+
+    let request = rx.recv().unwrap();
+    assert_eq!(header(&request, "range"), Some("bytes=2-"));
+    assert_eq!(std::fs::read_to_string(output).unwrap(), "he");
 }
 
 #[test]

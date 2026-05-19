@@ -13,9 +13,9 @@ use tokio::net::{TcpStream, UdpSocket};
 use tokio::task::JoinSet;
 
 use reqwest::header::{
-    ACCEPT, ACCEPT_ENCODING, ACCEPT_RANGES, AUTHORIZATION, CONTENT_LENGTH, CONTENT_TYPE, COOKIE,
-    ETAG, HeaderName, HeaderValue, IF_MODIFIED_SINCE, IF_NONE_MATCH, IF_UNMODIFIED_SINCE,
-    LAST_MODIFIED, LOCATION, RANGE, REFERER, RETRY_AFTER, USER_AGENT,
+    ACCEPT, ACCEPT_ENCODING, ACCEPT_RANGES, AUTHORIZATION, CONTENT_LENGTH, CONTENT_RANGE,
+    CONTENT_TYPE, COOKIE, ETAG, HeaderName, HeaderValue, IF_MODIFIED_SINCE, IF_NONE_MATCH,
+    IF_UNMODIFIED_SINCE, LAST_MODIFIED, LOCATION, RANGE, REFERER, RETRY_AFTER, USER_AGENT,
 };
 use reqwest::{Client, Method, StatusCode, Url, Version};
 
@@ -117,6 +117,12 @@ struct AppliedHttpHeaders {
     request: reqwest::RequestBuilder,
     has_authorization: bool,
     has_content_length: bool,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum HttpResumeAction {
+    ReadBody,
+    AlreadyComplete,
 }
 
 pub async fn run(config: Config) -> Result<i32> {
@@ -5945,6 +5951,62 @@ fn check_http_content_length_max_filesize(
     Ok(())
 }
 
+fn http_resume_action(
+    method: &Method,
+    resume_from: u64,
+    status: StatusCode,
+    headers: &reqwest::header::HeaderMap,
+) -> Result<HttpResumeAction> {
+    if resume_from == 0 || *method != Method::GET {
+        return Ok(HttpResumeAction::ReadBody);
+    }
+
+    if status == StatusCode::RANGE_NOT_SATISFIABLE {
+        return Ok(HttpResumeAction::AlreadyComplete);
+    }
+
+    if headers
+        .get(CONTENT_RANGE)
+        .and_then(|value| value.to_str().ok())
+        .and_then(content_range_start)
+        .is_some_and(|start| start == resume_from)
+    {
+        return Ok(HttpResumeAction::ReadBody);
+    }
+
+    if headers
+        .get(CONTENT_LENGTH)
+        .and_then(|value| value.to_str().ok())
+        .and_then(parse_http_content_length_for_max_filesize)
+        .is_some_and(|length| length == u128::from(resume_from))
+    {
+        return Ok(HttpResumeAction::AlreadyComplete);
+    }
+
+    Err(CurlError::RangeError)
+}
+
+fn is_resume_416(method: &Method, resume_from: u64, status: StatusCode) -> bool {
+    resume_from > 0 && *method == Method::GET && status == StatusCode::RANGE_NOT_SATISFIABLE
+}
+
+fn content_range_start(value: &str) -> Option<u64> {
+    let bytes = value.as_bytes();
+    let mut start = 0;
+    while start < bytes.len() && !bytes[start].is_ascii_digit() && bytes[start] != b'*' {
+        start += 1;
+    }
+    if start == bytes.len() || bytes[start] == b'*' {
+        return None;
+    }
+
+    let mut end = start;
+    while end < bytes.len() && bytes[end].is_ascii_digit() {
+        end += 1;
+    }
+    value[start..end].parse().ok()
+}
+
 fn parse_http_content_length_for_max_filesize(value: &str) -> Option<u128> {
     let value = value.trim();
     let value = value.split(',').next().unwrap_or(value).trim();
@@ -6406,8 +6468,9 @@ async fn run_http_transfer(
         metrics.headers = headers.clone();
 
         check_http_content_length_max_filesize(transfer, &headers, method == Method::HEAD)?;
+        let resume_action = http_resume_action(&method, resume_from, status, &headers)?;
 
-        let body = if method == Method::HEAD {
+        let body = if method == Method::HEAD || resume_action == HttpResumeAction::AlreadyComplete {
             Vec::new()
         } else {
             response.bytes().await.transfer_err()?.to_vec()
@@ -6775,7 +6838,8 @@ async fn raw_http_read_response(
 
     let (version, status, headers) = parse_raw_http_headers(&header_bytes)?;
     let retry_after = retry_after_delay(&headers);
-    let body = if method == Method::HEAD {
+    let resume_action = http_resume_action(method, resume_from, status, &headers)?;
+    let body = if method == Method::HEAD || resume_action == HttpResumeAction::AlreadyComplete {
         Vec::new()
     } else if let Some(length) = headers
         .get(CONTENT_LENGTH)
@@ -6955,7 +7019,10 @@ fn finish_http_transfer(
         return Err(CurlError::FileSizeExceeded);
     }
 
-    if transfer.fail && is_http_error_status(attempt.status) {
+    if transfer.fail
+        && is_http_error_status(attempt.status)
+        && !is_resume_416(&method, attempt.resume_from, attempt.status)
+    {
         return Err(CurlError::HttpStatus {
             status: attempt.status.as_u16(),
         });
