@@ -6472,7 +6472,7 @@ async fn run_http_transfer(
 
     if explicit_proxy.is_none()
         && raw_http_direct_supported(transfer, &url, has_multipart)
-        && needs_raw_custom_header_wire_semantics(transfer)?
+        && (transfer.request_target.is_some() || needs_raw_custom_header_wire_semantics(transfer)?)
     {
         let attempt = run_raw_http_direct_transfer(RawHttpDirectContext {
             transfer,
@@ -6501,6 +6501,13 @@ async fn run_http_transfer(
         check_http_content_length_max_filesize(transfer, &attempt.headers, method == Method::HEAD)?;
         metrics.size_download = attempt.body.len() as u64;
         return Ok(attempt);
+    }
+
+    if transfer.request_target.is_some() {
+        return Err(CurlError::Unsupported(
+            "--request-target is only implemented for plain HTTP raw requests in the Rust sidecar"
+                .to_string(),
+        ));
     }
 
     let mut current_method = method;
@@ -6738,15 +6745,14 @@ fn raw_http_direct_request(context: &RawHttpDirectContext<'_>) -> Result<Vec<u8>
             .any(|(header_name, _)| header_name.as_str().eq_ignore_ascii_case(name))
     };
     let body = raw_http_body(context.transfer, context.prepared_body, context.upload_body);
+    let target = context
+        .transfer
+        .request_target
+        .clone()
+        .unwrap_or_else(|| http_request_target(context.url));
     let mut request = Vec::new();
-    request.extend_from_slice(
-        format!(
-            "{} {} HTTP/1.1\r\n",
-            context.method.as_str(),
-            http_request_target(context.url)
-        )
-        .as_bytes(),
-    );
+    request
+        .extend_from_slice(format!("{} {target} HTTP/1.1\r\n", context.method.as_str()).as_bytes());
     if !has_header("host") {
         request
             .extend_from_slice(format!("Host: {}\r\n", http_host_header(context.url)).as_bytes());
@@ -6842,10 +6848,14 @@ fn raw_http_proxy_request(context: &RawHttpProxyContext<'_>) -> Result<Vec<u8>> 
             .any(|(header_name, _)| header_name.as_str().eq_ignore_ascii_case(name))
     };
     let body = raw_http_body(context.transfer, context.prepared_body, context.upload_body);
+    let target = context
+        .transfer
+        .request_target
+        .clone()
+        .unwrap_or_else(|| context.url.to_string());
     let mut request = Vec::new();
-    request.extend_from_slice(
-        format!("{} {} HTTP/1.1\r\n", context.method.as_str(), context.url).as_bytes(),
-    );
+    request
+        .extend_from_slice(format!("{} {target} HTTP/1.1\r\n", context.method.as_str()).as_bytes());
     if !has_header("host") {
         request
             .extend_from_slice(format!("Host: {}\r\n", http_host_header(context.url)).as_bytes());

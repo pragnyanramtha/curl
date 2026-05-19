@@ -2074,6 +2074,20 @@ fn user_agent_option_sets_header_and_empty_value_suppresses_default() {
 }
 
 #[test]
+fn request_target_sets_direct_http_request_line() {
+    let (url, rx) = spawn_server(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok");
+
+    let mut command = Command::cargo_bin("curl").unwrap();
+    command.args(["-q", "-sS", "--request-target", "*", "-X", "OPTIONS", &url]);
+    command.assert().success().stdout("ok");
+
+    let request = rx.recv().unwrap();
+    assert_eq!(request.start_line, "OPTIONS * HTTP/1.1");
+    assert!(header(&request, "user-agent").unwrap().starts_with("curl/"));
+    assert_eq!(header(&request, "accept"), Some("*/*"));
+}
+
+#[test]
 fn resolve_maps_host_to_address() {
     let (url, rx) = spawn_server(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok");
     let port = Url::parse(&url).unwrap().port().unwrap();
@@ -5833,6 +5847,30 @@ fn proxy_user_sets_proxy_authorization_header() {
 }
 
 #[test]
+fn request_target_sets_http_proxy_request_line() {
+    let (proxy_url, rx) = spawn_server(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok");
+
+    let mut command = Command::cargo_bin("curl").unwrap();
+    command.args([
+        "-q",
+        "-sS",
+        "--request-target",
+        "*",
+        "-X",
+        "OPTIONS",
+        "-x",
+        &proxy_url,
+        "http://www.example.org/",
+    ]);
+    command.assert().success().stdout("ok");
+
+    let request = rx.recv().unwrap();
+    assert_eq!(request.start_line, "OPTIONS * HTTP/1.1");
+    assert_eq!(header(&request, "host"), Some("www.example.org"));
+    assert_eq!(header(&request, "proxy-connection"), Some("Keep-Alive"));
+}
+
+#[test]
 fn raw_proxy_uses_user_agent_option_and_empty_value_suppresses_default() {
     let (custom_proxy_url, custom_rx) =
         spawn_server(b"HTTP/1.1 200 OK\r\nContent-Length: 6\r\n\r\ncustom");
@@ -6260,6 +6298,34 @@ fn libcurl_writes_source_file_for_supported_options() {
     )));
     assert!(text.contains("CURLOPT_COOKIESESSION, 1"));
     assert!(text.contains("curl_easy_perform(curl);"));
+}
+
+#[test]
+fn libcurl_writes_request_target_option() {
+    let (url, rx) = spawn_server(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok");
+    let temp = tempdir().unwrap();
+    let source = temp.path().join("client.c");
+
+    let mut command = Command::cargo_bin("curl").unwrap();
+    command.args([
+        "-q",
+        "-sS",
+        "--libcurl",
+        source.to_str().unwrap(),
+        "--request-target",
+        "*",
+        "-X",
+        "OPTIONS",
+        &url,
+    ]);
+    command.assert().success().stdout("ok");
+
+    let request = rx.recv().unwrap();
+    assert_eq!(request.start_line, "OPTIONS * HTTP/1.1");
+
+    let text = std::fs::read_to_string(source).unwrap();
+    assert!(text.contains("CURLOPT_CUSTOMREQUEST, \"OPTIONS\""));
+    assert!(text.contains("CURLOPT_REQUEST_TARGET, \"*\""));
 }
 
 #[test]

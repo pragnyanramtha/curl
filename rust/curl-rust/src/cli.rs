@@ -33,6 +33,7 @@ pub struct TransferConfig {
     pub url_remote_names: Vec<bool>,
     pub url_globoffs: Vec<bool>,
     pub method: Option<String>,
+    pub request_target: Option<String>,
     pub head: bool,
     pub get: bool,
     pub list_only: bool,
@@ -159,6 +160,7 @@ impl Default for TransferConfig {
             url_remote_names: Vec::new(),
             url_globoffs: Vec::new(),
             method: None,
+            request_target: None,
             head: false,
             get: false,
             list_only: false,
@@ -384,6 +386,10 @@ impl Parser {
             "request" => {
                 let value = self.value_for(name, inline_value)?;
                 self.current().method = Some(value);
+            }
+            "request-target" => {
+                let value = self.value_for(name, inline_value)?;
+                self.current().request_target = Some(parse_nonempty_string(name, value)?);
             }
             "head" => self.current().head = true,
             "get" => self.current().get = true,
@@ -1146,6 +1152,7 @@ impl TransferConfig {
     fn has_options(&self) -> bool {
         !self.urls.is_empty()
             || self.method.is_some()
+            || self.request_target.is_some()
             || self.head
             || self.get
             || self.list_only
@@ -1229,6 +1236,7 @@ fn option_takes_value(name: &str) -> bool {
             | "parallel-max"
             | "parallel-max-host"
             | "request"
+            | "request-target"
             | "header"
             | "referer"
             | "range"
@@ -1727,6 +1735,7 @@ fn print_common_help() {
                --expand-* <value>      Expand variables in option value\n\
                --libcurl <file>        Generate libcurl code\n\
            -X, --request <method>      Specify request method\n\
+               --request-target <path> Specify request target\n\
            -u, --user <user:pass>      Server user and password\n\
                --disallow-username-in-url Reject URL user names\n\
                --resolve <host:port:addr> Resolve host to address\n\
@@ -1966,6 +1975,26 @@ mod tests {
         assert_eq!(transfer.data[0].value, "a=b");
         assert_eq!(transfer.output.as_deref(), Some("out.txt"));
         assert_eq!(transfer.urls, ["https://example.com"]);
+    }
+
+    #[test]
+    fn parses_request_target_option() {
+        let config = parse_args(["-q", "--request-target", "*", "https://example.com"]).unwrap();
+        assert_eq!(config.transfers[0].request_target.as_deref(), Some("*"));
+    }
+
+    #[test]
+    fn config_files_parse_request_target_option() {
+        let temp = tempdir().unwrap();
+        let config_file = temp.path().join("curlrc");
+        std::fs::write(
+            &config_file,
+            "request-target = \"*\"\nurl = https://example.com\n",
+        )
+        .unwrap();
+
+        let config = parse_args(["-q", "--config", config_file.to_str().unwrap()]).unwrap();
+        assert_eq!(config.transfers[0].request_target.as_deref(), Some("*"));
     }
 
     #[test]

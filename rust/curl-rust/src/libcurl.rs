@@ -164,6 +164,9 @@ fn write_request(out: &mut String, render: &RenderTransfer<'_>, url: &str) -> Re
     if let Some(method) = &transfer.method {
         emit_string_setopt(out, "CURLOPT_CUSTOMREQUEST", method);
     }
+    if let Some(target) = &transfer.request_target {
+        emit_string_setopt(out, "CURLOPT_REQUEST_TARGET", target);
+    }
     if transfer.head {
         emit_long_setopt(out, "CURLOPT_NOBODY", 1);
     }
