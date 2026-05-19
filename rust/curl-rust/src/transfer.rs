@@ -1885,16 +1885,18 @@ fn validate_ssh_transfer(
             "custom requests for {scheme} URLs"
         )));
     }
-    if transfer.upload_file.is_some() {
-        if method != "GET" {
+    let is_upload = transfer.upload_file.is_some();
+    let is_scp_upload = protocol == SshProtocol::Scp && is_upload;
+    if is_upload {
+        if method != "GET" && !(is_scp_upload && method == "HEAD") {
             return Err(CurlError::Unsupported(format!(
                 "{method} requests for {scheme} uploads"
             )));
         }
-        if protocol == SshProtocol::Scp && transfer.upload_file.as_deref() == Some("-") {
+        if is_scp_upload && matches!(transfer.upload_file.as_deref(), Some("-" | ".")) {
             return Err(CurlError::FtpUploadFailed);
         }
-        if transfer.head {
+        if transfer.head && protocol == SshProtocol::Sftp {
             return Err(CurlError::Unsupported(format!(
                 "--upload-file combined with --head for {scheme} URLs"
             )));
@@ -1914,14 +1916,13 @@ fn validate_ssh_transfer(
             "--oauth2-bearer for {scheme} URLs"
         )));
     }
-    let is_upload = transfer.upload_file.is_some();
     let is_sftp_download = protocol == SshProtocol::Sftp && !is_upload;
-    if transfer.range.is_some() && !is_sftp_download {
+    if transfer.range.is_some() && !(is_sftp_download || is_scp_upload) {
         return Err(CurlError::Unsupported(format!(
             "range/resume for {scheme} URLs"
         )));
     }
-    if transfer.continue_at.is_some() && protocol != SshProtocol::Sftp {
+    if transfer.continue_at.is_some() && protocol != SshProtocol::Sftp && !is_scp_upload {
         return Err(CurlError::Unsupported(format!(
             "range/resume for {scheme} URLs"
         )));

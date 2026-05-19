@@ -6117,6 +6117,99 @@ fn scp_upload_dump_header_and_include_emit_no_bytes() {
 }
 
 #[test]
+fn scp_upload_dot_returns_upload_failed() {
+    let Some(fixture) = SshdFixture::new() else {
+        return;
+    };
+    let remote = fixture.root.join("scp-dot-upload.txt");
+    let url = fixture.url_for("scp", &remote);
+
+    let mut command = Command::cargo_bin("curl").unwrap();
+    command.args(["-q", "-sS", "-T", "."]);
+    command.args(fixture.auth_args());
+    command.arg(url);
+    command.assert().failure().code(25).stdout("");
+
+    assert!(!remote.exists());
+}
+
+#[test]
+fn scp_upload_with_head_still_uploads_file() {
+    let Some(fixture) = SshdFixture::new() else {
+        return;
+    };
+    let temp = tempdir().unwrap();
+    let upload = temp.path().join("payload.txt");
+    std::fs::write(&upload, b"head still uploads\n").unwrap();
+    let remote = fixture.root.join("scp-head-upload.txt");
+    let url = fixture.url_for("scp", &remote);
+
+    let mut command = Command::cargo_bin("curl").unwrap();
+    command.args(["-q", "-sS", "-I", "-T", upload.to_str().unwrap()]);
+    command.args(fixture.auth_args());
+    command.arg(url);
+    command.assert().success().stdout("");
+
+    assert_eq!(std::fs::read(remote).unwrap(), b"head still uploads\n");
+}
+
+#[test]
+fn scp_upload_range_continue_and_append_are_ignored() {
+    let Some(fixture) = SshdFixture::new() else {
+        return;
+    };
+    let temp = tempdir().unwrap();
+    let upload = temp.path().join("payload.txt");
+    std::fs::write(&upload, b"new scp bytes\n").unwrap();
+
+    for (name, args) in [
+        ("range", vec!["--range", "4-"]),
+        ("continue", vec!["--continue-at", "4"]),
+        ("append", vec!["--append"]),
+    ] {
+        let remote = fixture.root.join(format!("scp-{name}-ignored.txt"));
+        std::fs::write(&remote, b"old prefix").unwrap();
+        let url = fixture.url_for("scp", &remote);
+
+        let mut command = Command::cargo_bin("curl").unwrap();
+        command.args(["-q", "-sS"]);
+        command.args(args);
+        command.args(["-T", upload.to_str().unwrap()]);
+        command.args(fixture.auth_args());
+        command.arg(url);
+        command.assert().success().stdout("");
+
+        assert_eq!(std::fs::read(remote).unwrap(), b"new scp bytes\n");
+    }
+}
+
+#[test]
+fn scp_upload_create_dirs_is_ignored() {
+    let Some(fixture) = SshdFixture::new() else {
+        return;
+    };
+    let temp = tempdir().unwrap();
+    let upload = temp.path().join("payload.txt");
+    std::fs::write(&upload, b"not written\n").unwrap();
+    let remote = fixture.root.join("scp-created").join("payload.txt");
+    let url = fixture.url_for("scp", &remote);
+
+    let mut command = Command::cargo_bin("curl").unwrap();
+    command.args([
+        "-q",
+        "-sS",
+        "--ftp-create-dirs",
+        "-T",
+        upload.to_str().unwrap(),
+    ]);
+    command.args(fixture.auth_args());
+    command.arg(url);
+    command.assert().failure().code(25).stdout("");
+
+    assert!(!remote.exists());
+}
+
+#[test]
 fn sftp_missing_file_returns_78() {
     let Some(fixture) = SshdFixture::new() else {
         return;
