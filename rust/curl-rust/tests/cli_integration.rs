@@ -4754,7 +4754,31 @@ fn http_upload_rejects_data_body_combination() {
         "a=b",
         "http://example.invalid/",
     ]);
-    command.assert().failure().code(2).stdout("");
+    command.assert().failure().code(2).stdout("").stderr(
+        "Warning: You can only select one HTTP request method! You asked for both PUT \n\
+         Warning: (-T, --upload-file) and POST (-d, --data).\n",
+    );
+}
+
+#[test]
+fn http_upload_data_conflict_precedes_upload_file_read() {
+    let temp = tempdir().unwrap();
+    let missing = temp.path().join("missing.txt");
+
+    let mut command = Command::cargo_bin("curl").unwrap();
+    command.args([
+        "-q",
+        "-sS",
+        "-T",
+        missing.to_str().unwrap(),
+        "-d",
+        "a=b",
+        "http://never-accessed/",
+    ]);
+    command.assert().failure().code(2).stdout("").stderr(
+        "Warning: You can only select one HTTP request method! You asked for both PUT \n\
+         Warning: (-T, --upload-file) and POST (-d, --data).\n",
+    );
 }
 
 #[test]

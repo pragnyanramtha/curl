@@ -6050,6 +6050,9 @@ async fn run_http_transfer(
 ) -> Result<HttpAttempt> {
     let prepared_query = data::prepare_body(&transfer.url_query)?;
     let prepared_body = data::prepare_body(&transfer.data)?;
+    if transfer.upload_file.is_some() && prepared_body.is_some() {
+        return Err(CurlError::HttpMethodConflict);
+    }
     let upload_body = transfer
         .upload_file
         .as_deref()
@@ -6064,11 +6067,6 @@ async fn run_http_transfer(
     if prepared_body.is_some() && transfer.continue_at.is_some() {
         return Err(CurlError::Usage(
             "--continue-at cannot be combined with --data or --json".to_string(),
-        ));
-    }
-    if upload_body.is_some() && prepared_body.is_some() {
-        return Err(CurlError::Usage(
-            "--upload-file cannot be combined with --data or --json".to_string(),
         ));
     }
     if upload_body.is_some() && has_multipart {
@@ -6843,7 +6841,14 @@ fn apply_file_range(bytes: Vec<u8>, range: Option<&str>) -> Result<Vec<u8>> {
 
 fn report_error(transfer: &TransferConfig, error: &CurlError) {
     if !transfer.silent || transfer.show_error {
-        eprintln!("curl: ({}) {error}", error.exit_code());
+        if matches!(error, CurlError::HttpMethodConflict) {
+            eprintln!(
+                "Warning: You can only select one HTTP request method! You asked for both PUT "
+            );
+            eprintln!("Warning: (-T, --upload-file) and POST (-d, --data).");
+        } else {
+            eprintln!("curl: ({}) {error}", error.exit_code());
+        }
     }
 }
 

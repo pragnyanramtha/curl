@@ -106,7 +106,7 @@ pub fn read_upload_body(path: &str) -> Result<Vec<u8>> {
     if path == "-" {
         read_data_argument(path)
     } else {
-        std::fs::read(path).map_err(|_| CurlError::ReadError(format!("cannot open '{path}'")))
+        read_local_file(path)
     }
 }
 
@@ -244,8 +244,12 @@ fn read_data_argument(path: &str) -> Result<Vec<u8>> {
         io::stdin().read_to_end(&mut bytes)?;
         Ok(bytes)
     } else {
-        Ok(std::fs::read(path)?)
+        read_local_file(path)
     }
+}
+
+fn read_local_file(path: &str) -> Result<Vec<u8>> {
+    std::fs::read(path).map_err(|_| CurlError::ReadError(format!("cannot open '{path}'")))
 }
 
 fn data_urlencode(value: &str) -> Result<String> {
@@ -363,5 +367,20 @@ mod tests {
         .unwrap();
 
         assert!(form.is_some());
+    }
+
+    #[test]
+    fn missing_form_file_returns_read_error() {
+        let temp = tempfile::tempdir().unwrap();
+        let missing = temp.path().join("missing.txt");
+        let spec = format!("field=@{}", missing.display());
+
+        let error = match prepare_multipart(&[FormSpec::new(FormKind::Form, spec)]) {
+            Ok(_) => panic!("missing form file should fail"),
+            Err(error) => error,
+        };
+
+        assert!(matches!(error, CurlError::ReadError(_)));
+        assert_eq!(error.exit_code(), 26);
     }
 }

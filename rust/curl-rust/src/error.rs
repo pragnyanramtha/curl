@@ -6,6 +6,10 @@ pub type Result<T> = std::result::Result<T, CurlError>;
 pub enum CurlError {
     #[error("{0}")]
     Usage(String),
+    #[error(
+        "You can only select one HTTP request method! You asked for both PUT (-T, --upload-file) and POST (-d, --data)."
+    )]
+    HttpMethodConflict,
     #[error("unsupported option or feature: {0}")]
     Unsupported(String),
     #[error("Protocol \"{0}\" not supported")]
@@ -82,7 +86,7 @@ impl CurlError {
     pub fn exit_code(&self) -> i32 {
         match self {
             Self::UnsupportedProtocol(_) => 1,
-            Self::Usage(_) | Self::Unsupported(_) => 2,
+            Self::Usage(_) | Self::HttpMethodConflict | Self::Unsupported(_) => 2,
             Self::Url(_) => 3,
             Self::Transfer(_) => 7,
             Self::WeirdServerReply => 8,
