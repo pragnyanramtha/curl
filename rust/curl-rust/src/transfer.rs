@@ -1904,11 +1904,6 @@ fn validate_ssh_transfer(
             "--oauth2-bearer for {scheme} URLs"
         )));
     }
-    if protocol == SshProtocol::Scp && transfer_has_ftp_quote_commands(transfer) {
-        return Err(CurlError::Unsupported(format!(
-            "quote commands for {scheme} URLs in the Rust sidecar"
-        )));
-    }
     if transfer.range.is_some() || transfer.continue_at.is_some() {
         return Err(CurlError::Unsupported(format!(
             "range/resume for {scheme} URLs"
@@ -1920,12 +1915,6 @@ fn validate_ssh_transfer(
         )));
     }
     Ok(())
-}
-
-fn transfer_has_ftp_quote_commands(transfer: &TransferConfig) -> bool {
-    !transfer.ftp_quote.is_empty()
-        || !transfer.ftp_prequote.is_empty()
-        || !transfer.ftp_postquote.is_empty()
 }
 
 fn run_ssh_blocking(

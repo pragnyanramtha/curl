@@ -5744,6 +5744,51 @@ fn scp_downloads_file_with_known_hosts() {
 }
 
 #[test]
+fn scp_quote_options_are_ignored() {
+    let Some(fixture) = SshdFixture::new() else {
+        return;
+    };
+    let source = fixture.root.join("data.txt");
+    let created_dir = fixture.root.join("scp-prequote-dir");
+    let normal_quote = format!("rm {}", source.display());
+    let prequote = format!("+mkdir {}", created_dir.display());
+    let postquote = format!("-rm {}", source.display());
+    let url = fixture.url_for("scp", &source);
+
+    let mut command = Command::cargo_bin("curl").unwrap();
+    command.args([
+        "-q",
+        "-sS",
+        "--quote",
+        &normal_quote,
+        "--quote",
+        &prequote,
+        "--quote",
+        &postquote,
+    ]);
+    command.args(fixture.auth_args());
+    command.arg(url);
+    command.assert().success().stdout("ssh fixture body\n");
+
+    assert_eq!(std::fs::read(source).unwrap(), b"ssh fixture body\n");
+    assert!(!created_dir.exists());
+}
+
+#[test]
+fn scp_unknown_quote_is_ignored() {
+    let Some(fixture) = SshdFixture::new() else {
+        return;
+    };
+    let url = fixture.url_for("scp", &fixture.root.join("data.txt"));
+
+    let mut command = Command::cargo_bin("curl").unwrap();
+    command.args(["-q", "-sS", "--quote", "unknown command with trailing junk"]);
+    command.args(fixture.auth_args());
+    command.arg(url);
+    command.assert().success().stdout("ssh fixture body\n");
+}
+
+#[test]
 fn sftp_missing_file_returns_78() {
     let Some(fixture) = SshdFixture::new() else {
         return;
