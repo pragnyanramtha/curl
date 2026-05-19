@@ -5985,6 +5985,138 @@ fn scp_unknown_quote_is_ignored() {
 }
 
 #[test]
+fn scp_upload_file_writes_remote_file() {
+    let Some(fixture) = SshdFixture::new() else {
+        return;
+    };
+    let temp = tempdir().unwrap();
+    let upload = temp.path().join("payload.txt");
+    std::fs::write(&upload, b"uploaded over scp\n").unwrap();
+    let remote = fixture.root.join("scp-uploaded.txt");
+    let url = fixture.url_for("scp", &remote);
+
+    let mut command = Command::cargo_bin("curl").unwrap();
+    command.args(["-q", "-sS", "-T", upload.to_str().unwrap()]);
+    command.args(fixture.auth_args());
+    command.arg(url);
+    command.assert().success().stdout("");
+
+    assert_eq!(std::fs::read(remote).unwrap(), b"uploaded over scp\n");
+}
+
+#[test]
+fn scp_upload_dash_returns_upload_failed() {
+    let Some(fixture) = SshdFixture::new() else {
+        return;
+    };
+    let remote = fixture.root.join("scp-stdin-upload.txt");
+    let url = fixture.url_for("scp", &remote);
+
+    let mut command = Command::cargo_bin("curl").unwrap();
+    command.args(["-q", "-sS", "-T", "-"]);
+    command.args(fixture.auth_args());
+    command.arg(url);
+    command.assert().failure().code(25).stdout("");
+
+    assert!(!remote.exists());
+}
+
+#[test]
+fn scp_upload_to_directory_url_appends_local_filename() {
+    let Some(fixture) = SshdFixture::new() else {
+        return;
+    };
+    let temp = tempdir().unwrap();
+    let upload = temp.path().join("scp-client-name.txt");
+    std::fs::write(&upload, b"scp directory upload\n").unwrap();
+    let mut directory = fixture.root.join("dir").to_str().unwrap().to_string();
+    directory.push('/');
+    let url = fixture.url_for("scp", Path::new(&directory));
+
+    let mut command = Command::cargo_bin("curl").unwrap();
+    command.args(["-q", "-sS", "-T", upload.to_str().unwrap()]);
+    command.args(fixture.auth_args());
+    command.arg(url);
+    command.assert().success().stdout("");
+
+    assert_eq!(
+        std::fs::read(fixture.root.join("dir").join("scp-client-name.txt")).unwrap(),
+        b"scp directory upload\n"
+    );
+}
+
+#[test]
+fn scp_upload_missing_local_file_returns_read_error() {
+    let Some(fixture) = SshdFixture::new() else {
+        return;
+    };
+    let temp = tempdir().unwrap();
+    let missing = temp.path().join("missing.txt");
+    let remote = fixture.root.join("scp-should-not-exist.txt");
+    let url = fixture.url_for("scp", &remote);
+
+    let mut command = Command::cargo_bin("curl").unwrap();
+    command.args(["-q", "-sS", "-T", missing.to_str().unwrap()]);
+    command.args(fixture.auth_args());
+    command.arg(url);
+    command.assert().failure().code(26).stdout("");
+
+    assert!(!remote.exists());
+}
+
+#[test]
+fn scp_upload_missing_remote_directory_returns_25() {
+    let Some(fixture) = SshdFixture::new() else {
+        return;
+    };
+    let temp = tempdir().unwrap();
+    let upload = temp.path().join("payload.txt");
+    std::fs::write(&upload, b"not written\n").unwrap();
+    let remote = fixture.root.join("missing-dir").join("payload.txt");
+    let url = fixture.url_for("scp", &remote);
+
+    let mut command = Command::cargo_bin("curl").unwrap();
+    command.args(["-q", "-sS", "-T", upload.to_str().unwrap()]);
+    command.args(fixture.auth_args());
+    command.arg(url);
+    command.assert().failure().code(25).stdout("");
+
+    assert!(!remote.exists());
+}
+
+#[test]
+fn scp_upload_dump_header_and_include_emit_no_bytes() {
+    let Some(fixture) = SshdFixture::new() else {
+        return;
+    };
+    let temp = tempdir().unwrap();
+    let upload = temp.path().join("payload.txt");
+    let dump = temp.path().join("headers.txt");
+    std::fs::write(&upload, b"scp headerless upload\n").unwrap();
+    let remote = fixture.root.join("scp-headerless-upload.txt");
+    let url = fixture.url_for("scp", &remote);
+
+    let mut command = Command::cargo_bin("curl").unwrap();
+    command.args([
+        "-q",
+        "-sS",
+        "-i",
+        "-D",
+        dump.to_str().unwrap(),
+        "-w",
+        "%{size_download} %{http_code} %{header_json}",
+        "-T",
+        upload.to_str().unwrap(),
+    ]);
+    command.args(fixture.auth_args());
+    command.arg(url);
+    command.assert().success().stdout("0 000 {}");
+
+    assert_eq!(std::fs::read(dump).unwrap(), b"");
+    assert_eq!(std::fs::read(remote).unwrap(), b"scp headerless upload\n");
+}
+
+#[test]
 fn sftp_missing_file_returns_78() {
     let Some(fixture) = SshdFixture::new() else {
         return;

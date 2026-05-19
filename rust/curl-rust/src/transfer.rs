@@ -1886,15 +1886,13 @@ fn validate_ssh_transfer(
         )));
     }
     if transfer.upload_file.is_some() {
-        if protocol == SshProtocol::Scp {
-            return Err(CurlError::Unsupported(
-                "SCP uploads in the Rust sidecar".to_string(),
-            ));
-        }
         if method != "GET" {
             return Err(CurlError::Unsupported(format!(
                 "{method} requests for {scheme} uploads"
             )));
+        }
+        if protocol == SshProtocol::Scp && transfer.upload_file.as_deref() == Some("-") {
+            return Err(CurlError::FtpUploadFailed);
         }
         if transfer.head {
             return Err(CurlError::Unsupported(format!(
@@ -1965,9 +1963,8 @@ fn run_ssh_blocking(
             ssh_sftp_upload(transfer, &session, &path, &upload_body)?;
             return Ok(SshTransferResult::Upload { postquote });
         }
-        return Err(CurlError::Unsupported(
-            "SCP uploads in the Rust sidecar".to_string(),
-        ));
+        ssh_scp_upload(&session, &path, &upload_body)?;
+        return Ok(SshTransferResult::Upload { postquote: None });
     }
 
     match protocol {
@@ -2010,6 +2007,18 @@ fn ssh_scp_download(session: &Session, path: &str, method: &str) -> Result<SshDo
         quote_headers: Vec::new(),
         resume_from: 0,
     })
+}
+
+fn ssh_scp_upload(session: &Session, path: &str, body: &[u8]) -> Result<()> {
+    let mut channel = session
+        .scp_send(Path::new(path), 0o644, body.len() as u64, None)
+        .map_err(|_| CurlError::FtpUploadFailed)?;
+    channel.write_all(body).map_err(|_| CurlError::SendError)?;
+    channel.send_eof().map_err(ssh_error_to_curl)?;
+    channel.wait_eof().map_err(ssh_error_to_curl)?;
+    channel.close().map_err(ssh_error_to_curl)?;
+    channel.wait_close().map_err(ssh_error_to_curl)?;
+    Ok(())
 }
 
 fn ssh_sftp_download(
