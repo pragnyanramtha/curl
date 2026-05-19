@@ -614,6 +614,18 @@ fn spawn_ftp_server_with_listener(
                 data_stream.read_to_end(&mut upload).unwrap();
                 data_connections += 1;
                 stream.write_all(options.stor_final).unwrap();
+            } else if command.starts_with("NOOP") {
+                stream.write_all(b"200 NOOP ok\r\n").unwrap();
+            } else if command.starts_with("DELE ") {
+                stream.write_all(b"250 File deleted\r\n").unwrap();
+            } else if command.starts_with("RNFR ") {
+                stream.write_all(b"350 Ready for RNTO\r\n").unwrap();
+            } else if command.starts_with("RNTO ") {
+                stream.write_all(b"250 File renamed\r\n").unwrap();
+            } else if command.starts_with("FAIL") {
+                stream
+                    .write_all(b"500 Requested quote failure\r\n")
+                    .unwrap();
             } else if command == "QUIT" {
                 let _ = stream.write_all(b"221 Bye\r\n");
                 break;
@@ -3632,6 +3644,226 @@ fn ftp_upload_create_dirs_makes_missing_directory_before_stor() {
         b"USER anonymous\r\nPASS ftp@example.com\r\nPWD\r\nCWD incoming\r\nMKD incoming\r\nCWD incoming\r\nCWD nested\r\nEPSV\r\nTYPE I\r\nSTOR file.txt\r\nQUIT\r\n"
     );
     assert_eq!(record.upload, b"upload into created path");
+}
+
+#[test]
+fn ftp_quote_prequote_postquote_order_and_ignored_failures() {
+    let mut options = ftp_options(b"quoted body");
+    options.epsv_fails = true;
+    let (url, rx) = spawn_ftp_server("/file.txt", options);
+
+    let mut command = Command::cargo_bin("curl").unwrap();
+    command.args([
+        "-q",
+        "-sS",
+        "-Q",
+        "NOOP 1",
+        "-Q",
+        "+NOOP 2",
+        "-Q",
+        "-NOOP 3",
+        "-Q",
+        "*FAIL",
+        "-Q",
+        "+*FAIL HARD",
+        &url,
+    ]);
+    command.assert().success().stdout("quoted body");
+
+    let record = rx.recv().unwrap();
+    assert_eq!(
+        record.commands,
+        b"USER anonymous\r\nPASS ftp@example.com\r\nPWD\r\nNOOP 1\r\nFAIL\r\nEPSV\r\nPASV\r\nTYPE I\r\nNOOP 2\r\nFAIL HARD\r\nSIZE file.txt\r\nRETR file.txt\r\nNOOP 3\r\nQUIT\r\n"
+    );
+}
+
+#[test]
+fn ftp_quote_order_for_directory_listing() {
+    let (url, rx) = spawn_ftp_server("/path/", ftp_options(b"listing\r\n"));
+
+    let mut command = Command::cargo_bin("curl").unwrap();
+    command.args([
+        "-q", "-sS", "--quote", "NOOP 1", "--quote", "+NOOP 2", "--quote", "-NOOP 3", &url,
+    ]);
+    command.assert().success().stdout("listing\r\n");
+
+    let record = rx.recv().unwrap();
+    assert_eq!(
+        record.commands,
+        b"USER anonymous\r\nPASS ftp@example.com\r\nPWD\r\nNOOP 1\r\nCWD path\r\nEPSV\r\nTYPE A\r\nNOOP 2\r\nLIST\r\nNOOP 3\r\nQUIT\r\n"
+    );
+}
+
+#[test]
+fn ftp_quote_failure_returns_quote_error_and_quits() {
+    let (url, rx) = spawn_ftp_server("/file.txt", ftp_options(b"not downloaded"));
+
+    let mut command = Command::cargo_bin("curl").unwrap();
+    command.args(["-q", "-sS", "-Q", "FAIL HARD", &url]);
+    command.assert().failure().code(21).stdout("");
+
+    assert_eq!(
+        rx.recv().unwrap().commands,
+        b"USER anonymous\r\nPASS ftp@example.com\r\nPWD\r\nFAIL HARD\r\nQUIT\r\n"
+    );
+}
+
+#[test]
+fn ftp_postquote_failure_returns_quote_error_after_writing_body() {
+    let (url, rx) = spawn_ftp_server("/file.txt", ftp_options(b"downloaded first"));
+
+    let mut command = Command::cargo_bin("curl").unwrap();
+    command.args(["-q", "-sS", "-Q", "-FAIL after", &url]);
+    command
+        .assert()
+        .failure()
+        .code(21)
+        .stdout("downloaded first");
+
+    assert_eq!(
+        rx.recv().unwrap().commands,
+        b"USER anonymous\r\nPASS ftp@example.com\r\nPWD\r\nEPSV\r\nTYPE I\r\nSIZE file.txt\r\nRETR file.txt\r\nFAIL after\r\nQUIT\r\n"
+    );
+}
+
+#[test]
+fn ftp_postquote_is_skipped_after_output_write_failure() {
+    let temp = tempdir().unwrap();
+    let output = temp.path().join("missing").join("download.txt");
+    let (url, rx) = spawn_ftp_server("/file.txt", ftp_options(b"downloaded first"));
+
+    let mut command = Command::cargo_bin("curl").unwrap();
+    command.args([
+        "-q",
+        "-sS",
+        "-o",
+        output.to_str().unwrap(),
+        "-Q",
+        "-DELE after",
+        &url,
+    ]);
+    command.assert().failure().code(23).stdout("");
+
+    assert_eq!(
+        rx.recv().unwrap().commands,
+        b"USER anonymous\r\nPASS ftp@example.com\r\nPWD\r\nEPSV\r\nTYPE I\r\nSIZE file.txt\r\nRETR file.txt\r\nQUIT\r\n"
+    );
+}
+
+#[test]
+fn ftp_postquote_is_skipped_after_buffered_max_filesize_failure() {
+    let mut options = ftp_options(b"abcdef");
+    options.size = None;
+    let (url, rx) = spawn_ftp_server("/file.txt", options);
+
+    let mut command = Command::cargo_bin("curl").unwrap();
+    command.args([
+        "-q",
+        "-sS",
+        "--max-filesize",
+        "3",
+        "-Q",
+        "-DELE after",
+        &url,
+    ]);
+    command.assert().failure().code(63).stdout("abc");
+
+    let record = rx.recv().unwrap();
+    assert_eq!(
+        record.commands,
+        b"USER anonymous\r\nPASS ftp@example.com\r\nPWD\r\nEPSV\r\nTYPE I\r\nSIZE file.txt\r\nRETR file.txt\r\nQUIT\r\n"
+    );
+    assert_eq!(record.data_connections, 1);
+}
+
+#[test]
+fn ftp_postquote_is_skipped_after_failed_transfer() {
+    let mut options = ftp_options(b"not downloaded");
+    options.retr_denied = true;
+    let (url, rx) = spawn_ftp_server("/file.txt", options);
+
+    let mut command = Command::cargo_bin("curl").unwrap();
+    command.args(["-q", "-sS", "-Q", "-DELE after", &url]);
+    command.assert().failure().code(78).stdout("");
+
+    assert_eq!(
+        rx.recv().unwrap().commands,
+        b"USER anonymous\r\nPASS ftp@example.com\r\nPWD\r\nEPSV\r\nTYPE I\r\nSIZE file.txt\r\nRETR file.txt\r\nQUIT\r\n"
+    );
+}
+
+#[test]
+fn ftp_upload_prequote_runs_before_stor() {
+    let temp = tempdir().unwrap();
+    let upload = temp.path().join("payload.txt");
+    std::fs::write(&upload, b"upload with quote").unwrap();
+    let (url, rx) = spawn_ftp_server("/target.txt", ftp_options(Vec::new()));
+
+    let mut command = Command::cargo_bin("curl").unwrap();
+    command.args([
+        "-q",
+        "-sS",
+        "-Q",
+        "+NOOP before-stor",
+        "-T",
+        upload.to_str().unwrap(),
+        &url,
+    ]);
+    command.assert().success().stdout("");
+
+    let record = rx.recv().unwrap();
+    assert_eq!(
+        record.commands,
+        b"USER anonymous\r\nPASS ftp@example.com\r\nPWD\r\nEPSV\r\nTYPE I\r\nNOOP before-stor\r\nSTOR target.txt\r\nQUIT\r\n"
+    );
+    assert_eq!(record.upload, b"upload with quote");
+}
+
+#[test]
+fn ftp_upload_postquote_runs_after_successful_stor() {
+    let temp = tempdir().unwrap();
+    let upload = temp.path().join("payload.txt");
+    std::fs::write(&upload, b"upload before postquote").unwrap();
+    let (url, rx) = spawn_ftp_server("/target.txt", ftp_options(Vec::new()));
+
+    let mut command = Command::cargo_bin("curl").unwrap();
+    command.args([
+        "-q",
+        "-sS",
+        "-Q",
+        "-DELE uploaded",
+        "-T",
+        upload.to_str().unwrap(),
+        &url,
+    ]);
+    command.assert().success().stdout("");
+
+    let record = rx.recv().unwrap();
+    assert_eq!(
+        record.commands,
+        b"USER anonymous\r\nPASS ftp@example.com\r\nPWD\r\nEPSV\r\nTYPE I\r\nSTOR target.txt\r\nDELE uploaded\r\nQUIT\r\n"
+    );
+    assert_eq!(record.upload, b"upload before postquote");
+}
+
+#[test]
+fn ftp_head_prequote_runs_before_size() {
+    let (url, rx) = spawn_ftp_server("/file.txt", ftp_options(Vec::new()));
+
+    let mut command = Command::cargo_bin("curl").unwrap();
+    let output = command
+        .args(["-q", "-sS", "-I", "-Q", "+NOOP before-size", &url])
+        .output()
+        .unwrap();
+
+    assert!(output.status.success());
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    assert!(stdout.contains("content-length: 0\r\n"));
+
+    assert_eq!(
+        rx.recv().unwrap().commands,
+        b"USER anonymous\r\nPASS ftp@example.com\r\nPWD\r\nMDTM file.txt\r\nTYPE I\r\nNOOP before-size\r\nSIZE file.txt\r\nREST 0\r\nQUIT\r\n"
+    );
 }
 
 #[test]
@@ -7305,6 +7537,52 @@ fn libcurl_writes_ftp_create_dirs_option() {
     );
     let text = std::fs::read_to_string(source).unwrap();
     assert!(text.contains("CURLOPT_FTP_CREATE_MISSING_DIRS, CURLFTP_CREATE_DIR_RETRY"));
+}
+
+#[test]
+fn libcurl_writes_ftp_quote_options() {
+    let temp = tempdir().unwrap();
+    let source = temp.path().join("ftp-quote-client.c");
+    let mut options = ftp_options(b"quoted");
+    options.epsv_fails = true;
+    let (url, rx) = spawn_ftp_server("/file.txt", options);
+
+    let mut command = Command::cargo_bin("curl").unwrap();
+    command.args([
+        "-q",
+        "-sS",
+        "--libcurl",
+        source.to_str().unwrap(),
+        "-Q",
+        "NOOP 1",
+        "-Q",
+        "+NOOP 2",
+        "-Q",
+        "-NOOP 3",
+        "-Q",
+        "*FAIL",
+        "-Q",
+        "+*FAIL HARD",
+        &url,
+    ]);
+    command.assert().success().stdout("quoted");
+
+    assert_eq!(
+        rx.recv().unwrap().commands,
+        b"USER anonymous\r\nPASS ftp@example.com\r\nPWD\r\nNOOP 1\r\nFAIL\r\nEPSV\r\nPASV\r\nTYPE I\r\nNOOP 2\r\nFAIL HARD\r\nSIZE file.txt\r\nRETR file.txt\r\nNOOP 3\r\nQUIT\r\n"
+    );
+    let text = std::fs::read_to_string(source).unwrap();
+    assert!(text.contains("struct curl_slist *slist1;"));
+    assert!(text.contains("struct curl_slist *slist2;"));
+    assert!(text.contains("struct curl_slist *slist3;"));
+    assert!(text.contains("curl_slist_append(slist1, \"NOOP 1\");"));
+    assert!(text.contains("curl_slist_append(slist1, \"*FAIL\");"));
+    assert!(text.contains("curl_slist_append(slist2, \"NOOP 3\");"));
+    assert!(text.contains("curl_slist_append(slist3, \"NOOP 2\");"));
+    assert!(text.contains("curl_slist_append(slist3, \"*FAIL HARD\");"));
+    assert!(text.contains("CURLOPT_QUOTE, slist1"));
+    assert!(text.contains("CURLOPT_POSTQUOTE, slist2"));
+    assert!(text.contains("CURLOPT_PREQUOTE, slist3"));
 }
 
 #[test]

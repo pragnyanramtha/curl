@@ -63,6 +63,9 @@ struct RenderTransfer<'a> {
     headers: Vec<String>,
     slist: Option<String>,
     mail_rcpt_slist: Option<String>,
+    quote_slist: Option<String>,
+    postquote_slist: Option<String>,
+    prequote_slist: Option<String>,
 }
 
 fn prepare_transfers(config: &Config) -> Result<Vec<RenderTransfer<'_>>> {
@@ -88,6 +91,27 @@ fn prepare_transfers(config: &Config) -> Result<Vec<RenderTransfer<'_>>> {
             slist_index += 1;
             Some(name)
         };
+        let quote_slist = if transfer.ftp_quote.is_empty() {
+            None
+        } else {
+            let name = format!("slist{slist_index}");
+            slist_index += 1;
+            Some(name)
+        };
+        let postquote_slist = if transfer.ftp_postquote.is_empty() {
+            None
+        } else {
+            let name = format!("slist{slist_index}");
+            slist_index += 1;
+            Some(name)
+        };
+        let prequote_slist = if transfer.ftp_prequote.is_empty() {
+            None
+        } else {
+            let name = format!("slist{slist_index}");
+            slist_index += 1;
+            Some(name)
+        };
 
         transfers.push(RenderTransfer {
             transfer,
@@ -96,6 +120,9 @@ fn prepare_transfers(config: &Config) -> Result<Vec<RenderTransfer<'_>>> {
             headers,
             slist,
             mail_rcpt_slist,
+            quote_slist,
+            postquote_slist,
+            prequote_slist,
         });
     }
 
@@ -124,34 +151,42 @@ fn write_declarations(out: &mut String, transfers: &[RenderTransfer<'_>]) {
         if let Some(slist) = &transfer.mail_rcpt_slist {
             writeln!(out, "  struct curl_slist *{slist};").unwrap();
         }
+        if let Some(slist) = &transfer.quote_slist {
+            writeln!(out, "  struct curl_slist *{slist};").unwrap();
+        }
+        if let Some(slist) = &transfer.postquote_slist {
+            writeln!(out, "  struct curl_slist *{slist};").unwrap();
+        }
+        if let Some(slist) = &transfer.prequote_slist {
+            writeln!(out, "  struct curl_slist *{slist};").unwrap();
+        }
     }
     out.push('\n');
 }
 
 fn write_slist_initializers(out: &mut String, transfers: &[RenderTransfer<'_>]) {
     for transfer in transfers {
-        let Some(slist) = &transfer.slist else {
-            if let Some(slist) = &transfer.mail_rcpt_slist {
-                writeln!(out, "  {slist} = NULL;").unwrap();
-                for recipient in &transfer.transfer.mail_rcpt {
-                    emit_slist_append(out, slist, recipient);
-                }
-                out.push('\n');
-            }
-            continue;
-        };
-        writeln!(out, "  {slist} = NULL;").unwrap();
-        for header in &transfer.headers {
-            emit_slist_append(out, slist, header);
-        }
-        out.push('\n');
-        if let Some(slist) = &transfer.mail_rcpt_slist {
-            writeln!(out, "  {slist} = NULL;").unwrap();
-            for recipient in &transfer.transfer.mail_rcpt {
-                emit_slist_append(out, slist, recipient);
-            }
-            out.push('\n');
-        }
+        write_slist_initializer(out, transfer.slist.as_deref(), &transfer.headers);
+        write_slist_initializer(
+            out,
+            transfer.mail_rcpt_slist.as_deref(),
+            &transfer.transfer.mail_rcpt,
+        );
+        write_slist_initializer(
+            out,
+            transfer.quote_slist.as_deref(),
+            &transfer.transfer.ftp_quote,
+        );
+        write_slist_initializer(
+            out,
+            transfer.postquote_slist.as_deref(),
+            &transfer.transfer.ftp_postquote,
+        );
+        write_slist_initializer(
+            out,
+            transfer.prequote_slist.as_deref(),
+            &transfer.transfer.ftp_prequote,
+        );
     }
 }
 
@@ -192,6 +227,15 @@ fn write_request(out: &mut String, render: &RenderTransfer<'_>, url: &str) -> Re
             "CURLOPT_FTP_SKIP_PASV_IP",
             if skip_pasv_ip { 1 } else { 0 },
         );
+    }
+    if let Some(slist) = &render.quote_slist {
+        emit_raw_setopt(out, "CURLOPT_QUOTE", slist);
+    }
+    if let Some(slist) = &render.postquote_slist {
+        emit_raw_setopt(out, "CURLOPT_POSTQUOTE", slist);
+    }
+    if let Some(slist) = &render.prequote_slist {
+        emit_raw_setopt(out, "CURLOPT_PREQUOTE", slist);
     }
     if transfer.fail {
         emit_long_setopt(out, "CURLOPT_FAILONERROR", 1);
@@ -395,6 +439,18 @@ fn write_cleanup(out: &mut String, transfers: &[RenderTransfer<'_>]) {
             writeln!(out, "  curl_slist_free_all({slist});").unwrap();
             writeln!(out, "  {slist} = NULL;").unwrap();
         }
+        if let Some(slist) = &transfer.quote_slist {
+            writeln!(out, "  curl_slist_free_all({slist});").unwrap();
+            writeln!(out, "  {slist} = NULL;").unwrap();
+        }
+        if let Some(slist) = &transfer.postquote_slist {
+            writeln!(out, "  curl_slist_free_all({slist});").unwrap();
+            writeln!(out, "  {slist} = NULL;").unwrap();
+        }
+        if let Some(slist) = &transfer.prequote_slist {
+            writeln!(out, "  curl_slist_free_all({slist});").unwrap();
+            writeln!(out, "  {slist} = NULL;").unwrap();
+        }
     }
 }
 
@@ -509,6 +565,17 @@ fn emit_slist_append(out: &mut String, slist: &str, value: &str) {
         c_escape(value.as_bytes())
     )
     .unwrap();
+}
+
+fn write_slist_initializer(out: &mut String, slist: Option<&str>, values: &[String]) {
+    let Some(slist) = slist else {
+        return;
+    };
+    writeln!(out, "  {slist} = NULL;").unwrap();
+    for value in values {
+        emit_slist_append(out, slist, value);
+    }
+    out.push('\n');
 }
 
 fn emit_string_setopt(out: &mut String, option: &str, value: &str) {

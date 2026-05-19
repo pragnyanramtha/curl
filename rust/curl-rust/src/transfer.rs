@@ -924,13 +924,23 @@ async fn run_ftp_exchange(
 
     let _ = ftp_command(&mut stream, b"PWD", metrics, &mut control_headers).await?;
 
+    if let Err(error) = ftp_run_quote_commands(
+        &mut stream,
+        &transfer.ftp_quote,
+        metrics,
+        &mut control_headers,
+    )
+    .await
+    {
+        ftp_quit_preserving_response_code(&mut stream, metrics, &mut control_headers).await;
+        return Err(error);
+    }
+
     if let Err(error) =
         ftp_change_directories(transfer, &mut stream, &path, metrics, &mut control_headers).await
     {
         if matches!(error, CurlError::RemoteAccessDenied) {
-            let response_code_before_quit = metrics.response_code;
-            let _ = ftp_command(&mut stream, b"QUIT", metrics, &mut control_headers).await;
-            metrics.response_code = response_code_before_quit;
+            ftp_quit_preserving_response_code(&mut stream, metrics, &mut control_headers).await;
         }
         return Err(error);
     }
@@ -953,6 +963,7 @@ async fn run_ftp_exchange(
         .map(|_| ())
     } else if method == "HEAD" || transfer.head {
         ftp_head_file(
+            transfer,
             &mut stream,
             &path,
             metrics,
@@ -984,57 +995,78 @@ async fn run_ftp_exchange(
         return transfer_result;
     }
 
-    let response_code_before_quit = metrics.response_code;
-    let _ = ftp_command(&mut stream, b"QUIT", metrics, &mut control_headers).await;
-    metrics.response_code = response_code_before_quit;
-
-    if let Some(path) = &transfer.dump_header {
-        output::dump_headers(path, &control_headers, transfer.create_dirs)?;
+    if let Some(path) = &transfer.dump_header
+        && let Err(error) = output::dump_headers(path, &control_headers, transfer.create_dirs)
+    {
+        ftp_quit_preserving_response_code(&mut stream, metrics, &mut control_headers).await;
+        return Err(error);
     }
 
-    transfer_result?;
+    if let Err(error) = transfer_result {
+        ftp_quit_preserving_response_code(&mut stream, metrics, &mut control_headers).await;
+        return Err(error);
+    }
 
     metrics.url_effective = url.to_string();
-    if uploaded {
-        metrics.size_download = 0;
-        metrics.headers = reqwest::header::HeaderMap::new();
-        return Ok(());
-    }
-    if method == "HEAD" || transfer.head {
-        metrics.headers = synthetic_headers.clone();
-        let header_bytes = if synthetic_headers.is_empty() {
-            Vec::new()
-        } else {
-            output::render_file_headers(&synthetic_headers)
-        };
+
+    let local_result = (|| -> Result<()> {
+        if uploaded {
+            metrics.size_download = 0;
+            metrics.headers = reqwest::header::HeaderMap::new();
+            return Ok(());
+        }
+        if method == "HEAD" || transfer.head {
+            metrics.headers = synthetic_headers.clone();
+            let header_bytes = if synthetic_headers.is_empty() {
+                Vec::new()
+            } else {
+                output::render_file_headers(&synthetic_headers)
+            };
+            let filename = output::write_response(
+                transfer,
+                &url,
+                &synthetic_headers,
+                &expanded.variables,
+                &header_bytes,
+                false,
+            )?;
+            metrics.filename_effective = filename.map(|path| path.display().to_string());
+            metrics.size_download = 0;
+            return Ok(());
+        }
+
+        let (body_bytes, max_filesize_exceeded) = limit_body_for_max_filesize(transfer, &body);
+        metrics.size_download = body_bytes.len() as u64;
         let filename = output::write_response(
             transfer,
             &url,
-            &synthetic_headers,
+            &reqwest::header::HeaderMap::new(),
             &expanded.variables,
-            &header_bytes,
-            false,
+            body_bytes,
+            resume_from > 0,
         )?;
         metrics.filename_effective = filename.map(|path| path.display().to_string());
-        metrics.size_download = 0;
-        return Ok(());
+        if max_filesize_exceeded {
+            Err(CurlError::FileSizeExceeded)
+        } else {
+            Ok(())
+        }
+    })();
+
+    if let Err(error) = local_result {
+        ftp_quit_preserving_response_code(&mut stream, metrics, &mut control_headers).await;
+        return Err(error);
     }
 
-    let (body_bytes, max_filesize_exceeded) = limit_body_for_max_filesize(transfer, &body);
-    metrics.size_download = body_bytes.len() as u64;
-    let filename = output::write_response(
-        transfer,
-        &url,
-        &reqwest::header::HeaderMap::new(),
-        &expanded.variables,
-        body_bytes,
-        resume_from > 0,
-    )?;
-    metrics.filename_effective = filename.map(|path| path.display().to_string());
-    if max_filesize_exceeded {
-        return Err(CurlError::FileSizeExceeded);
-    }
-    Ok(())
+    let postquote_result = ftp_run_quote_commands(
+        &mut stream,
+        &transfer.ftp_postquote,
+        metrics,
+        &mut control_headers,
+    )
+    .await;
+    ftp_quit_preserving_response_code(&mut stream, metrics, &mut control_headers).await;
+    postquote_result
 }
 
 struct FtpPath {
@@ -1071,6 +1103,34 @@ async fn ftp_change_directories(
     Ok(())
 }
 
+async fn ftp_run_quote_commands(
+    stream: &mut TcpStream,
+    commands: &[String],
+    metrics: &mut writeout::Metrics,
+    control_headers: &mut Vec<u8>,
+) -> Result<()> {
+    for raw in commands {
+        let (ignore_failure, command) = raw
+            .strip_prefix('*')
+            .map_or((false, raw.as_str()), |command| (true, command));
+        let response = ftp_command(stream, command.as_bytes(), metrics, control_headers).await?;
+        if response.code >= 400 && !ignore_failure {
+            return Err(CurlError::QuoteError);
+        }
+    }
+    Ok(())
+}
+
+async fn ftp_quit_preserving_response_code(
+    stream: &mut TcpStream,
+    metrics: &mut writeout::Metrics,
+    control_headers: &mut Vec<u8>,
+) {
+    let response_code_before_quit = metrics.response_code;
+    let _ = ftp_command(stream, b"QUIT", metrics, control_headers).await;
+    metrics.response_code = response_code_before_quit;
+}
+
 async fn ftp_cwd(
     stream: &mut TcpStream,
     directory: &[u8],
@@ -1094,6 +1154,7 @@ async fn ftp_mkd(
 }
 
 async fn ftp_head_file(
+    transfer: &TransferConfig,
     stream: &mut TcpStream,
     path: &FtpPath,
     metrics: &mut writeout::Metrics,
@@ -1101,6 +1162,7 @@ async fn ftp_head_file(
     synthetic_headers: &mut reqwest::header::HeaderMap,
 ) -> Result<()> {
     let Some(file) = &path.file else {
+        ftp_run_quote_commands(stream, &transfer.ftp_prequote, metrics, control_headers).await?;
         return Ok(());
     };
 
@@ -1115,6 +1177,7 @@ async fn ftp_head_file(
     }
 
     ftp_set_type(stream, b'I', metrics, control_headers).await?;
+    ftp_run_quote_commands(stream, &transfer.ftp_prequote, metrics, control_headers).await?;
 
     let mut size_command = Vec::from(&b"SIZE "[..]);
     size_command.extend_from_slice(file);
@@ -1151,6 +1214,7 @@ async fn ftp_download_body(
         control_headers,
     )
     .await?;
+    ftp_run_quote_commands(stream, &transfer.ftp_prequote, metrics, control_headers).await?;
 
     if let Some(file) = path.file.as_ref().filter(|_| !transfer.list_only) {
         let mut size_command = Vec::from(&b"SIZE "[..]);
@@ -1220,6 +1284,7 @@ async fn ftp_upload_body(
     let mut data_stream =
         ftp_open_passive_data(transfer, stream, host, metrics, control_headers).await?;
     ftp_set_type(stream, b'I', metrics, control_headers).await?;
+    ftp_run_quote_commands(stream, &transfer.ftp_prequote, metrics, control_headers).await?;
 
     let mut offset = 0_usize;
     let mut append = transfer.ftp_append;
@@ -1798,6 +1863,11 @@ fn validate_ssh_transfer(
             "--oauth2-bearer for {scheme} URLs"
         )));
     }
+    if transfer_has_ftp_quote_commands(transfer) {
+        return Err(CurlError::Unsupported(format!(
+            "quote commands for {scheme} URLs in the Rust sidecar"
+        )));
+    }
     if transfer.range.is_some() || transfer.continue_at.is_some() {
         return Err(CurlError::Unsupported(format!(
             "range/resume for {scheme} URLs"
@@ -1809,6 +1879,12 @@ fn validate_ssh_transfer(
         )));
     }
     Ok(())
+}
+
+fn transfer_has_ftp_quote_commands(transfer: &TransferConfig) -> bool {
+    !transfer.ftp_quote.is_empty()
+        || !transfer.ftp_prequote.is_empty()
+        || !transfer.ftp_postquote.is_empty()
 }
 
 fn run_ssh_blocking(

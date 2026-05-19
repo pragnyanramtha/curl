@@ -41,6 +41,9 @@ pub struct TransferConfig {
     pub ftp_create_dirs: bool,
     pub ftp_disable_epsv: bool,
     pub ftp_skip_pasv_ip: Option<bool>,
+    pub ftp_quote: Vec<String>,
+    pub ftp_prequote: Vec<String>,
+    pub ftp_postquote: Vec<String>,
     pub include_headers: bool,
     pub headers: Vec<String>,
     pub data: Vec<DataSpec>,
@@ -173,6 +176,9 @@ impl Default for TransferConfig {
             ftp_create_dirs: false,
             ftp_disable_epsv: false,
             ftp_skip_pasv_ip: None,
+            ftp_quote: Vec::new(),
+            ftp_prequote: Vec::new(),
+            ftp_postquote: Vec::new(),
             include_headers: false,
             headers: Vec::new(),
             data: Vec::new(),
@@ -410,6 +416,10 @@ impl Parser {
             "epsv" => self.current().ftp_disable_epsv = false,
             "ftp-pasv" => {}
             "ftp-skip-pasv-ip" => self.current().ftp_skip_pasv_ip = Some(true),
+            "quote" => {
+                let value = self.value_for(name, inline_value)?;
+                self.add_ftp_quote(value);
+            }
             "include" => self.current().include_headers = true,
             "header" => {
                 let value = self.value_for(name, inline_value)?;
@@ -765,6 +775,11 @@ impl Parser {
                 'G' => self.current().get = true,
                 'l' => self.current().list_only = true,
                 'a' => self.current().ftp_append = true,
+                'Q' => {
+                    let value = self.short_value('Q', rest)?;
+                    self.add_ftp_quote(value);
+                    break;
+                }
                 'i' => self.current().include_headers = true,
                 'H' => {
                     let value = self.short_value('H', rest)?;
@@ -949,6 +964,16 @@ impl Parser {
             append_cookie_header(&mut self.current().cookie, value);
         } else {
             self.current().cookie_files.push(value);
+        }
+    }
+
+    fn add_ftp_quote(&mut self, value: String) {
+        if let Some(command) = value.strip_prefix('-') {
+            self.current().ftp_postquote.push(command.to_string());
+        } else if let Some(command) = value.strip_prefix('+') {
+            self.current().ftp_prequote.push(command.to_string());
+        } else {
+            self.current().ftp_quote.push(value);
         }
     }
 
@@ -1184,6 +1209,9 @@ impl TransferConfig {
             || self.ftp_create_dirs
             || self.ftp_disable_epsv
             || self.ftp_skip_pasv_ip.is_some()
+            || !self.ftp_quote.is_empty()
+            || !self.ftp_prequote.is_empty()
+            || !self.ftp_postquote.is_empty()
             || self.include_headers
             || !self.headers.is_empty()
             || !self.data.is_empty()
@@ -1266,6 +1294,7 @@ fn option_takes_value(name: &str) -> bool {
             | "parallel-max-host"
             | "request"
             | "request-target"
+            | "quote"
             | "header"
             | "referer"
             | "range"
@@ -2163,6 +2192,26 @@ mod tests {
         ])
         .unwrap();
         assert!(!config.transfers[0].ftp_create_dirs);
+    }
+
+    #[test]
+    fn parses_ftp_quote_options_by_phase() {
+        let config = parse_args([
+            "-q",
+            "-Q",
+            "NOOP 1",
+            "--quote",
+            "+NOOP 2",
+            "-Q-*DELE after",
+            "--quote=*FAIL",
+            "ftp://example.com/file",
+        ])
+        .unwrap();
+
+        let transfer = &config.transfers[0];
+        assert_eq!(transfer.ftp_quote, ["NOOP 1", "*FAIL"]);
+        assert_eq!(transfer.ftp_prequote, ["NOOP 2"]);
+        assert_eq!(transfer.ftp_postquote, ["*DELE after"]);
     }
 
     #[test]
