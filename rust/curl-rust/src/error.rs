@@ -10,6 +10,12 @@ pub enum CurlError {
         "You can only select one HTTP request method! You asked for both PUT (-T, --upload-file) and POST (-d, --data)."
     )]
     HttpMethodConflict,
+    #[error("bad option syntax: {0}")]
+    OptionSyntax(String),
+    #[error("Could not parse CURLOPT_RESOLVE entry '{0}'")]
+    ResolveParse(String),
+    #[error("No valid port number in '{0}'")]
+    ConnectToPortSyntax(String),
     #[error("unsupported option or feature: {0}")]
     Unsupported(String),
     #[error("Protocol \"{0}\" not supported")]
@@ -52,6 +58,8 @@ pub enum CurlError {
     FileSizeExceeded,
     #[error("Login denied")]
     LoginDenied,
+    #[error("URL rejected: Credentials was passed in the URL when prohibited")]
+    UrlCredentialsProhibited,
     #[error("SSL peer certificate or SSH remote key was not OK")]
     PeerVerificationFailed,
     #[error("LDAP cannot bind")]
@@ -88,6 +96,7 @@ impl CurlError {
             Self::UnsupportedProtocol(_) => 1,
             Self::Usage(_) | Self::HttpMethodConflict | Self::Unsupported(_) => 2,
             Self::Url(_) => 3,
+            Self::OptionSyntax(_) | Self::ResolveParse(_) | Self::ConnectToPortSyntax(_) => 49,
             Self::Transfer(_) => 7,
             Self::WeirdServerReply => 8,
             Self::GotNothing => 52,
@@ -100,7 +109,7 @@ impl CurlError {
             Self::TooManyRedirects { .. } => 47,
             Self::HttpStatus { .. } => 22,
             Self::FileSizeExceeded => 63,
-            Self::LoginDenied => 67,
+            Self::LoginDenied | Self::UrlCredentialsProhibited => 67,
             Self::PeerVerificationFailed => 60,
             Self::LdapCannotBind => 38,
             Self::LdapSearchFailed => 39,

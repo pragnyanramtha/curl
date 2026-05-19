@@ -69,6 +69,9 @@ pub struct TransferConfig {
     pub fail_with_body: bool,
     pub user: Option<String>,
     pub oauth2_bearer: Option<String>,
+    pub resolve: Vec<String>,
+    pub connect_to: Vec<String>,
+    pub disallow_username_in_url: bool,
     pub proxy: Option<String>,
     pub proxy_user: Option<String>,
     pub noproxy: Option<String>,
@@ -172,6 +175,9 @@ impl Default for TransferConfig {
             fail_with_body: false,
             user: None,
             oauth2_bearer: None,
+            resolve: Vec::new(),
+            connect_to: Vec::new(),
+            disallow_username_in_url: false,
             proxy: None,
             proxy_user: None,
             noproxy: None,
@@ -515,6 +521,15 @@ impl Parser {
                 let value = self.value_for(name, inline_value)?;
                 self.current().oauth2_bearer = Some(value);
             }
+            "resolve" => {
+                let value = self.value_for(name, inline_value)?;
+                self.current().resolve.push(value);
+            }
+            "connect-to" => {
+                let value = self.value_for(name, inline_value)?;
+                self.current().connect_to.push(value);
+            }
+            "disallow-username-in-url" => self.current().disallow_username_in_url = true,
             "proxy" => {
                 let value = self.value_for(name, inline_value)?;
                 self.current().proxy = Some(value);
@@ -607,6 +622,7 @@ impl Parser {
                 self.current().fail = false;
                 self.current().fail_with_body = false;
             }
+            "disallow-username-in-url" => self.current().disallow_username_in_url = false,
             "insecure" => self.current().insecure = false,
             "junk-session-cookies" => self.current().junk_session_cookies = false,
             "mail-rcpt-allowfails" => self.current().mail_rcpt_allowfails = false,
@@ -935,6 +951,9 @@ impl TransferConfig {
             || self.fail_with_body
             || self.user.is_some()
             || self.oauth2_bearer.is_some()
+            || !self.resolve.is_empty()
+            || !self.connect_to.is_empty()
+            || self.disallow_username_in_url
             || self.proxy.is_some()
             || self.proxy_user.is_some()
             || self.noproxy.is_some()
@@ -1250,6 +1269,9 @@ fn print_common_help() {
                --libcurl <file>        Generate libcurl code\n\
            -X, --request <method>      Specify request method\n\
            -u, --user <user:pass>      Server user and password\n\
+               --disallow-username-in-url Reject URL user names\n\
+               --resolve <host:port:addr> Resolve host to address\n\
+               --connect-to <rule>     Connect to alternate host\n\
            -b, --cookie <data>         Send cookies from string\n\
            -c, --cookie-jar <file>     Save cookies to file\n\
            -j, --junk-session-cookies  Ignore session cookies from file\n\
@@ -1838,6 +1860,34 @@ mod tests {
         assert_eq!(transfer.proxy.as_deref(), Some("http://proxy.example:8080"));
         assert_eq!(transfer.proxy_user.as_deref(), Some("proxy-user:secret"));
         assert_eq!(transfer.noproxy.as_deref(), Some("example.com"));
+    }
+
+    #[test]
+    fn parses_resolve_connect_to_and_disallow_username_options() {
+        let config = parse_args([
+            "-q",
+            "--resolve",
+            "example.com:80:127.0.0.1",
+            "--connect-to",
+            "::backend.example:8080",
+            "--disallow-username-in-url",
+            "https://example.com",
+        ])
+        .unwrap();
+
+        let transfer = &config.transfers[0];
+        assert_eq!(transfer.resolve, ["example.com:80:127.0.0.1"]);
+        assert_eq!(transfer.connect_to, ["::backend.example:8080"]);
+        assert!(transfer.disallow_username_in_url);
+
+        let config = parse_args([
+            "-q",
+            "--disallow-username-in-url",
+            "--no-disallow-username-in-url",
+            "https://example.com",
+        ])
+        .unwrap();
+        assert!(!config.transfers[0].disallow_username_in_url);
     }
 
     #[test]

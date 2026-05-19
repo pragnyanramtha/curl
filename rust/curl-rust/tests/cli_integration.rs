@@ -1808,6 +1808,78 @@ fn downloads_http_and_renders_writeout() {
 }
 
 #[test]
+fn resolve_maps_host_to_address() {
+    let (url, rx) = spawn_server(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok");
+    let port = Url::parse(&url).unwrap().port().unwrap();
+    let target = format!("http://example.test:{port}/resource");
+    let resolve = format!("example.test:{port}:127.0.0.1");
+
+    let mut command = Command::cargo_bin("curl").unwrap();
+    command.args(["-q", "-sS", "--resolve", &resolve, &target]);
+    command.assert().success().stdout("ok");
+
+    let request = rx.recv().unwrap();
+    assert!(request.start_line.starts_with("GET /resource HTTP/1.1"));
+    assert_eq!(
+        header(&request, "host"),
+        Some(format!("example.test:{port}").as_str())
+    );
+}
+
+#[test]
+fn resolve_invalid_syntax_exits_option_syntax_error() {
+    let mut command = Command::cargo_bin("curl").unwrap();
+    command.args([
+        "-q",
+        "-sS",
+        "--resolve",
+        "127.0.0.1:example.test:127.0.0.1",
+        "http://example.test/",
+    ]);
+    command
+        .assert()
+        .failure()
+        .code(49)
+        .stdout("")
+        .stderr("curl: Could not parse CURLOPT_RESOLVE entry '127.0.0.1:example.test:127.0.0.1'\n");
+}
+
+#[test]
+fn connect_to_invalid_syntax_exits_option_syntax_error() {
+    let mut command = Command::cargo_bin("curl").unwrap();
+    command.args([
+        "-q",
+        "-sS",
+        "--connect-to",
+        "::example.com:example.com",
+        "http://example.com/",
+    ]);
+    command
+        .assert()
+        .failure()
+        .code(49)
+        .stdout("")
+        .stderr("curl: No valid port number in 'example.com:example.com'\n");
+}
+
+#[test]
+fn disallow_username_in_url_rejects_url_userinfo() {
+    let mut command = Command::cargo_bin("curl").unwrap();
+    command.args([
+        "-q",
+        "-sS",
+        "--disallow-username-in-url",
+        "http://username:password@example.com/",
+    ]);
+    command
+        .assert()
+        .failure()
+        .code(67)
+        .stdout("")
+        .stderr("curl: (67) URL rejected: Credentials was passed in the URL when prohibited\n");
+}
+
+#[test]
 fn max_filesize_allows_http_body_within_limit() {
     let (url, rx) = spawn_server(b"HTTP/1.1 200 OK\r\nContent-Length: 5\r\n\r\nhello");
 

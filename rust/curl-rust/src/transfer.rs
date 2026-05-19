@@ -251,6 +251,21 @@ fn build_client(transfer: &TransferConfig, cookie_jar: Option<Arc<CookieJar>>) -
         builder = builder.connect_timeout(timeout);
     }
 
+    for entry in &transfer.resolve {
+        if let Some((host, addrs)) = parse_resolve_entry(entry)? {
+            builder = builder.resolve_to_addrs(&host, &addrs);
+        }
+    }
+
+    for rule in &transfer.connect_to {
+        validate_connect_to_rule(rule)?;
+    }
+    if !transfer.connect_to.is_empty() {
+        return Err(CurlError::Unsupported(
+            "--connect-to remapping is not implemented in the Rust sidecar".to_string(),
+        ));
+    }
+
     if let Some(proxy) = &transfer.proxy
         && !transfer.noproxy.as_deref().is_some_and(is_global_noproxy)
     {
@@ -277,6 +292,88 @@ fn build_client(transfer: &TransferConfig, cookie_jar: Option<Arc<CookieJar>>) -
 
 fn is_global_noproxy(value: &str) -> bool {
     value.split(',').any(|entry| entry.trim() == "*")
+}
+
+fn parse_resolve_entry(entry: &str) -> Result<Option<(String, Vec<SocketAddr>)>> {
+    let entry = entry.strip_prefix('+').unwrap_or(entry);
+    if let Some(removal) = entry.strip_prefix('-') {
+        let (host, port) = removal
+            .split_once(':')
+            .ok_or_else(|| resolve_syntax_error(entry))?;
+        if host.is_empty() || port.is_empty() {
+            return Err(resolve_syntax_error(entry));
+        }
+        parse_resolve_port(entry, port)?;
+        return Ok(None);
+    }
+
+    let mut fields = entry.splitn(3, ':');
+    let host = fields.next().unwrap_or_default();
+    let port = fields.next().unwrap_or_default();
+    let addresses = fields.next().unwrap_or_default();
+    if host.is_empty() || port.is_empty() || addresses.is_empty() {
+        return Err(resolve_syntax_error(entry));
+    }
+
+    let port = parse_resolve_port(entry, port)?;
+    let mut addrs = Vec::new();
+    for address in addresses.split(',') {
+        let ip = parse_ip_literal(address).ok_or_else(|| resolve_syntax_error(entry))?;
+        addrs.push(SocketAddr::new(ip, port));
+    }
+    Ok(Some((trim_ip_brackets(host).to_string(), addrs)))
+}
+
+fn validate_connect_to_rule(rule: &str) -> Result<()> {
+    let fields: Vec<_> = rule.split(':').collect();
+    if fields.len() != 4 {
+        return Err(connect_to_syntax_error(rule));
+    }
+    if !fields[1].is_empty() {
+        parse_connect_to_port(fields[0], fields[1])?;
+    }
+    if !fields[3].is_empty() {
+        parse_connect_to_port(fields[2], fields[3])?;
+    }
+    Ok(())
+}
+
+fn parse_resolve_port(entry: &str, port: &str) -> Result<u16> {
+    port.parse::<u16>().map_err(|_| resolve_syntax_error(entry))
+}
+
+fn parse_connect_to_port(host: &str, port: &str) -> Result<u16> {
+    port.parse::<u16>()
+        .map_err(|_| CurlError::ConnectToPortSyntax(format!("{host}:{port}")))
+}
+
+fn parse_ip_literal(value: &str) -> Option<IpAddr> {
+    trim_ip_brackets(value).parse().ok()
+}
+
+fn trim_ip_brackets(value: &str) -> &str {
+    value
+        .strip_prefix('[')
+        .and_then(|value| value.strip_suffix(']'))
+        .unwrap_or(value)
+}
+
+fn resolve_syntax_error(value: &str) -> CurlError {
+    CurlError::ResolveParse(value.to_string())
+}
+
+fn connect_to_syntax_error(value: &str) -> CurlError {
+    CurlError::OptionSyntax(format!("--connect-to {value:?}"))
+}
+
+fn reject_url_userinfo(raw_url: &str) -> Result<()> {
+    let Ok(url) = Url::parse(raw_url) else {
+        return Ok(());
+    };
+    if !url.username().is_empty() || url.password().is_some() {
+        return Err(CurlError::UrlCredentialsProhibited);
+    }
+    Ok(())
 }
 
 async fn run_expanded_url(
@@ -311,7 +408,15 @@ async fn run_expanded_url(
         metrics.method = method_label.clone();
     }
 
-    let result = if has_url_scheme(&expanded.url, "file") {
+    let userinfo_check = if transfer.disallow_username_in_url {
+        reject_url_userinfo(&expanded.url)
+    } else {
+        Ok(())
+    };
+
+    let result = if let Err(error) = userinfo_check {
+        Err(error)
+    } else if has_url_scheme(&expanded.url, "file") {
         run_file_transfer(transfer, &expanded, &method_label, &mut metrics).await
     } else if has_url_scheme_with_authority(&expanded.url, "dict") {
         run_dict_transfer(transfer, &expanded, &method_label, &mut metrics).await
