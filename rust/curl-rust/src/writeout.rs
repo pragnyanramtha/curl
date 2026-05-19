@@ -19,6 +19,12 @@ pub struct Metrics {
     pub headers: HeaderMap,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OutputStream {
+    Stdout,
+    Stderr,
+}
+
 impl Metrics {
     pub fn empty(url: &str, method: &str) -> Self {
         Self {
@@ -40,6 +46,15 @@ impl Metrics {
 }
 
 pub fn render(format: &str, metrics: &Metrics) -> String {
+    render_segments(format, metrics)
+        .into_iter()
+        .map(|(_, chunk)| chunk)
+        .collect()
+}
+
+pub fn render_segments(format: &str, metrics: &Metrics) -> Vec<(OutputStream, String)> {
+    let mut segments = Vec::new();
+    let mut stream = OutputStream::Stdout;
     let mut output = String::new();
     let mut chars = format.chars().peekable();
 
@@ -71,7 +86,21 @@ pub fn render(format: &str, metrics: &Metrics) -> String {
                         }
                         name.push(next);
                     }
-                    output.push_str(&variable(&name, metrics));
+                    match name.as_str() {
+                        "stdout" => switch_stream(
+                            &mut segments,
+                            &mut output,
+                            &mut stream,
+                            OutputStream::Stdout,
+                        ),
+                        "stderr" => switch_stream(
+                            &mut segments,
+                            &mut output,
+                            &mut stream,
+                            OutputStream::Stderr,
+                        ),
+                        _ => output.push_str(&variable(&name, metrics)),
+                    }
                 } else {
                     output.push('%');
                 }
@@ -80,7 +109,22 @@ pub fn render(format: &str, metrics: &Metrics) -> String {
         }
     }
 
-    output
+    if !output.is_empty() {
+        segments.push((stream, output));
+    }
+    segments
+}
+
+fn switch_stream(
+    segments: &mut Vec<(OutputStream, String)>,
+    output: &mut String,
+    stream: &mut OutputStream,
+    next_stream: OutputStream,
+) {
+    if !output.is_empty() {
+        segments.push((*stream, std::mem::take(output)));
+    }
+    *stream = next_stream;
 }
 
 fn variable(name: &str, metrics: &Metrics) -> String {
@@ -102,7 +146,6 @@ fn variable(name: &str, metrics: &Metrics) -> String {
         "num_retries" => metrics.num_retries.to_string(),
         "json" => json(metrics),
         "header_json" => header_json(&metrics.headers),
-        "stdout" | "stderr" => String::new(),
         _ => String::new(),
     }
 }
@@ -179,6 +222,24 @@ mod tests {
         );
         assert!(
             render("%{json}", &metrics).contains("\"referer\":\"https://refer.example/source\"")
+        );
+    }
+
+    #[test]
+    fn render_segments_switches_output_streams() {
+        let metrics = Metrics::empty("https://example.com/", "GET");
+
+        assert_eq!(
+            render_segments("one%{stderr}two%{stdout}three", &metrics),
+            vec![
+                (OutputStream::Stdout, "one".to_string()),
+                (OutputStream::Stderr, "two".to_string()),
+                (OutputStream::Stdout, "three".to_string()),
+            ]
+        );
+        assert_eq!(
+            render("one%{stderr}two%{stdout}three", &metrics),
+            "onetwothree"
         );
     }
 }

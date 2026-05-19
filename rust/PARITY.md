@@ -66,7 +66,7 @@ companion data before this rewrite can be called complete.
 | `--ipfs-gateway` | partial | `TransferConfig::ipfs_gateway` | `parses_ipfs_gateway`, `rejects_empty_ipfs_gateway`, IPFS/IPNS rewrite tests | Explicit gateway parsing and IPFS/IPNS HTTP rewrite support only; generated libcurl rewrites URL through the same helper, but full corpus mapping and exact C URL parser edge cases remain incomplete |
 | `--output`, `--remote-name`, `--remote-header-name` | partial | output module | output and `-OJ` tests, `remote_header_name_with_remote_name_refuses_to_overwrite_header_filename`, `remote_header_name_with_remote_name_strips_header_filename_path`, curl corpus 1460 | Header-derived remote filenames refuse to overwrite existing files and strip path components; needs full Content-Disposition parity |
 | `--dump-header` | partial | `TransferConfig::dump_header` | `dump_header_dash_writes_headers_to_stdout`, `ftp_dump_header_writes_control_replies_and_include_adds_no_bytes` | HTTP/file header dumping plus FTP control-reply dumping are covered; redirect header history and exact FTP `-D -` interleaving remain incomplete |
-| `--write-out` | partial | `writeout.rs` | `renders_common_variables` | Many variables missing |
+| `--write-out` | partial | `writeout.rs` | `renders_common_variables`, `render_segments_switches_output_streams`, curl corpus 1278 | Common variables and `%{stdout}`/`%{stderr}` stream switching are covered; many variables remain missing |
 | `--referer` | partial | `TransferConfig::referer`, `TransferConfig::auto_referer` | `sends_referer_range_and_url_query`, `location_does_not_auto_referer_without_referer_auto`, `fixed_referer_is_reused_across_redirects_without_auto`, `auto_referer_strips_credentials_and_fragment_on_redirect`, `auto_referer_tracks_immediately_previous_redirect_url`, `auto_referer_respects_max_redirs_limit`, `initial_referer_auto_replaces_referer_after_redirect`, `custom_referer_header_suppresses_generated_referer` | Basic header, `;auto` redirect behavior, `%{referer}`, max-redirs exhaustion for the auto path, and libcurl `CURLOPT_AUTOREFERER` covered; method rewriting, auth/cookie redirect scoping, and full corpus mapping remain incomplete |
 | `--range` | partial | `TransferConfig::range` | `file_range_outputs_slice`, HTTP header test | Multipart ranges and resume interactions missing |
 | `--etag-save`, `--etag-compare` | partial | `TransferConfig::etag_save`, `TransferConfig::etag_compare` | `etag_compare_sends_if_none_match`, `etag_save_writes_response_etag` | Single URL semantics and full corpus mapping missing |
@@ -101,7 +101,7 @@ companion data before this rewrite can be called complete.
 | CMake sidecar build | partial | `BUILD_RUST_CURL_EXE=ON`, `curl-rust-test`, `curl-rust-corpus-test` |
 | Autotools sidecar build | partial | `--enable-rust-curl`, `make -C rust rust-test`, `make -C rust rust-corpus-test` |
 | Existing curl Perl suite with C binary | verified for C path | Does not prove Rust parity |
-| Existing curl Perl suite with Rust binary | partial | `curl-rust-corpus-test` maps 205 smoke cases across FILE, FTP, DICT, GOPHER, HTTP, IPFS/IPNS, IMAP, MQTT, POP3, SCP/SFTP, SMB, SMTP, TFTP, TELNET, CLI help/config/options, and URL/HTTP preflight/error cases; broader protocol corpus remains required before full parity |
+| Existing curl Perl suite with Rust binary | partial | `curl-rust-corpus-test` maps 206 smoke cases across FILE, FTP, DICT, GOPHER, HTTP, IPFS/IPNS, IMAP, MQTT, POP3, SCP/SFTP, SMB, SMTP, TFTP, TELNET, CLI help/config/options, and URL/HTTP preflight/error cases; broader protocol corpus remains required before full parity |
 | Pytest HTTP suite with Rust binary | missing | Required before full parity |
 
 Current `curl-rust-corpus-test` selection:
@@ -112,7 +112,7 @@ Current `curl-rust-corpus-test` selection:
 - IMAP: 800, 801, 802, 803, 806, 807, 808, 809, 810, 811, 812, 813, 814, 817, 818, 829, 841, 846, 847, 1847, 1848, 3206
 - DICT: 1450
 - GOPHER: 1200, 1201, 1202, 1203
-- CLI/help/config/options: 333, 452, 454, 460, 462, 467, 697, 759, 774, 787, 1022, 1023, 1027, 1269, 1409, 1410, 1462, 1474, 2080
+- CLI/help/config/options: 333, 452, 454, 460, 462, 467, 697, 759, 774, 787, 1022, 1023, 1027, 1269, 1278, 1409, 1410, 1462, 1474, 2080
 - URL/HTTP preflight/error paths: 21, 23, 219, 419, 426, 496, 1234, 1236, 1264, 1281, 1289, 1673, 2092
 - IPFS/IPNS: 723, 725, 726, 738, 739, 741
 - MQTT: 1190, 1191, 1192, 1193, 1194, 1196, 1198, 1199, 2200, 2201, 2202, 2203, 2204, 2206, 2207, 3017, 3018

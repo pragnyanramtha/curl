@@ -6849,7 +6849,12 @@ fn report_error(transfer: &TransferConfig, error: &CurlError) {
 
 fn write_writeout(transfer: &TransferConfig, metrics: &writeout::Metrics) -> Result<()> {
     if let Some(format) = &transfer.write_out {
-        print!("{}", writeout::render(format, metrics));
+        for (stream, chunk) in writeout::render_segments(format, metrics) {
+            match stream {
+                writeout::OutputStream::Stdout => print!("{chunk}"),
+                writeout::OutputStream::Stderr => eprint!("{chunk}"),
+            }
+        }
     }
     Ok(())
 }
