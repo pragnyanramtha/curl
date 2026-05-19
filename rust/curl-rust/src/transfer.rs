@@ -3444,7 +3444,7 @@ async fn run_smtp_exchange(
             .await
             .map(|()| Vec::new())
     } else {
-        let command = smtp_command(transfer)?;
+        let command = smtp_command(transfer, &capabilities)?;
         smtp_send_line(&mut stream, &command).await?;
         let response = smtp_read_response(&mut stream).await?;
         metrics.response_code = Some(response.code);
@@ -6766,7 +6766,7 @@ async fn smtp_send_mail(
     smtp_require_code(&response, &[250], CurlError::WeirdServerReply)
 }
 
-fn smtp_command(transfer: &TransferConfig) -> Result<Vec<u8>> {
+fn smtp_command(transfer: &TransferConfig, capabilities: &SmtpResponse) -> Result<Vec<u8>> {
     let mut command = if let Some(custom) = &transfer.method {
         smtp_argument_bytes("--request", custom)?
     } else if transfer.mail_rcpt.is_empty() {
@@ -6778,6 +6778,11 @@ fn smtp_command(transfer: &TransferConfig) -> Result<Vec<u8>> {
     if let Some(recipient) = transfer.mail_rcpt.first() {
         command.push(b' ');
         command.extend_from_slice(&smtp_argument_bytes("--mail-rcpt", recipient)?);
+        if transfer.method.as_deref() == Some("EXPN")
+            && smtp_response_has_keyword(capabilities, b"SMTPUTF8")
+        {
+            command.extend_from_slice(b" SMTPUTF8");
+        }
     }
     Ok(command)
 }

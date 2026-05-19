@@ -4641,6 +4641,29 @@ fn smtp_custom_expn_uses_mail_recipient() {
 }
 
 #[test]
+fn smtp_custom_expn_adds_smtputf8_when_advertised() {
+    let (url, rx) = spawn_smtp_server(
+        "/expn.example",
+        b"250-expn.example\r\n250 SMTPUTF8\r\n",
+        b"250 Friend <friend@example.com>\r\n",
+    );
+
+    let mut command = Command::cargo_bin("curl").unwrap();
+    command.args(["-q", "-sS", "--mail-rcpt", "Friends", "-X", "EXPN", &url]);
+    command
+        .assert()
+        .success()
+        .stdout("250 Friend <friend@example.com>\r\n");
+
+    let record = rx.recv().unwrap();
+    assert_eq!(
+        record.commands,
+        b"EHLO expn.example\r\nEXPN Friends SMTPUTF8\r\nQUIT\r\n"
+    );
+    assert!(record.upload.is_empty());
+}
+
+#[test]
 fn smtp_recipient_failure_returns_send_error() {
     let (url, rx) = spawn_smtp_server_with_rcpt_responses(
         "/send.example",
