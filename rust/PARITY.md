@@ -74,10 +74,10 @@ companion data before this rewrite can be called complete.
 | `--user` | partial | `TransferConfig::user` | `username_only_basic_auth_encodes_empty_password`, `ldap_simple_bind_uses_user_option` | Basic HTTP auth and LDAP simple bind credentials only |
 | `--oauth2-bearer` | partial | `TransferConfig::oauth2_bearer` | `sends_oauth2_bearer_authorization_header` | Redirect credential scoping needs parity work |
 | `--disallow-username-in-url` | partial | `TransferConfig::disallow_username_in_url` | `disallow_username_in_url_rejects_url_userinfo`, curl corpus 2075 | URLs containing credentials are rejected with exit 67 before network work; interactions with redirects, generated libcurl, and non-HTTP schemes need broader parity |
-| `--proto-default` | partial | `TransferConfig::proto_default`, `glob::apply_default_protocol` | `parses_proto_default_option`, `applies_default_protocol_to_schemeless_urls`, curl corpus 1146, 2044, 2045 | Adds a configured default scheme before URL glob expansion and validates known protocol names case-insensitively; proxy request-header parity keeps corpus 2008 unmapped |
+| `--proto-default` | partial | `TransferConfig::proto_default`, `glob::apply_default_protocol` | `parses_proto_default_option`, `applies_default_protocol_to_schemeless_urls`, curl corpus 1146, 2008, 2044, 2045 | Adds a configured default scheme before URL glob expansion and validates known protocol names case-insensitively; schemeless HTTP proxy absolute-form requests are covered for the mapped case |
 | `--resolve` | partial | `TransferConfig::resolve`, reqwest DNS overrides | `resolve_maps_host_to_address`, `resolve_invalid_syntax_exits_option_syntax_error`, curl corpus 3019 | Basic `host:port:address[,address]` parsing and HTTP DNS override support are covered, including invalid syntax exit 49; removal entries are accepted as no-ops, and wildcard/IPv6-host/timeout/generated libcurl parity remain incomplete |
 | `--connect-to` | partial | `TransferConfig::connect_to` | `connect_to_invalid_syntax_exits_option_syntax_error`, curl corpus 3020 | Invalid port syntax exits 49; actual destination remapping is still missing and valid rules fail explicitly as unsupported |
-| `--proxy` | partial | `TransferConfig::proxy` | `proxy_user_sets_proxy_authorization_header`, `noproxy_bypasses_configured_proxy` | Basic HTTP proxy path only |
+| `--proxy` | partial | `TransferConfig::proxy` | `proxy_user_sets_proxy_authorization_header`, `noproxy_bypasses_configured_proxy`, curl corpus 2008 | Basic HTTP proxy path only; simple explicit `http://` proxies use a raw request path to preserve curl-like wire headers, while broader proxy behavior still delegates to reqwest or remains missing |
 | `--proxy-user` | partial | `TransferConfig::proxy_user` | `proxy_user_sets_proxy_authorization_header` | Basic proxy auth only |
 | `--noproxy` | partial | `TransferConfig::noproxy` | `noproxy_bypasses_configured_proxy` | Delegates matching to reqwest |
 | `--compressed` | partial | `TransferConfig::compressed` | default encoding assertion | Compression negotiation subset |
@@ -105,14 +105,14 @@ companion data before this rewrite can be called complete.
 | CMake sidecar build | partial | `BUILD_RUST_CURL_EXE=ON`, `curl-rust-test`, `curl-rust-corpus-test` |
 | Autotools sidecar build | partial | `--enable-rust-curl`, `make -C rust rust-test`, `make -C rust rust-corpus-test` |
 | Existing curl Perl suite with C binary | verified for C path | Does not prove Rust parity |
-| Existing curl Perl suite with Rust binary | partial | `curl-rust-corpus-test` maps 214 smoke cases across FILE, FTP, DICT, GOPHER, HTTP, IPFS/IPNS, IMAP, MQTT, POP3, SCP/SFTP, SMB, SMTP, TFTP, TELNET, CLI help/config/options, and URL/HTTP preflight/error cases; broader protocol corpus remains required before full parity |
+| Existing curl Perl suite with Rust binary | partial | `curl-rust-corpus-test` maps 215 smoke cases across FILE, FTP, DICT, GOPHER, HTTP, IPFS/IPNS, IMAP, MQTT, POP3, SCP/SFTP, SMB, SMTP, TFTP, TELNET, CLI help/config/options, and URL/HTTP preflight/error cases; broader protocol corpus remains required before full parity |
 | Pytest HTTP suite with Rust binary | missing | Required before full parity |
 
 Current `curl-rust-corpus-test` selection:
 
 - FILE: 200, 201, 202, 203, 204, 205, 231, 1016, 1017, 1018, 1019, 1020, 1146, 1220, 2072
 - FTP: 100, 102, 104, 126, 136, 137, 138, 225, 226, 238, 261, 290, 291, 295, 1000, 1003, 1005, 1006, 1062, 1153, 1219, 1224, 2045
-- HTTP: 1460
+- HTTP: 1460, 2008
 - IMAP: 800, 801, 802, 803, 806, 807, 808, 809, 810, 811, 812, 813, 814, 817, 818, 829, 841, 846, 847, 1847, 1848, 3206
 - DICT: 1450
 - GOPHER: 1200, 1201, 1202, 1203

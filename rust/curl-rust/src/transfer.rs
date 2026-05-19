@@ -75,11 +75,29 @@ const MQTT_SUBACK: u8 = 0x90;
 const MQTT_PINGRESP: u8 = 0xd0;
 const MQTT_DISCONNECT: u8 = 0xe0;
 
+struct ExplicitHttpProxy {
+    host: String,
+    port: u16,
+    authorization: Option<String>,
+}
+
+struct RawHttpProxyContext<'a> {
+    transfer: &'a TransferConfig,
+    url: &'a Url,
+    method: &'a Method,
+    prepared_body: Option<&'a PreparedBody>,
+    upload_body: Option<&'a [u8]>,
+    resume_from: u64,
+    referer: Option<&'a str>,
+    proxy: &'a ExplicitHttpProxy,
+}
+
 struct HttpAttempt {
     status: StatusCode,
     version: Version,
     final_url: Url,
     headers: reqwest::header::HeaderMap,
+    header_bytes: Option<Vec<u8>>,
     body: Vec<u8>,
     retry_after: Option<Duration>,
     resume_from: u64,
@@ -1867,6 +1885,14 @@ fn base64_no_padding(bytes: &[u8]) -> String {
         if chunk.len() > 2 {
             output.push(ALPHABET[(b2 & 0x3f) as usize] as char);
         }
+    }
+    output
+}
+
+fn base64_padded(bytes: &[u8]) -> String {
+    let mut output = base64_no_padding(bytes);
+    while !output.len().is_multiple_of(4) {
+        output.push('=');
     }
     output
 }
@@ -6221,6 +6247,39 @@ async fn run_http_transfer(
     };
     let mut redirects = 0usize;
 
+    if let Some(proxy) = explicit_http_proxy(transfer)?
+        && raw_http_proxy_supported(transfer, &url, has_multipart)
+    {
+        let attempt = run_raw_http_proxy_transfer(RawHttpProxyContext {
+            transfer,
+            url: &url,
+            method: &method,
+            prepared_body: prepared_body.as_ref(),
+            upload_body: upload_body.as_deref(),
+            resume_from,
+            referer: custom_referer.as_deref().or(current_referer.as_deref()),
+            proxy: &proxy,
+        })
+        .await?;
+        metrics.url_effective = attempt.final_url.to_string();
+        metrics.response_code = Some(attempt.status.as_u16());
+        metrics.referer = custom_referer.clone().or_else(|| current_referer.clone());
+        metrics.content_type = attempt
+            .headers
+            .get(CONTENT_TYPE)
+            .and_then(|value| value.to_str().ok())
+            .map(ToString::to_string);
+        metrics.redirect_url = attempt
+            .headers
+            .get(LOCATION)
+            .and_then(|value| value.to_str().ok())
+            .map(ToString::to_string);
+        metrics.headers = attempt.headers.clone();
+        check_http_content_length_max_filesize(transfer, &attempt.headers, method == Method::HEAD)?;
+        metrics.size_download = attempt.body.len() as u64;
+        return Ok(attempt);
+    }
+
     loop {
         let multipart = data::prepare_multipart(&transfer.forms)?;
         let mut request = client.request(method.clone(), url.clone());
@@ -6318,11 +6377,320 @@ async fn run_http_transfer(
             version,
             final_url,
             headers,
+            header_bytes: None,
             body,
             retry_after,
             resume_from,
         });
     }
+}
+
+fn raw_http_proxy_supported(transfer: &TransferConfig, url: &Url, has_multipart: bool) -> bool {
+    url.scheme() == "http"
+        && !transfer.follow_location
+        && !transfer.auto_referer
+        && !has_multipart
+        && !cookie_engine_active(transfer)
+        && !matches!(
+            transfer.http_version,
+            HttpVersionPreference::Http2 | HttpVersionPreference::Http2PriorKnowledge
+        )
+}
+
+fn explicit_http_proxy(transfer: &TransferConfig) -> Result<Option<ExplicitHttpProxy>> {
+    if transfer.noproxy.as_deref().is_some_and(is_global_noproxy) {
+        return Ok(None);
+    }
+
+    let Some(raw_proxy) = &transfer.proxy else {
+        return Ok(None);
+    };
+    let proxy = Url::parse(raw_proxy).map_err(|error| CurlError::Url(error.to_string()))?;
+    if proxy.scheme() != "http" {
+        return Ok(None);
+    }
+    let host = proxy
+        .host_str()
+        .ok_or_else(|| CurlError::Url("proxy URL is missing a host".to_string()))?
+        .to_string();
+    let port = proxy.port_or_known_default().unwrap_or(80);
+    let credentials = transfer
+        .proxy_user
+        .clone()
+        .or_else(|| proxy_url_credentials(&proxy));
+    let authorization =
+        credentials.map(|credentials| format!("Basic {}", base64_padded(credentials.as_bytes())));
+
+    Ok(Some(ExplicitHttpProxy {
+        host,
+        port,
+        authorization,
+    }))
+}
+
+fn proxy_url_credentials(proxy: &Url) -> Option<String> {
+    if proxy.username().is_empty() {
+        return None;
+    }
+    let password = proxy.password().unwrap_or("");
+    Some(format!("{}:{password}", proxy.username()))
+}
+
+async fn run_raw_http_proxy_transfer(context: RawHttpProxyContext<'_>) -> Result<HttpAttempt> {
+    let request = raw_http_proxy_request(&context)?;
+    let mut stream = TcpStream::connect((context.proxy.host.as_str(), context.proxy.port))
+        .await
+        .map_err(tcp_io_error)?;
+    stream.write_all(&request).await.map_err(tcp_io_error)?;
+    raw_http_read_response(
+        &mut stream,
+        context.method,
+        context.url,
+        context.resume_from,
+    )
+    .await
+}
+
+fn raw_http_proxy_request(context: &RawHttpProxyContext<'_>) -> Result<Vec<u8>> {
+    let parsed_headers = parse_headers(&context.transfer.headers)?;
+    let has_header = |name: &str| {
+        parsed_headers
+            .iter()
+            .any(|(header_name, _)| header_name.as_str().eq_ignore_ascii_case(name))
+    };
+    let body = raw_http_body(context.transfer, context.prepared_body, context.upload_body);
+    let mut request = Vec::new();
+    request.extend_from_slice(
+        format!("{} {} HTTP/1.1\r\n", context.method.as_str(), context.url).as_bytes(),
+    );
+    if !has_header("host") {
+        request
+            .extend_from_slice(format!("Host: {}\r\n", http_host_header(context.url)).as_bytes());
+    }
+    if let Some(authorization) = &context.proxy.authorization
+        && !has_header("proxy-authorization")
+    {
+        request.extend_from_slice(format!("Proxy-Authorization: {authorization}\r\n").as_bytes());
+    }
+    if !has_header("user-agent") {
+        request.extend_from_slice(format!("User-Agent: {}\r\n", default_user_agent()).as_bytes());
+    }
+    if !has_header("accept") {
+        if context.prepared_body.is_some_and(|body| body.is_json) {
+            request.extend_from_slice(b"Accept: application/json\r\n");
+        } else {
+            request.extend_from_slice(b"Accept: */*\r\n");
+        }
+    }
+    if context.transfer.compressed && !has_header("accept-encoding") {
+        request.extend_from_slice(b"Accept-Encoding: deflate, gzip, br\r\n");
+    }
+    if let Some(cookie) = &context.transfer.cookie
+        && !has_header("cookie")
+    {
+        request.extend_from_slice(format!("Cookie: {cookie}\r\n").as_bytes());
+    }
+    if let Some(token) = &context.transfer.oauth2_bearer
+        && !has_header("authorization")
+    {
+        request.extend_from_slice(format!("Authorization: Bearer {token}\r\n").as_bytes());
+    } else if let Some(user) = &context.transfer.user
+        && context.transfer.oauth2_bearer.is_none()
+        && !has_header("authorization")
+    {
+        request.extend_from_slice(
+            format!(
+                "Authorization: Basic {}\r\n",
+                base64_padded(user.as_bytes())
+            )
+            .as_bytes(),
+        );
+    }
+    if let Some(path) = &context.transfer.etag_compare
+        && !has_header("if-none-match")
+    {
+        request.extend_from_slice(
+            format!("If-None-Match: {}\r\n", load_etag_compare(path)?).as_bytes(),
+        );
+    }
+    if let Some(time_cond) = &context.transfer.time_cond {
+        let (name, value) = time_condition_header(time_cond);
+        if !has_header(name.as_str()) {
+            request.extend_from_slice(name.as_str().as_bytes());
+            request.extend_from_slice(b": ");
+            request.extend_from_slice(value.as_bytes());
+            request.extend_from_slice(b"\r\n");
+        }
+    }
+    if let Some(referer) = context.referer
+        && !has_header("referer")
+    {
+        request.extend_from_slice(format!("Referer: {referer}\r\n").as_bytes());
+    }
+    if let Some(range) = effective_range(context.transfer, context.resume_from)
+        && !has_header("range")
+    {
+        request.extend_from_slice(format!("Range: {}\r\n", range_header_value(&range)).as_bytes());
+    }
+    if context.prepared_body.is_some_and(|body| body.is_json) && !has_header("content-type") {
+        request.extend_from_slice(b"Content-Type: application/json\r\n");
+    }
+    if let Some(body) = body
+        && !body.is_empty()
+        && !has_header("content-length")
+    {
+        request.extend_from_slice(format!("Content-Length: {}\r\n", body.len()).as_bytes());
+    }
+    if !has_header("proxy-connection") {
+        request.extend_from_slice(b"Proxy-Connection: Keep-Alive\r\n");
+    }
+    for (name, value) in parsed_headers {
+        if value.is_empty() {
+            continue;
+        }
+        request.extend_from_slice(name.as_str().as_bytes());
+        request.extend_from_slice(b": ");
+        request.extend_from_slice(value.as_bytes());
+        request.extend_from_slice(b"\r\n");
+    }
+    request.extend_from_slice(b"\r\n");
+    if let Some(body) = body {
+        request.extend_from_slice(body);
+    }
+    Ok(request)
+}
+
+fn raw_http_body<'a>(
+    transfer: &TransferConfig,
+    prepared_body: Option<&'a PreparedBody>,
+    upload_body: Option<&'a [u8]>,
+) -> Option<&'a [u8]> {
+    if let Some(body) = upload_body {
+        Some(body)
+    } else if transfer.get {
+        None
+    } else {
+        prepared_body.map(|body| body.bytes.as_slice())
+    }
+}
+
+async fn raw_http_read_response(
+    stream: &mut TcpStream,
+    method: &Method,
+    final_url: &Url,
+    resume_from: u64,
+) -> Result<HttpAttempt> {
+    let mut header_bytes = Vec::new();
+    let mut byte = [0_u8; 1];
+    loop {
+        let read = stream.read(&mut byte).await.map_err(tcp_io_error)?;
+        if read == 0 {
+            return Err(CurlError::GotNothing);
+        }
+        header_bytes.push(byte[0]);
+        if header_bytes.ends_with(b"\r\n\r\n") || header_bytes.ends_with(b"\n\n") {
+            break;
+        }
+        if header_bytes.len() > 64 * 1024 {
+            return Err(CurlError::WeirdServerReply);
+        }
+    }
+
+    let (version, status, headers) = parse_raw_http_headers(&header_bytes)?;
+    let retry_after = retry_after_delay(&headers);
+    let body = if method == Method::HEAD {
+        Vec::new()
+    } else if let Some(length) = headers
+        .get(CONTENT_LENGTH)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.parse::<usize>().ok())
+    {
+        let mut body = vec![0_u8; length];
+        stream.read_exact(&mut body).await.map_err(tcp_io_error)?;
+        body
+    } else {
+        let mut body = Vec::new();
+        stream.read_to_end(&mut body).await.map_err(tcp_io_error)?;
+        body
+    };
+
+    Ok(HttpAttempt {
+        status,
+        version,
+        final_url: final_url.clone(),
+        headers,
+        header_bytes: Some(header_bytes),
+        body,
+        retry_after,
+        resume_from,
+    })
+}
+
+fn parse_raw_http_headers(
+    header_bytes: &[u8],
+) -> Result<(Version, StatusCode, reqwest::header::HeaderMap)> {
+    let text = String::from_utf8_lossy(header_bytes);
+    let mut lines = text.lines();
+    let status_line = lines.next().ok_or(CurlError::WeirdServerReply)?;
+    let mut fields = status_line.split_whitespace();
+    let version = match fields.next() {
+        Some("HTTP/1.0") => Version::HTTP_10,
+        Some("HTTP/1.1") => Version::HTTP_11,
+        Some("HTTP/2") => Version::HTTP_2,
+        Some("HTTP/3") => Version::HTTP_3,
+        _ => return Err(CurlError::WeirdServerReply),
+    };
+    let status = fields
+        .next()
+        .ok_or(CurlError::WeirdServerReply)?
+        .parse::<u16>()
+        .ok()
+        .and_then(|status| StatusCode::from_u16(status).ok())
+        .ok_or(CurlError::WeirdServerReply)?;
+    let mut headers = reqwest::header::HeaderMap::new();
+    for line in lines {
+        let line = line.trim_end_matches('\r');
+        if line.is_empty() {
+            break;
+        }
+        let Some((name, value)) = line.split_once(':') else {
+            return Err(CurlError::WeirdServerReply);
+        };
+        let name = HeaderName::from_bytes(name.trim().as_bytes())
+            .map_err(|_| CurlError::WeirdServerReply)?;
+        let value =
+            HeaderValue::from_str(value.trim_start()).map_err(|_| CurlError::WeirdServerReply)?;
+        headers.append(name, value);
+    }
+    Ok((version, status, headers))
+}
+
+fn http_host_header(url: &Url) -> String {
+    let host = url.host_str().unwrap_or("");
+    let host = if host.contains(':') && !host.starts_with('[') {
+        format!("[{host}]")
+    } else {
+        host.to_string()
+    };
+    match url.port() {
+        Some(port) if Some(port) != url.port_or_known_default() => format!("{host}:{port}"),
+        _ => host,
+    }
+}
+
+fn default_user_agent() -> String {
+    format!("curl/{}", curl_compat_version())
+}
+
+fn curl_compat_version() -> &'static str {
+    const CURLVER_H: &str = include_str!("../../../include/curl/curlver.h");
+    CURLVER_H
+        .lines()
+        .find_map(|line| {
+            line.strip_prefix("#define LIBCURL_VERSION \"")
+                .and_then(|value| value.strip_suffix('"'))
+        })
+        .unwrap_or("8.21.0-DEV")
 }
 
 async fn run_http_with_retries(
@@ -6406,7 +6774,9 @@ fn write_http_attempt_output(
     attempt: &HttpAttempt,
     persist_headers: bool,
 ) -> Result<bool> {
-    let header_bytes = output::render_headers(attempt.version, attempt.status, &attempt.headers);
+    let header_bytes = attempt.header_bytes.clone().unwrap_or_else(|| {
+        output::render_headers(attempt.version, attempt.status, &attempt.headers)
+    });
     if persist_headers && let Some(path) = &transfer.dump_header {
         output::dump_headers(path, &header_bytes, transfer.create_dirs)?;
     }

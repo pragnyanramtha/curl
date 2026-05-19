@@ -223,6 +223,7 @@ set(_curl_rust_corpus_tests
   1847
   1848
   1850
+  2008
   2044
   2045
   2072

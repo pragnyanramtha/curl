@@ -5506,6 +5506,9 @@ fn proxy_user_sets_proxy_authorization_header() {
             .start_line
             .starts_with("GET http://example.test/resource HTTP/1.1")
     );
+    assert!(header(&request, "user-agent").unwrap().starts_with("curl/"));
+    assert_eq!(header(&request, "accept"), Some("*/*"));
+    assert_eq!(header(&request, "proxy-connection"), Some("Keep-Alive"));
     assert_eq!(
         header(&request, "proxy-authorization"),
         Some("Basic YWxhZGRpbjpvcGVuc2VzYW1l")
