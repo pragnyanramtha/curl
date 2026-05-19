@@ -981,6 +981,10 @@ async fn run_ftp_exchange(
         }
     };
 
+    if matches!(transfer_result, Err(CurlError::FtpWeird227Format)) {
+        return transfer_result;
+    }
+
     let response_code_before_quit = metrics.response_code;
     let _ = ftp_command(&mut stream, b"QUIT", metrics, &mut control_headers).await;
     metrics.response_code = response_code_before_quit;
@@ -1092,8 +1096,8 @@ async fn ftp_download_body(
     control_headers: &mut Vec<u8>,
     resume_from: u64,
 ) -> Result<Vec<u8>> {
-    let (data_host, data_port) = ftp_enter_passive(stream, host, metrics, control_headers).await?;
-    let mut data_stream = connect_tcp(&data_host, data_port, transfer).await?;
+    let mut data_stream =
+        ftp_open_passive_data(transfer, stream, host, metrics, control_headers).await?;
     let ascii = transfer.list_only || path.file.is_none();
     ftp_set_type(
         stream,
@@ -1168,8 +1172,8 @@ async fn ftp_upload_body(
         .file
         .as_ref()
         .ok_or_else(|| CurlError::Url("FTP upload requires a remote filename".to_string()))?;
-    let (data_host, data_port) = ftp_enter_passive(stream, host, metrics, control_headers).await?;
-    let mut data_stream = connect_tcp(&data_host, data_port, transfer).await?;
+    let mut data_stream =
+        ftp_open_passive_data(transfer, stream, host, metrics, control_headers).await?;
     ftp_set_type(stream, b'I', metrics, control_headers).await?;
 
     let mut offset = 0_usize;
@@ -1218,23 +1222,37 @@ async fn ftp_upload_body(
     Ok(body.len())
 }
 
-async fn ftp_enter_passive(
+async fn ftp_open_passive_data(
+    transfer: &TransferConfig,
     stream: &mut TcpStream,
     host: &str,
     metrics: &mut writeout::Metrics,
     control_headers: &mut Vec<u8>,
-) -> Result<(String, u16)> {
-    let response = ftp_command(stream, b"EPSV", metrics, control_headers).await?;
-    if response.code == 229 {
-        let port = ftp_epsv_port(&response)?;
-        return Ok((host.to_string(), port));
+) -> Result<TcpStream> {
+    let control_is_ipv6 = stream.peer_addr().is_ok_and(|addr| addr.is_ipv6());
+    if !transfer.ftp_disable_epsv || control_is_ipv6 {
+        let response = ftp_command(stream, b"EPSV", metrics, control_headers).await?;
+        if response.code == 229 {
+            let port = ftp_epsv_port(&response)?;
+            match connect_tcp(host, port, transfer).await {
+                Ok(data_stream) => return Ok(data_stream),
+                Err(_) if !control_is_ipv6 => {}
+                Err(error) => return Err(error),
+            }
+        }
     }
 
     let response = ftp_command(stream, b"PASV", metrics, control_headers).await?;
     if response.code != 227 {
         return Err(CurlError::FtpWeirdPasvReply);
     }
-    ftp_pasv_addr(&response)
+    let (pasv_host, port) = ftp_pasv_addr(&response)?;
+    let data_host = if transfer.ftp_skip_pasv_ip.unwrap_or(true) {
+        host.to_string()
+    } else {
+        pasv_host
+    };
+    connect_tcp(&data_host, port, transfer).await
 }
 
 async fn ftp_set_type(
@@ -1397,7 +1415,7 @@ fn ftp_pasv_addr(response: &FtpResponse) -> Result<(String, u16)> {
             }
         }
     }
-    Err(CurlError::FtpWeirdPasvReply)
+    Err(CurlError::FtpWeird227Format)
 }
 
 fn ftp_parse_pasv_numbers(bytes: &[u8]) -> Option<[u8; 6]> {

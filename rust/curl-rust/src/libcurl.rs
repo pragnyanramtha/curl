@@ -176,6 +176,16 @@ fn write_request(out: &mut String, render: &RenderTransfer<'_>, url: &str) -> Re
     if transfer.list_only {
         emit_long_setopt(out, "CURLOPT_DIRLISTONLY", 1);
     }
+    if transfer.ftp_disable_epsv {
+        emit_long_setopt(out, "CURLOPT_FTP_USE_EPSV", 0);
+    }
+    if let Some(skip_pasv_ip) = transfer.ftp_skip_pasv_ip {
+        emit_long_setopt(
+            out,
+            "CURLOPT_FTP_SKIP_PASV_IP",
+            if skip_pasv_ip { 1 } else { 0 },
+        );
+    }
     if transfer.fail {
         emit_long_setopt(out, "CURLOPT_FAILONERROR", 1);
     }

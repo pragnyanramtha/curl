@@ -38,6 +38,8 @@ pub enum CurlError {
     RecvError,
     #[error("FTP weird PASV reply")]
     FtpWeirdPasvReply,
+    #[error("FTP weird 227 format")]
+    FtpWeird227Format,
     #[error("FTP could not set transfer type")]
     FtpCouldntSetType,
     #[error("FTP could not retrieve file")]
@@ -116,6 +118,7 @@ impl CurlError {
             Self::RecvError => 56,
             Self::RemoteAccessDenied => 9,
             Self::FtpWeirdPasvReply => 13,
+            Self::FtpWeird227Format => 14,
             Self::FtpCouldntSetType => 17,
             Self::FtpCouldntRetrFile => 19,
             Self::FtpUploadFailed => 25,

@@ -241,7 +241,10 @@ struct FtpServerOptions {
     greeting: &'static [u8],
     data: Vec<u8>,
     epsv_fails: bool,
+    epsv_bad_port: bool,
     pasv_denied: bool,
+    pasv_reply: Option<&'static [u8]>,
+    pasv_host: [u8; 4],
     login_denied: bool,
     pwd_denied: bool,
     cwd_denied: bool,
@@ -410,7 +413,10 @@ fn ftp_options(data: impl Into<Vec<u8>>) -> FtpServerOptions {
         greeting: b"220 curl FTP test server\r\n",
         data,
         epsv_fails: false,
+        epsv_bad_port: false,
         pasv_denied: false,
+        pasv_reply: None,
+        pasv_host: [127, 0, 0, 1],
         login_denied: false,
         pwd_denied: false,
         cwd_denied: false,
@@ -426,11 +432,28 @@ fn ftp_options(data: impl Into<Vec<u8>>) -> FtpServerOptions {
 
 fn spawn_ftp_server(path: &str, options: FtpServerOptions) -> (String, Receiver<FtpRecord>) {
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    spawn_ftp_server_with_listener(path, options, listener)
+}
+
+fn spawn_ftp_server_ipv6(
+    path: &str,
+    options: FtpServerOptions,
+) -> Option<(String, Receiver<FtpRecord>)> {
+    let listener = TcpListener::bind("[::1]:0").ok()?;
+    Some(spawn_ftp_server_with_listener(path, options, listener))
+}
+
+fn spawn_ftp_server_with_listener(
+    path: &str,
+    options: FtpServerOptions,
+    listener: TcpListener,
+) -> (String, Receiver<FtpRecord>) {
     let addr = listener.local_addr().unwrap();
     let (tx, rx) = mpsc::channel();
 
     thread::spawn(move || {
         let (mut stream, _) = listener.accept().unwrap();
+        let control_is_ipv6 = stream.local_addr().unwrap().is_ipv6();
         stream.write_all(options.greeting).unwrap();
 
         let mut commands = Vec::new();
@@ -471,8 +494,16 @@ fn spawn_ftp_server(path: &str, options: FtpServerOptions) -> (String, Receiver<
             } else if command == "EPSV" {
                 if options.epsv_fails {
                     stream.write_all(b"500 EPSV unsupported\r\n").unwrap();
+                } else if options.epsv_bad_port {
+                    let port = unused_local_port();
+                    stream
+                        .write_all(
+                            format!("229 Entering Extended Passive Mode (|||{port}|)\r\n")
+                                .as_bytes(),
+                        )
+                        .unwrap();
                 } else {
-                    let (listener, port) = ftp_passive_listener();
+                    let (listener, port) = ftp_passive_listener(control_is_ipv6);
                     passive_listener = Some(listener);
                     stream
                         .write_all(
@@ -486,13 +517,19 @@ fn spawn_ftp_server(path: &str, options: FtpServerOptions) -> (String, Receiver<
                     stream.write_all(b"500 PASV unsupported\r\n").unwrap();
                     continue;
                 }
-                let (listener, port) = ftp_passive_listener();
+                if let Some(reply) = options.pasv_reply {
+                    stream.write_all(reply).unwrap();
+                    continue;
+                }
+                let (listener, port) = ftp_passive_listener(false);
                 passive_listener = Some(listener);
                 let p1 = port / 256;
                 let p2 = port % 256;
+                let [h1, h2, h3, h4] = options.pasv_host;
                 stream
                     .write_all(
-                        format!("227 Entering Passive Mode (127,0,0,1,{p1},{p2})\r\n").as_bytes(),
+                        format!("227 Entering Passive Mode ({h1},{h2},{h3},{h4},{p1},{p2})\r\n")
+                            .as_bytes(),
                     )
                     .unwrap();
             } else if command.starts_with("TYPE ") {
@@ -574,10 +611,16 @@ fn spawn_ftp_server(path: &str, options: FtpServerOptions) -> (String, Receiver<
     (format!("ftp://{addr}{path}"), rx)
 }
 
-fn ftp_passive_listener() -> (TcpListener, u16) {
-    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+fn ftp_passive_listener(ipv6: bool) -> (TcpListener, u16) {
+    let addr = if ipv6 { "[::1]:0" } else { "127.0.0.1:0" };
+    let listener = TcpListener::bind(addr).unwrap();
     let port = listener.local_addr().unwrap().port();
     (listener, port)
+}
+
+fn unused_local_port() -> u16 {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    listener.local_addr().unwrap().port()
 }
 
 fn spawn_pop3_server(path: &str, command_response: &'static [u8]) -> (String, Receiver<Vec<u8>>) {
@@ -3542,6 +3585,117 @@ fn ftp_passive_failure_returns_13() {
     assert_eq!(
         rx.recv().unwrap().commands,
         b"USER anonymous\r\nPASS ftp@example.com\r\nPWD\r\nEPSV\r\nPASV\r\nQUIT\r\n"
+    );
+}
+
+#[test]
+fn ftp_malformed_pasv_reply_returns_14() {
+    let mut options = ftp_options(Vec::new());
+    options.epsv_fails = true;
+    options.pasv_reply = Some(b"227 Entering Passive Mode (1216,256,2,127,127,127)\r\n");
+    let (url, rx) = spawn_ftp_server("/file.txt", options);
+
+    let mut command = Command::cargo_bin("curl").unwrap();
+    command.args(["-q", "-sS", &url]);
+    command.assert().failure().code(14).stdout("");
+
+    assert_eq!(
+        rx.recv().unwrap().commands,
+        b"USER anonymous\r\nPASS ftp@example.com\r\nPWD\r\nEPSV\r\nPASV\r\n"
+    );
+}
+
+#[test]
+fn ftp_default_skips_pasv_ip() {
+    let mut options = ftp_options(b"downloaded");
+    options.epsv_fails = true;
+    options.pasv_host = [203, 0, 113, 1];
+    let (url, rx) = spawn_ftp_server("/file.txt", options);
+
+    let mut command = Command::cargo_bin("curl").unwrap();
+    command.args(["-q", "-sS", &url]);
+    command.assert().success().stdout("downloaded");
+
+    assert_eq!(
+        rx.recv().unwrap().commands,
+        b"USER anonymous\r\nPASS ftp@example.com\r\nPWD\r\nEPSV\r\nPASV\r\nTYPE I\r\nSIZE file.txt\r\nRETR file.txt\r\nQUIT\r\n"
+    );
+}
+
+#[test]
+fn ftp_epsv_connect_failure_falls_back_to_pasv() {
+    let mut options = ftp_options(b"downloaded");
+    options.epsv_bad_port = true;
+    let (url, rx) = spawn_ftp_server("/file.txt", options);
+
+    let mut command = Command::cargo_bin("curl").unwrap();
+    command.args(["-q", "-sS", &url]);
+    command.assert().success().stdout("downloaded");
+
+    assert_eq!(
+        rx.recv().unwrap().commands,
+        b"USER anonymous\r\nPASS ftp@example.com\r\nPWD\r\nEPSV\r\nPASV\r\nTYPE I\r\nSIZE file.txt\r\nRETR file.txt\r\nQUIT\r\n"
+    );
+}
+
+#[test]
+fn ftp_disable_epsv_uses_pasv_directly() {
+    let (url, rx) = spawn_ftp_server("/file.txt", ftp_options(b"downloaded"));
+
+    let mut command = Command::cargo_bin("curl").unwrap();
+    command.args(["-q", "-sS", "--disable-epsv", &url]);
+    command.assert().success().stdout("downloaded");
+
+    assert_eq!(
+        rx.recv().unwrap().commands,
+        b"USER anonymous\r\nPASS ftp@example.com\r\nPWD\r\nPASV\r\nTYPE I\r\nSIZE file.txt\r\nRETR file.txt\r\nQUIT\r\n"
+    );
+}
+
+#[test]
+fn ftp_epsv_reenables_after_disable_epsv() {
+    let (url, rx) = spawn_ftp_server("/file.txt", ftp_options(b"downloaded"));
+
+    let mut command = Command::cargo_bin("curl").unwrap();
+    command.args(["-q", "-sS", "--disable-epsv", "--epsv", &url]);
+    command.assert().success().stdout("downloaded");
+
+    assert_eq!(
+        rx.recv().unwrap().commands,
+        b"USER anonymous\r\nPASS ftp@example.com\r\nPWD\r\nEPSV\r\nTYPE I\r\nSIZE file.txt\r\nRETR file.txt\r\nQUIT\r\n"
+    );
+}
+
+#[test]
+fn ftp_ipv6_disable_epsv_still_uses_epsv() {
+    let Some((url, rx)) = spawn_ftp_server_ipv6("/", ftp_options(b"listing\n")) else {
+        return;
+    };
+
+    let mut command = Command::cargo_bin("curl").unwrap();
+    command.args(["-q", "-sS", "--disable-epsv", "-g", &url]);
+    command.assert().success().stdout("listing\n");
+
+    assert_eq!(
+        rx.recv().unwrap().commands,
+        b"USER anonymous\r\nPASS ftp@example.com\r\nPWD\r\nEPSV\r\nTYPE A\r\nLIST\r\nQUIT\r\n"
+    );
+}
+
+#[test]
+fn ftp_skip_pasv_ip_uses_control_host() {
+    let mut options = ftp_options(b"downloaded");
+    options.epsv_fails = true;
+    options.pasv_host = [203, 0, 113, 1];
+    let (url, rx) = spawn_ftp_server("/file.txt", options);
+
+    let mut command = Command::cargo_bin("curl").unwrap();
+    command.args(["-q", "-sS", "--ftp-skip-pasv-ip", &url]);
+    command.assert().success().stdout("downloaded");
+
+    assert_eq!(
+        rx.recv().unwrap().commands,
+        b"USER anonymous\r\nPASS ftp@example.com\r\nPWD\r\nEPSV\r\nPASV\r\nTYPE I\r\nSIZE file.txt\r\nRETR file.txt\r\nQUIT\r\n"
     );
 }
 
@@ -7014,6 +7168,33 @@ fn libcurl_writes_ftp_upload_append_options() {
     let text = std::fs::read_to_string(source).unwrap();
     assert!(text.contains("CURLOPT_UPLOAD, 1L"));
     assert!(text.contains("CURLOPT_APPEND, 1L"));
+}
+
+#[test]
+fn libcurl_writes_ftp_passive_options() {
+    let temp = tempdir().unwrap();
+    let source = temp.path().join("ftp-passive-client.c");
+    let (url, rx) = spawn_ftp_server("/file.txt", ftp_options(b"downloaded"));
+
+    let mut command = Command::cargo_bin("curl").unwrap();
+    command.args([
+        "-q",
+        "-sS",
+        "--libcurl",
+        source.to_str().unwrap(),
+        "--disable-epsv",
+        "--ftp-skip-pasv-ip",
+        &url,
+    ]);
+    command.assert().success().stdout("downloaded");
+
+    assert_eq!(
+        rx.recv().unwrap().commands,
+        b"USER anonymous\r\nPASS ftp@example.com\r\nPWD\r\nPASV\r\nTYPE I\r\nSIZE file.txt\r\nRETR file.txt\r\nQUIT\r\n"
+    );
+    let text = std::fs::read_to_string(source).unwrap();
+    assert!(text.contains("CURLOPT_FTP_USE_EPSV, 0L"));
+    assert!(text.contains("CURLOPT_FTP_SKIP_PASV_IP, 1L"));
 }
 
 #[test]

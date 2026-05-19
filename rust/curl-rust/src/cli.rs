@@ -38,6 +38,8 @@ pub struct TransferConfig {
     pub get: bool,
     pub list_only: bool,
     pub ftp_append: bool,
+    pub ftp_disable_epsv: bool,
+    pub ftp_skip_pasv_ip: Option<bool>,
     pub include_headers: bool,
     pub headers: Vec<String>,
     pub data: Vec<DataSpec>,
@@ -167,6 +169,8 @@ impl Default for TransferConfig {
             get: false,
             list_only: false,
             ftp_append: false,
+            ftp_disable_epsv: false,
+            ftp_skip_pasv_ip: None,
             include_headers: false,
             headers: Vec::new(),
             data: Vec::new(),
@@ -399,6 +403,10 @@ impl Parser {
             "get" => self.current().get = true,
             "list-only" => self.current().list_only = true,
             "append" => self.current().ftp_append = true,
+            "disable-epsv" => self.current().ftp_disable_epsv = true,
+            "epsv" => self.current().ftp_disable_epsv = false,
+            "ftp-pasv" => {}
+            "ftp-skip-pasv-ip" => self.current().ftp_skip_pasv_ip = Some(true),
             "include" => self.current().include_headers = true,
             "header" => {
                 let value = self.value_for(name, inline_value)?;
@@ -682,6 +690,9 @@ impl Parser {
             "get" => self.current().get = false,
             "list-only" => self.current().list_only = false,
             "append" => self.current().ftp_append = false,
+            "disable-epsv" => self.current().ftp_disable_epsv = false,
+            "epsv" => self.current().ftp_disable_epsv = true,
+            "ftp-skip-pasv-ip" => self.current().ftp_skip_pasv_ip = Some(false),
             "include" => self.current().include_headers = false,
             "parallel" => self.config.parallel = false,
             "parallel-immediate" => self.config.parallel_immediate = false,
@@ -1166,6 +1177,8 @@ impl TransferConfig {
             || self.get
             || self.list_only
             || self.ftp_append
+            || self.ftp_disable_epsv
+            || self.ftp_skip_pasv_ip.is_some()
             || self.include_headers
             || !self.headers.is_empty()
             || !self.data.is_empty()
@@ -2130,6 +2143,38 @@ mod tests {
         let config =
             parse_args(["-q", "--append", "--no-append", "ftp://example.com/file"]).unwrap();
         assert!(!config.transfers[0].ftp_append);
+    }
+
+    #[test]
+    fn parses_ftp_passive_options() {
+        let config = parse_args([
+            "-q",
+            "--disable-epsv",
+            "--ftp-pasv",
+            "--ftp-skip-pasv-ip",
+            "ftp://example.com/file",
+        ])
+        .unwrap();
+        assert!(config.transfers[0].ftp_disable_epsv);
+        assert_eq!(config.transfers[0].ftp_skip_pasv_ip, Some(true));
+
+        let config = parse_args([
+            "-q",
+            "--disable-epsv",
+            "--epsv",
+            "--ftp-skip-pasv-ip",
+            "--no-ftp-skip-pasv-ip",
+            "ftp://example.com/file",
+        ])
+        .unwrap();
+        assert!(!config.transfers[0].ftp_disable_epsv);
+        assert_eq!(config.transfers[0].ftp_skip_pasv_ip, Some(false));
+
+        let config = parse_args(["-q", "--no-epsv", "ftp://example.com/file"]).unwrap();
+        assert!(config.transfers[0].ftp_disable_epsv);
+
+        let config = parse_args(["-q", "ftp://example.com/file"]).unwrap();
+        assert_eq!(config.transfers[0].ftp_skip_pasv_ip, None);
     }
 
     #[test]
