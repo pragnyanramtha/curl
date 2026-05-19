@@ -8,7 +8,7 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use assert_cmd::Command;
-use tempfile::{TempDir, tempdir};
+use tempfile::{TempDir, tempdir, tempdir_in};
 use url::Url;
 
 const DICT_GREETING: &[u8] = b"220 dictserver <xnooptions> <msgid@msgid>\n";
@@ -6382,6 +6382,35 @@ fn sftp_list_only_outputs_directory_names() {
 }
 
 #[test]
+fn sftp_url_path_expands_remote_home() {
+    let Some(fixture) = SshdFixture::new() else {
+        return;
+    };
+    let Some(home) = std::env::var_os("HOME") else {
+        return;
+    };
+    let remote_home_dir = tempdir_in(home).unwrap();
+    let remote_dirname = remote_home_dir
+        .path()
+        .file_name()
+        .unwrap()
+        .to_str()
+        .unwrap();
+    let remote_file = remote_home_dir.path().join("url-home.txt");
+    std::fs::write(&remote_file, b"sftp home url\n").unwrap();
+    let url = format!(
+        "sftp://127.0.0.1:{}/~/{remote_dirname}/url-home.txt",
+        fixture.port
+    );
+
+    let mut command = Command::cargo_bin("curl").unwrap();
+    command.args(["-q", "-sS"]);
+    command.args(fixture.auth_args());
+    command.arg(url);
+    command.assert().success().stdout("sftp home url\n");
+}
+
+#[test]
 fn sftp_quote_mkdir_runs_before_download() {
     let Some(fixture) = SshdFixture::new() else {
         return;
@@ -6397,6 +6426,35 @@ fn sftp_quote_mkdir_runs_before_download() {
     command.assert().success().stdout("ssh fixture body\n");
 
     assert!(remote_dir.is_dir());
+}
+
+#[test]
+fn sftp_quote_path_expands_remote_home() {
+    let Some(fixture) = SshdFixture::new() else {
+        return;
+    };
+    let Some(home) = std::env::var_os("HOME") else {
+        return;
+    };
+    let remote_home_dir = tempdir_in(home).unwrap();
+    let remote_dirname = remote_home_dir
+        .path()
+        .file_name()
+        .unwrap()
+        .to_str()
+        .unwrap();
+    let remote_file = remote_home_dir.path().join("quote-home.txt");
+    std::fs::write(&remote_file, b"remove through quote\n").unwrap();
+    let quote = format!("rm /~/{remote_dirname}/quote-home.txt");
+    let url = fixture.url_for("sftp", &fixture.root.join("data.txt"));
+
+    let mut command = Command::cargo_bin("curl").unwrap();
+    command.args(["-q", "-sS", "--quote", &quote]);
+    command.args(fixture.auth_args());
+    command.arg(url);
+    command.assert().success().stdout("ssh fixture body\n");
+
+    assert!(!remote_file.exists());
 }
 
 #[test]

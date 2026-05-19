@@ -1703,6 +1703,7 @@ struct SshDownload {
 struct SshPostquoteContext {
     session: Session,
     current_path: String,
+    homedir: String,
 }
 
 enum SshTransferResult {
@@ -1867,6 +1868,7 @@ async fn run_sftp_postquote(
             &postquote.session,
             &commands,
             &postquote.current_path,
+            &postquote.homedir,
             &mut quote_headers,
         )
     });
@@ -1953,15 +1955,33 @@ fn run_ssh_blocking(
     let path = ssh_url_path(&url, protocol)?;
     let session = ssh_connect(transfer, &url)?;
 
+    let sftp_homedir = if protocol == SshProtocol::Sftp {
+        Some(ssh_sftp_home_dir(&session)?)
+    } else {
+        None
+    };
+    let path = if let Some(homedir) = sftp_homedir.as_deref() {
+        ssh_sftp_expand_url_home_path(&path, homedir)
+    } else {
+        path
+    };
+
     let mut quote_headers = Vec::new();
     if protocol == SshProtocol::Sftp {
-        ssh_sftp_run_quote_commands(&session, &transfer.ftp_quote, &path, &mut quote_headers)?;
+        ssh_sftp_run_quote_commands(
+            &session,
+            &transfer.ftp_quote,
+            &path,
+            sftp_homedir.as_deref().unwrap_or_default(),
+            &mut quote_headers,
+        )?;
     }
     let postquote =
         (protocol == SshProtocol::Sftp && !transfer.ftp_postquote.is_empty()).then(|| {
             SshPostquoteContext {
                 session: session.clone(),
                 current_path: path.clone(),
+                homedir: sftp_homedir.clone().unwrap_or_default(),
             }
         });
 
@@ -2177,10 +2197,40 @@ fn sftp_seek_error(transfer: &TransferConfig, resume_from: u64) -> CurlError {
     }
 }
 
+fn ssh_sftp_home_dir(session: &Session) -> Result<String> {
+    let sftp = session.sftp().map_err(ssh_error_to_curl)?;
+    let homedir = sftp.realpath(Path::new(".")).map_err(ssh_error_to_curl)?;
+    homedir
+        .into_os_string()
+        .into_string()
+        .map_err(|_| CurlError::Url("SFTP home path is not valid UTF-8".to_string()))
+}
+
+fn ssh_sftp_expand_url_home_path(path: &str, homedir: &str) -> String {
+    if path == "/~" {
+        format!("{homedir}/")
+    } else if let Some(rest) = path.strip_prefix("/~/") {
+        if homedir.ends_with('/') {
+            format!("{homedir}{rest}")
+        } else {
+            format!("{homedir}/{rest}")
+        }
+    } else {
+        path.to_string()
+    }
+}
+
+fn ssh_sftp_expand_quote_home_path(path: &str, homedir: &str) -> String {
+    path.strip_prefix("/~/")
+        .map(|rest| format!("{homedir}/{rest}"))
+        .unwrap_or_else(|| path.to_string())
+}
+
 fn ssh_sftp_run_quote_commands(
     session: &Session,
     commands: &[String],
     current_path: &str,
+    homedir: &str,
     quote_headers: &mut Vec<u8>,
 ) -> Result<()> {
     if commands.is_empty() {
@@ -2188,7 +2238,7 @@ fn ssh_sftp_run_quote_commands(
     }
     let sftp = session.sftp().map_err(ssh_error_to_curl)?;
     for command in commands {
-        ssh_sftp_run_quote_command(&sftp, command, current_path, quote_headers)?;
+        ssh_sftp_run_quote_command(&sftp, command, current_path, homedir, quote_headers)?;
     }
     Ok(())
 }
@@ -2197,6 +2247,7 @@ fn ssh_sftp_run_quote_command(
     sftp: &ssh2::Sftp,
     command: &str,
     current_path: &str,
+    homedir: &str,
     quote_headers: &mut Vec<u8>,
 ) -> Result<()> {
     let (command, accept_fail) = sftp_quote_accept_failure(command);
@@ -2215,8 +2266,8 @@ fn ssh_sftp_run_quote_command(
 
     match operation {
         "chgrp" => {
-            let (group, remaining) = parse_sftp_quote_path(arguments)?;
-            let (path, remaining) = parse_sftp_quote_path(remaining)?;
+            let (group, remaining) = parse_sftp_quote_path(arguments, homedir)?;
+            let (path, remaining) = parse_sftp_quote_path(remaining, homedir)?;
             ensure_no_sftp_quote_trailing_data(remaining)?;
             let gid = parse_sftp_quote_decimal(&group)?;
             let stat = match sftp.stat(Path::new(&path)) {
@@ -2239,8 +2290,8 @@ fn ssh_sftp_run_quote_command(
             )
         }
         "chmod" => {
-            let (mode, remaining) = parse_sftp_quote_path(arguments)?;
-            let (path, remaining) = parse_sftp_quote_path(remaining)?;
+            let (mode, remaining) = parse_sftp_quote_path(arguments, homedir)?;
+            let (path, remaining) = parse_sftp_quote_path(remaining, homedir)?;
             ensure_no_sftp_quote_trailing_data(remaining)?;
             let mode = parse_sftp_quote_octal(&mode)?;
             sftp_quote_result(
@@ -2259,8 +2310,8 @@ fn ssh_sftp_run_quote_command(
             )
         }
         "chown" => {
-            let (user, remaining) = parse_sftp_quote_path(arguments)?;
-            let (path, remaining) = parse_sftp_quote_path(remaining)?;
+            let (user, remaining) = parse_sftp_quote_path(arguments, homedir)?;
+            let (path, remaining) = parse_sftp_quote_path(remaining, homedir)?;
             ensure_no_sftp_quote_trailing_data(remaining)?;
             let uid = parse_sftp_quote_decimal(&user)?;
             let stat = match sftp.stat(Path::new(&path)) {
@@ -2283,8 +2334,8 @@ fn ssh_sftp_run_quote_command(
             )
         }
         "atime" | "mtime" => {
-            let (date, remaining) = parse_sftp_quote_path(arguments)?;
-            let (path, remaining) = parse_sftp_quote_path(remaining)?;
+            let (date, remaining) = parse_sftp_quote_path(arguments, homedir)?;
+            let (path, remaining) = parse_sftp_quote_path(remaining, homedir)?;
             ensure_no_sftp_quote_trailing_data(remaining)?;
             let timestamp = parse_sftp_quote_date(&date)?;
             let stat = match sftp.stat(Path::new(&path)) {
@@ -2312,8 +2363,8 @@ fn ssh_sftp_run_quote_command(
             )
         }
         "ln" | "symlink" => {
-            let (source, remaining) = parse_sftp_quote_path(arguments)?;
-            let (target, remaining) = parse_sftp_quote_path(remaining)?;
+            let (source, remaining) = parse_sftp_quote_path(arguments, homedir)?;
+            let (target, remaining) = parse_sftp_quote_path(remaining, homedir)?;
             ensure_no_sftp_quote_trailing_data(remaining)?;
             sftp_quote_result(
                 sftp.symlink(Path::new(&source), Path::new(&target)),
@@ -2321,13 +2372,13 @@ fn ssh_sftp_run_quote_command(
             )
         }
         "mkdir" => {
-            let (path, remaining) = parse_sftp_quote_path(arguments)?;
+            let (path, remaining) = parse_sftp_quote_path(arguments, homedir)?;
             ensure_no_sftp_quote_trailing_data(remaining)?;
             sftp_quote_result(sftp.mkdir(Path::new(&path), 0o755), accept_fail)
         }
         "rename" => {
-            let (source, remaining) = parse_sftp_quote_path(arguments)?;
-            let (target, remaining) = parse_sftp_quote_path(remaining)?;
+            let (source, remaining) = parse_sftp_quote_path(arguments, homedir)?;
+            let (target, remaining) = parse_sftp_quote_path(remaining, homedir)?;
             ensure_no_sftp_quote_trailing_data(remaining)?;
             sftp_quote_result(
                 sftp.rename(
@@ -2339,17 +2390,17 @@ fn ssh_sftp_run_quote_command(
             )
         }
         "rm" => {
-            let (path, remaining) = parse_sftp_quote_path(arguments)?;
+            let (path, remaining) = parse_sftp_quote_path(arguments, homedir)?;
             ensure_no_sftp_quote_trailing_data(remaining)?;
             sftp_quote_result(sftp.unlink(Path::new(&path)), accept_fail)
         }
         "rmdir" => {
-            let (path, remaining) = parse_sftp_quote_path(arguments)?;
+            let (path, remaining) = parse_sftp_quote_path(arguments, homedir)?;
             ensure_no_sftp_quote_trailing_data(remaining)?;
             sftp_quote_result(sftp.rmdir(Path::new(&path)), accept_fail)
         }
         "statvfs" => {
-            let (path, remaining) = parse_sftp_quote_path(arguments)?;
+            let (path, remaining) = parse_sftp_quote_path(arguments, homedir)?;
             ensure_no_sftp_quote_trailing_data(remaining)?;
             match sftp_quote_statvfs(sftp, Path::new(&path), quote_headers) {
                 Ok(()) => Ok(()),
@@ -2405,7 +2456,7 @@ fn sftp_quote_accept_failure(command: &str) -> (&str, bool) {
         .unwrap_or((command, false))
 }
 
-fn parse_sftp_quote_path(input: &str) -> Result<(String, &str)> {
+fn parse_sftp_quote_path<'a>(input: &'a str, homedir: &str) -> Result<(String, &'a str)> {
     let input = input.trim_start_matches(char::is_whitespace);
     if input.is_empty() {
         return Err(CurlError::QuoteError);
@@ -2445,10 +2496,8 @@ fn parse_sftp_quote_path(input: &str) -> Result<(String, &str)> {
     if path.is_empty() {
         return Err(CurlError::QuoteError);
     }
-    Ok((
-        path.to_string(),
-        input[end..].trim_start_matches(char::is_whitespace),
-    ))
+    let path = ssh_sftp_expand_quote_home_path(path, homedir);
+    Ok((path, input[end..].trim_start_matches(char::is_whitespace)))
 }
 
 fn ensure_no_sftp_quote_trailing_data(input: &str) -> Result<()> {
