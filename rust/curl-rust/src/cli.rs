@@ -1,7 +1,10 @@
+use std::collections::HashMap;
 use std::ffi::OsString;
 use std::io::Read;
 use std::path::PathBuf;
 use std::time::Duration;
+
+use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64_STANDARD};
 
 use crate::data::{DataKind, DataSpec, FormKind, FormSpec};
 use crate::error::{CurlError, Result};
@@ -9,6 +12,7 @@ use crate::error::{CurlError, Result};
 pub const PARALLEL_DEFAULT: usize = 50;
 pub const PARALLEL_MAX_LIMIT: usize = 65_535;
 pub const PARALLEL_MAX_HOST_DEFAULT: usize = 0;
+const MAX_VARIABLE_NAME_LEN: usize = 128;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Config {
@@ -230,6 +234,7 @@ where
         pos: 0,
         config: Config::default(),
         loaded_configs: 0,
+        variables: HashMap::new(),
     };
     parser.parse()
 }
@@ -239,6 +244,7 @@ struct Parser {
     pos: usize,
     config: Config,
     loaded_configs: usize,
+    variables: HashMap<String, Vec<u8>>,
 }
 
 impl Parser {
@@ -280,9 +286,15 @@ impl Parser {
     }
 
     fn parse_long(&mut self, raw: &str) -> Result<()> {
-        let (name, inline_value) = raw
+        let (mut name, mut inline_value) = raw
             .split_once('=')
             .map_or((raw, None), |(name, value)| (name, Some(value.to_string())));
+        let expand = if let Some(expanded) = name.strip_prefix("expand-") {
+            name = expanded;
+            true
+        } else {
+            false
+        };
 
         if let Some(name) = name.strip_prefix("no-") {
             if inline_value.is_some() {
@@ -292,6 +304,16 @@ impl Parser {
             }
             self.parse_no_long(name)?;
             return Ok(());
+        }
+
+        if expand {
+            if !option_takes_value(name) {
+                return Err(CurlError::Usage(format!(
+                    "option --expand-{name} cannot be used with an option that takes no value"
+                )));
+            }
+            let value = self.value_for(name, inline_value)?;
+            inline_value = Some(self.expand_value(&value)?);
         }
 
         match name {
@@ -304,6 +326,10 @@ impl Parser {
             "config" => {
                 let value = self.value_for(name, inline_value)?;
                 self.insert_config_file(&value)?;
+            }
+            "variable" => {
+                let value = self.value_for(name, inline_value)?;
+                self.set_variable(&value)?;
             }
             "libcurl" => {
                 let value = self.value_for(name, inline_value)?;
@@ -911,6 +937,138 @@ impl Parser {
         self.args.splice(self.pos..self.pos, tokens);
         Ok(())
     }
+
+    fn set_variable(&mut self, input: &str) -> Result<()> {
+        let mut rest = input;
+        let import = if let Some(stripped) = rest.strip_prefix('%') {
+            rest = stripped;
+            true
+        } else {
+            false
+        };
+
+        let name_len = rest
+            .bytes()
+            .take_while(|byte| byte.is_ascii_alphanumeric() || *byte == b'_')
+            .count();
+        if name_len == 0 || name_len >= MAX_VARIABLE_NAME_LEN {
+            return Ok(());
+        }
+
+        let name = &rest[..name_len];
+        rest = &rest[name_len..];
+
+        let mut range = VariableRange::default();
+        if let Some(stripped) = rest.strip_prefix('[') {
+            let Some((parsed_range, after_range)) = parse_variable_range(stripped)? else {
+                return Ok(());
+            };
+            range = parsed_range;
+            rest = after_range;
+        }
+
+        let env_value = import.then(|| std::env::var_os(name)).flatten();
+        let mut content = if let Some(value) = env_value {
+            value.to_string_lossy().into_owned().into_bytes()
+        } else if rest.is_empty() {
+            if import {
+                return Err(CurlError::Usage(format!(
+                    "Variable '{name}' import fail, not set"
+                )));
+            }
+            return Ok(());
+        } else if let Some(value) = rest.strip_prefix('=') {
+            range.apply(value.as_bytes()).to_vec()
+        } else if let Some(path) = rest.strip_prefix('@') {
+            let bytes = if path == "-" {
+                let mut bytes = Vec::new();
+                std::io::stdin().read_to_end(&mut bytes)?;
+                bytes
+            } else {
+                std::fs::read(path).map_err(|error| CurlError::ReadError(error.to_string()))?
+            };
+            range.apply(&bytes).to_vec()
+        } else {
+            return Ok(());
+        };
+
+        if import && !rest.is_empty() && !range.is_default() && !content.is_empty() {
+            content = range.apply(&content).to_vec();
+        }
+
+        self.variables.insert(name.to_string(), content);
+        Ok(())
+    }
+
+    fn expand_value(&self, input: &str) -> Result<String> {
+        let mut output = Vec::new();
+        let bytes = input.as_bytes();
+        let mut pos = 0;
+        let mut replaced = false;
+
+        while let Some(relative) = find_bytes(&bytes[pos..], b"{{") {
+            let start = pos + relative;
+            if start > 0 && bytes[start - 1] == b'\\' {
+                output.extend_from_slice(&bytes[pos..start - 1]);
+                output.extend_from_slice(b"{{");
+                pos = start + 2;
+                continue;
+            }
+
+            output.extend_from_slice(&bytes[pos..start]);
+            let name_start = start + 2;
+            let Some(close_relative) = find_bytes(&bytes[name_start..], b"}}") else {
+                output.extend_from_slice(&bytes[start..]);
+                pos = bytes.len();
+                break;
+            };
+            let close = name_start + close_relative;
+            let expression = std::str::from_utf8(&bytes[name_start..close])
+                .map_err(|_| variable_expansion_error("variable expression is not UTF-8"))?;
+
+            if let Some(expanded) = self.expand_variable_expression(expression)? {
+                if expanded.contains(&0) {
+                    return Err(variable_expansion_error("variable contains null byte"));
+                }
+                output.extend_from_slice(&expanded);
+                replaced = true;
+            } else {
+                output.extend_from_slice(&bytes[start..close + 2]);
+            }
+            pos = close + 2;
+        }
+
+        output.extend_from_slice(&bytes[pos..]);
+
+        if !replaced {
+            return Ok(input.to_string());
+        }
+
+        String::from_utf8(output)
+            .map_err(|_| variable_expansion_error("expanded value is not UTF-8"))
+    }
+
+    fn expand_variable_expression(&self, expression: &str) -> Result<Option<Vec<u8>>> {
+        let (name, functions) = expression
+            .split_once(':')
+            .map_or((expression, ""), |(name, functions)| (name, functions));
+        if name.is_empty()
+            || name.len() >= MAX_VARIABLE_NAME_LEN
+            || !name
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || byte == b'_')
+        {
+            return Ok(None);
+        }
+
+        let mut value = self.variables.get(name).cloned().unwrap_or_default();
+        if !functions.is_empty() {
+            for function in functions.split(':') {
+                value = apply_variable_function(function, &value)?;
+            }
+        }
+        Ok(Some(value))
+    }
 }
 
 impl TransferConfig {
@@ -986,6 +1144,208 @@ impl TransferConfig {
             || self.create_dirs
             || self.http_version != HttpVersionPreference::Any
     }
+}
+
+fn option_takes_value(name: &str) -> bool {
+    matches!(
+        name,
+        "config"
+            | "libcurl"
+            | "variable"
+            | "url"
+            | "parallel-max"
+            | "parallel-max-host"
+            | "request"
+            | "header"
+            | "referer"
+            | "range"
+            | "continue-at"
+            | "data"
+            | "data-ascii"
+            | "data-raw"
+            | "data-binary"
+            | "data-urlencode"
+            | "json"
+            | "url-query"
+            | "form"
+            | "form-string"
+            | "upload-file"
+            | "mail-from"
+            | "mail-rcpt"
+            | "key"
+            | "pubkey"
+            | "knownhosts"
+            | "hostpubmd5"
+            | "hostpubsha256"
+            | "tftp-blksize"
+            | "telnet-option"
+            | "ipfs-gateway"
+            | "proto-default"
+            | "output"
+            | "output-dir"
+            | "dump-header"
+            | "etag-compare"
+            | "etag-save"
+            | "time-cond"
+            | "write-out"
+            | "max-redirs"
+            | "retry"
+            | "retry-delay"
+            | "retry-max-time"
+            | "user"
+            | "oauth2-bearer"
+            | "resolve"
+            | "connect-to"
+            | "proxy"
+            | "proxy-user"
+            | "noproxy"
+            | "connect-timeout"
+            | "max-time"
+            | "max-filesize"
+            | "user-agent"
+            | "cookie"
+            | "cookie-jar"
+            | "trace"
+            | "trace-ascii"
+    )
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+struct VariableRange {
+    start: usize,
+    end: Option<usize>,
+    specified: bool,
+}
+
+impl VariableRange {
+    fn apply<'a>(&self, bytes: &'a [u8]) -> &'a [u8] {
+        if !self.specified {
+            return bytes;
+        }
+        if self.start >= bytes.len() {
+            return &bytes[0..0];
+        }
+
+        let end = self
+            .end
+            .unwrap_or(bytes.len() - 1)
+            .min(bytes.len().saturating_sub(1));
+        &bytes[self.start..=end]
+    }
+
+    fn is_default(&self) -> bool {
+        !self.specified
+    }
+}
+
+fn parse_variable_range(input: &str) -> Result<Option<(VariableRange, &str)>> {
+    let Some(dash) = input.find('-') else {
+        return Ok(None);
+    };
+    let start = &input[..dash];
+    if start.is_empty() || !start.bytes().all(|byte| byte.is_ascii_digit()) {
+        return Ok(None);
+    }
+
+    let after_dash = &input[dash + 1..];
+    let Some(close) = after_dash.find(']') else {
+        return Err(CurlError::Usage("bad --variable byte range".to_string()));
+    };
+    let end = &after_dash[..close];
+    let start = start
+        .parse::<usize>()
+        .map_err(|_| CurlError::Usage("bad --variable byte range".to_string()))?;
+    let end = if end.is_empty() {
+        None
+    } else {
+        if !end.bytes().all(|byte| byte.is_ascii_digit()) {
+            return Err(CurlError::Usage("bad --variable byte range".to_string()));
+        }
+        Some(
+            end.parse::<usize>()
+                .map_err(|_| CurlError::Usage("bad --variable byte range".to_string()))?,
+        )
+    };
+    if end.is_some_and(|end| start > end) {
+        return Err(CurlError::Usage("bad --variable byte range".to_string()));
+    }
+
+    Ok(Some((
+        VariableRange {
+            start,
+            end,
+            specified: true,
+        },
+        &after_dash[close + 1..],
+    )))
+}
+
+fn find_bytes(haystack: &[u8], needle: &[u8]) -> Option<usize> {
+    haystack
+        .windows(needle.len())
+        .position(|window| window == needle)
+}
+
+fn apply_variable_function(function: &str, value: &[u8]) -> Result<Vec<u8>> {
+    match function {
+        "trim" => Ok(trim_ascii_whitespace(value).to_vec()),
+        "json" => Ok(json_quote_bytes(value)),
+        "url" => Ok(percent_encode_bytes(value).into_bytes()),
+        "b64" => Ok(BASE64_STANDARD.encode(value).into_bytes()),
+        "64dec" => Ok(BASE64_STANDARD
+            .decode(value)
+            .unwrap_or_else(|_| b"[64dec-fail]".to_vec())),
+        _ => Err(variable_expansion_error(format!(
+            "unknown variable function in '{function}'"
+        ))),
+    }
+}
+
+fn trim_ascii_whitespace(bytes: &[u8]) -> &[u8] {
+    let start = bytes
+        .iter()
+        .position(|byte| !byte.is_ascii_whitespace())
+        .unwrap_or(bytes.len());
+    let end = bytes
+        .iter()
+        .rposition(|byte| !byte.is_ascii_whitespace())
+        .map(|index| index + 1)
+        .unwrap_or(start);
+    &bytes[start..end]
+}
+
+fn json_quote_bytes(bytes: &[u8]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(bytes.len());
+    for byte in bytes {
+        match *byte {
+            b'\\' => out.extend_from_slice(b"\\\\"),
+            b'"' => out.extend_from_slice(b"\\\""),
+            b'\x08' => out.extend_from_slice(b"\\b"),
+            b'\x0c' => out.extend_from_slice(b"\\f"),
+            b'\n' => out.extend_from_slice(b"\\n"),
+            b'\r' => out.extend_from_slice(b"\\r"),
+            b'\t' => out.extend_from_slice(b"\\t"),
+            0..=31 => out.extend_from_slice(format!("\\u{byte:04x}").as_bytes()),
+            other => out.push(other),
+        }
+    }
+    out
+}
+
+fn percent_encode_bytes(bytes: &[u8]) -> String {
+    let mut out = String::new();
+    for byte in bytes {
+        if byte.is_ascii_alphanumeric() || matches!(*byte, b'-' | b'.' | b'_' | b'~') {
+            out.push(char::from(*byte));
+        } else {
+            out.push_str(&format!("%{byte:02X}"));
+        }
+    }
+    out
+}
+
+fn variable_expansion_error(message: impl Into<String>) -> CurlError {
+    CurlError::Usage(format!("variable expansion failure: {}", message.into()))
 }
 
 fn parse_usize(name: &str, value: &str) -> Result<usize> {
@@ -1286,6 +1646,8 @@ fn print_common_help() {
                --etag-save <file>      Save response ETag to file\n\
            -z, --time-cond <time>      Transfer based on time condition\n\
            -w, --write-out <format>    Write transfer metrics\n\
+               --variable <name=data>  Set command-line variable\n\
+               --expand-* <value>      Expand variables in option value\n\
                --libcurl <file>        Generate libcurl code\n\
            -X, --request <method>      Specify request method\n\
            -u, --user <user:pass>      Server user and password\n\
@@ -1770,6 +2132,117 @@ mod tests {
                 "https://example.com"
             ]
         );
+    }
+
+    #[test]
+    fn expands_command_line_variables() {
+        let config = parse_args([
+            "-q",
+            "--variable",
+            "name=  hello world ",
+            "--expand-data",
+            "{{name:trim:url}}",
+            "https://example.com",
+        ])
+        .unwrap();
+
+        assert_eq!(config.transfers[0].data[0].value, "hello%20world");
+    }
+
+    #[test]
+    fn expands_variables_with_range_and_base64_functions() {
+        let config = parse_args([
+            "-q",
+            "--variable",
+            "slice[5-9]=0123456789abcdef",
+            "--expand-variable",
+            "encoded={{slice:b64}}",
+            "--expand-url",
+            "https://example.com/{{encoded:64dec}}",
+        ])
+        .unwrap();
+
+        assert_eq!(config.transfers[0].urls, ["https://example.com/56789"]);
+    }
+
+    #[test]
+    fn expands_file_variables_and_json_quotes() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("value.txt");
+        std::fs::write(&path, b" \n\"quoted\"\n ").unwrap();
+
+        let config = parse_args([
+            "-q",
+            "--variable",
+            &format!("body@{}", path.display()),
+            "--expand-data",
+            "{{body:trim:json}}",
+            "https://example.com",
+        ])
+        .unwrap();
+
+        assert_eq!(config.transfers[0].data[0].value, "\\\"quoted\\\"");
+    }
+
+    #[test]
+    fn escaped_invalid_and_missing_variables_match_curl_expansion_shape() {
+        let config = parse_args([
+            "-q",
+            "--variable",
+            "name=value",
+            "--expand-data",
+            r"1{{name}}2\{{raw}}3{{unset}}4{{not.good}}5{{}}",
+            "https://example.com",
+        ])
+        .unwrap();
+
+        assert_eq!(
+            config.transfers[0].data[0].value,
+            "1value2{{raw}}34{{not.good}}5{{}}"
+        );
+    }
+
+    #[test]
+    fn missing_imported_environment_variable_is_an_error() {
+        let error = parse_args([
+            "-q",
+            "--variable",
+            "%CURL_RUST_TEST_MISSING_VARIABLE_91D34294",
+            "--expand-data",
+            "{{CURL_RUST_TEST_MISSING_VARIABLE_91D34294}}",
+            "https://example.com",
+        ])
+        .unwrap_err();
+
+        assert!(error.to_string().contains("import fail"));
+    }
+
+    #[test]
+    fn variable_expansion_rejects_unknown_functions_and_raw_nul_bytes() {
+        let error = parse_args([
+            "-q",
+            "--variable",
+            "name=hello",
+            "--expand-data",
+            "{{name:trim,url}}",
+            "https://example.com",
+        ])
+        .unwrap_err();
+        assert!(error.to_string().contains("unknown variable function"));
+
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("nul.bin");
+        std::fs::write(&path, b"\0hello").unwrap();
+        let error = parse_args([
+            "-q",
+            "--variable",
+            &format!("body@{}", path.display()),
+            "--expand-data",
+            "{{body}}",
+            "https://example.com",
+        ])
+        .unwrap_err();
+        assert!(error.to_string().contains("null byte"));
     }
 
     #[test]
