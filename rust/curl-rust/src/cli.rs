@@ -49,6 +49,7 @@ pub struct TransferConfig {
     pub tftp_no_options: bool,
     pub telnet_options: Vec<String>,
     pub ipfs_gateway: Option<String>,
+    pub proto_default: Option<String>,
     pub output: Option<String>,
     pub output_dir: Option<PathBuf>,
     pub remote_name: bool,
@@ -155,6 +156,7 @@ impl Default for TransferConfig {
             tftp_no_options: false,
             telnet_options: Vec::new(),
             ipfs_gateway: None,
+            proto_default: None,
             output: None,
             output_dir: None,
             remote_name: false,
@@ -462,6 +464,10 @@ impl Parser {
                 let value = self.value_for(name, inline_value)?;
                 self.current().ipfs_gateway = Some(parse_nonempty_string(name, value)?);
             }
+            "proto-default" => {
+                let value = self.value_for(name, inline_value)?;
+                self.current().proto_default = Some(parse_protocol_name(name, value)?);
+            }
             "output" => {
                 let value = self.value_for(name, inline_value)?;
                 self.current().output = Some(value);
@@ -628,6 +634,7 @@ impl Parser {
             "mail-rcpt-allowfails" => self.current().mail_rcpt_allowfails = false,
             "compressed-ssh" => self.current().compressed_ssh = false,
             "tftp-no-options" => self.current().tftp_no_options = false,
+            "proto-default" => self.current().proto_default = None,
             "compressed" => self.current().compressed = false,
             "verbose" => self.current().verbose = false,
             "progress-meter" => self.current().silent = true,
@@ -932,6 +939,7 @@ impl TransferConfig {
             || self.tftp_no_options
             || !self.telnet_options.is_empty()
             || self.ipfs_gateway.is_some()
+            || self.proto_default.is_some()
             || self.output.is_some()
             || self.output_dir.is_some()
             || self.remote_name
@@ -1117,6 +1125,17 @@ fn parse_nonempty_string(name: &str, value: String) -> Result<String> {
     }
 }
 
+fn parse_protocol_name(name: &str, value: String) -> Result<String> {
+    let value = parse_nonempty_string(name, value)?.to_ascii_lowercase();
+    match value.as_str() {
+        "dict" | "file" | "ftp" | "ftps" | "gopher" | "gophers" | "http" | "https" | "imap"
+        | "imaps" | "ipfs" | "ipns" | "ldap" | "ldaps" | "mqtt" | "mqtts" | "pop3" | "pop3s"
+        | "rtsp" | "scp" | "sftp" | "smb" | "smbs" | "smtp" | "smtps" | "telnet" | "tftp"
+        | "ws" | "wss" => Ok(value),
+        _ => Err(CurlError::UnsupportedProtocol(value)),
+    }
+}
+
 fn append_cookie_header(cookie: &mut Option<String>, value: String) {
     if let Some(existing) = cookie {
         if !existing.is_empty() && !value.is_empty() {
@@ -1245,6 +1264,7 @@ fn print_common_help() {
                --tftp-no-options       Do not send TFTP options\n\
            -t, --telnet-option <opt>   Set telnet option\n\
                --ipfs-gateway <URL>    Gateway for IPFS/IPNS URLs\n\
+               --proto-default <proto> Default protocol for schemeless URLs\n\
                --url-query <data>      Add URL query data\n\
                --json <data>           JSON request body\n\
            -e, --referer <url>         Send Referer header\n\
@@ -1888,6 +1908,30 @@ mod tests {
         ])
         .unwrap();
         assert!(!config.transfers[0].disallow_username_in_url);
+    }
+
+    #[test]
+    fn parses_proto_default_option() {
+        let config = parse_args(["-q", "--proto-default", "FILE", "/tmp/input.txt"]).unwrap();
+        assert_eq!(config.transfers[0].proto_default.as_deref(), Some("file"));
+
+        let config = parse_args([
+            "-q",
+            "--proto-default",
+            "file",
+            "--no-proto-default",
+            "http://example.com",
+        ])
+        .unwrap();
+        assert_eq!(config.transfers[0].proto_default, None);
+
+        let config = parse_args(["-q", "--proto-default", "ftp", "example.com"]).unwrap();
+        assert_eq!(config.transfers[0].proto_default.as_deref(), Some("ftp"));
+
+        let error = parse_args(["-q", "--proto-default", "doesnotexist"]).unwrap_err();
+        assert!(
+            matches!(error, CurlError::UnsupportedProtocol(protocol) if protocol == "doesnotexist")
+        );
     }
 
     #[test]

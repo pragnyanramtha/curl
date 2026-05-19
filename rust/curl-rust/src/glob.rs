@@ -17,6 +17,16 @@ pub fn expand_url(input: &str, globoff: bool) -> Result<Vec<ExpandedUrl>> {
     expand_recursive(input, Vec::new())
 }
 
+pub fn apply_default_protocol(input: &str, default_protocol: Option<&str>) -> String {
+    if input.contains("://") {
+        return input.to_string();
+    }
+    let Some(default_protocol) = default_protocol else {
+        return input.to_string();
+    };
+    format!("{default_protocol}://{input}")
+}
+
 fn expand_recursive(input: &str, variables: Vec<String>) -> Result<Vec<ExpandedUrl>> {
     let Some(token) = find_token(input)? else {
         return Ok(vec![ExpandedUrl {
@@ -202,6 +212,23 @@ mod tests {
     fn leaves_ipv6_brackets_alone() {
         let expanded = expand_url("http://[::1]/", false).unwrap();
         assert_eq!(expanded[0].url, "http://[::1]/");
+    }
+
+    #[test]
+    fn applies_default_protocol_to_schemeless_urls() {
+        assert_eq!(
+            apply_default_protocol("/tmp/file.txt", Some("file")),
+            "file:///tmp/file.txt"
+        );
+        assert_eq!(
+            apply_default_protocol("example.com", Some("https")),
+            "https://example.com"
+        );
+        assert_eq!(
+            apply_default_protocol("http://example.com", Some("https")),
+            "http://example.com"
+        );
+        assert_eq!(apply_default_protocol("example.com", None), "example.com");
     }
 
     #[test]

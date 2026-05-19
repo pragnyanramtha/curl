@@ -378,7 +378,8 @@ fn effective_urls(
 ) -> Result<Vec<String>> {
     let mut urls = Vec::new();
     for raw in &transfer.urls {
-        for expanded in glob::expand_url(raw, transfer.globoff)? {
+        let raw = glob::apply_default_protocol(raw, transfer.proto_default.as_deref());
+        for expanded in glob::expand_url(&raw, transfer.globoff)? {
             let effective_url =
                 ipfs::maybe_rewrite_url(&expanded.url, transfer.ipfs_gateway.as_deref())?
                     .unwrap_or(expanded.url);

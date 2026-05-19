@@ -218,7 +218,8 @@ fn spawn_parallel_job(active: &mut JoinSet<Result<(usize, i32)>>, job: ParallelJ
 fn expand_urls(transfer: &TransferConfig) -> Result<Vec<glob::ExpandedUrl>> {
     let mut expanded = Vec::new();
     for url in &transfer.urls {
-        expanded.extend(glob::expand_url(url, transfer.globoff)?);
+        let url = glob::apply_default_protocol(url, transfer.proto_default.as_deref());
+        expanded.extend(glob::expand_url(&url, transfer.globoff)?);
     }
     Ok(expanded)
 }
