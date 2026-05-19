@@ -102,6 +102,7 @@ pub struct TransferConfig {
     pub globoff: bool,
     pub create_dirs: bool,
     pub http_version: HttpVersionPreference,
+    pub ssl_version: Option<SslVersionPreference>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -117,6 +118,14 @@ pub enum HttpVersionPreference {
     Http11,
     Http2,
     Http2PriorKnowledge,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SslVersionPreference {
+    TlsV1_0,
+    TlsV1_1,
+    TlsV1_2,
+    TlsV1_3,
 }
 
 impl Default for Config {
@@ -211,6 +220,7 @@ impl Default for TransferConfig {
             globoff: false,
             create_dirs: false,
             http_version: HttpVersionPreference::Any,
+            ssl_version: None,
         }
     }
 }
@@ -631,6 +641,12 @@ impl Parser {
             "http3" | "http3-only" => {
                 return Err(CurlError::Unsupported(format!("--{name}")));
             }
+            "tlsv1" | "tlsv1.0" => self.current().ssl_version = Some(SslVersionPreference::TlsV1_0),
+            "tlsv1.1" => self.current().ssl_version = Some(SslVersionPreference::TlsV1_1),
+            "tlsv1.2" => self.current().ssl_version = Some(SslVersionPreference::TlsV1_2),
+            "tlsv1.3" => self.current().ssl_version = Some(SslVersionPreference::TlsV1_3),
+            "proxy-tlsv1" => return Err(CurlError::Unsupported(format!("--{name}"))),
+            "sslv2" | "sslv3" => warn_deprecated_ssl_option(name),
             other => return Err(CurlError::Usage(format!("unknown option --{other}"))),
         }
 
@@ -686,8 +702,8 @@ impl Parser {
                 'h' => {
                     if rest.is_empty() {
                         self.config.show_help = true;
+                        self.config.help_category = self.optional_help_category(None);
                     } else {
-                        self.append_header_value(rest.to_string())?;
                         break;
                     }
                 }
@@ -829,9 +845,9 @@ impl Parser {
                 'v' => self.current().verbose = true,
                 'g' => self.current().globoff = true,
                 '0' => self.current().http_version = HttpVersionPreference::Http10,
-                '1' => self.current().http_version = HttpVersionPreference::Http11,
-                '2' => self.current().http_version = HttpVersionPreference::Http2,
-                '?' => self.config.show_help = true,
+                '1' => self.current().ssl_version = Some(SslVersionPreference::TlsV1_0),
+                '2' => warn_deprecated_ssl_option("sslv2"),
+                '3' => warn_deprecated_ssl_option("sslv3"),
                 other => return Err(CurlError::Usage(format!("unknown option -{other}"))),
             }
 
@@ -1185,6 +1201,7 @@ impl TransferConfig {
             || self.globoff
             || self.create_dirs
             || self.http_version != HttpVersionPreference::Any
+            || self.ssl_version.is_some()
     }
 }
 
@@ -1536,6 +1553,10 @@ fn parse_protocol_name(name: &str, value: String) -> Result<String> {
         | "ws" | "wss" => Ok(value),
         _ => Err(CurlError::UnsupportedProtocol(value)),
     }
+}
+
+fn warn_deprecated_ssl_option(name: &str) {
+    eprintln!("Warning: --{name} is deprecated and has no function anymore");
 }
 
 fn append_cookie_header(cookie: &mut Option<String>, value: String) {
@@ -2403,6 +2424,11 @@ mod tests {
         assert!(config.show_help);
         assert_eq!(config.help_category.as_deref(), Some("ldap"));
         assert!(config.transfers.is_empty());
+
+        let config = parse_args(["-q", "-h", "tls"]).unwrap();
+        assert!(config.show_help);
+        assert_eq!(config.help_category.as_deref(), Some("tls"));
+        assert!(config.transfers.is_empty());
     }
 
     #[test]
@@ -2411,6 +2437,22 @@ mod tests {
         assert!(config.show_help);
         assert!(config.show_version);
         assert_eq!(config.help_category, None);
+    }
+
+    #[test]
+    fn separates_short_help_from_header_alias() {
+        let config = parse_args(["-q", "-h"]).unwrap();
+        assert!(config.show_help);
+
+        let config = parse_args(["-q", "-HAccept: text/plain", "https://example.com"]).unwrap();
+        assert_eq!(config.transfers[0].headers, ["Accept: text/plain"]);
+
+        let config = parse_args(["-q", "-hAccept:", "https://example.com"]).unwrap();
+        assert!(!config.show_help);
+        assert!(config.transfers[0].headers.is_empty());
+
+        let error = parse_args(["-q", "-?", "https://example.com"]).unwrap_err();
+        assert!(error.to_string().contains("unknown option -?"));
     }
 
     #[test]
@@ -2426,6 +2468,47 @@ mod tests {
             config.transfers[0].http_version,
             HttpVersionPreference::Http2PriorKnowledge
         );
+
+        let config = parse_args(["-q", "-0", "https://example.com"]).unwrap();
+        assert_eq!(
+            config.transfers[0].http_version,
+            HttpVersionPreference::Http10
+        );
+
+        let config = parse_args(["-q", "--http1.1", "https://example.com"]).unwrap();
+        assert_eq!(
+            config.transfers[0].http_version,
+            HttpVersionPreference::Http11
+        );
+    }
+
+    #[test]
+    fn tls_short_aliases_are_not_http_version_aliases() {
+        let config = parse_args(["-q", "-1", "https://example.com"]).unwrap();
+        assert_eq!(config.transfers[0].http_version, HttpVersionPreference::Any);
+        assert_eq!(
+            config.transfers[0].ssl_version,
+            Some(SslVersionPreference::TlsV1_0)
+        );
+
+        let config = parse_args(["-q", "--tlsv1.2", "https://example.com"]).unwrap();
+        assert_eq!(config.transfers[0].http_version, HttpVersionPreference::Any);
+        assert_eq!(
+            config.transfers[0].ssl_version,
+            Some(SslVersionPreference::TlsV1_2)
+        );
+
+        let config = parse_args([
+            "-q",
+            "-2",
+            "-3",
+            "--sslv2",
+            "--sslv3",
+            "https://example.com",
+        ])
+        .unwrap();
+        assert_eq!(config.transfers[0].http_version, HttpVersionPreference::Any);
+        assert_eq!(config.transfers[0].ssl_version, None);
     }
 
     #[test]

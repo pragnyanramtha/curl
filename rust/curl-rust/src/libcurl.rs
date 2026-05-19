@@ -4,7 +4,7 @@ use std::path::Path;
 
 use url::Url;
 
-use crate::cli::{Config, ContinueAt, HttpVersionPreference, TransferConfig};
+use crate::cli::{Config, ContinueAt, HttpVersionPreference, SslVersionPreference, TransferConfig};
 use crate::data::{self, PreparedBody};
 use crate::error::{CurlError, Result};
 use crate::{glob, ipfs, transfer};
@@ -333,6 +333,7 @@ fn write_request(out: &mut String, render: &RenderTransfer<'_>, url: &str) -> Re
         emit_string_setopt(out, "CURLOPT_USERAGENT", &transfer::default_user_agent());
     }
     emit_http_version(out, transfer.http_version);
+    emit_ssl_version(out, transfer.ssl_version);
     emit_long_setopt(out, "CURLOPT_TCP_KEEPALIVE", 1);
     out.push('\n');
     writeln!(out, "  result = curl_easy_perform(curl);").unwrap();
@@ -449,6 +450,17 @@ fn emit_http_version(out: &mut String, version: HttpVersionPreference) {
         HttpVersionPreference::Http2PriorKnowledge => "CURL_HTTP_VERSION_2_PRIOR_KNOWLEDGE",
     };
     emit_raw_setopt(out, "CURLOPT_HTTP_VERSION", value);
+}
+
+fn emit_ssl_version(out: &mut String, version: Option<SslVersionPreference>) {
+    let value = match version {
+        Some(SslVersionPreference::TlsV1_0) => "CURL_SSLVERSION_TLSv1_0",
+        Some(SslVersionPreference::TlsV1_1) => "CURL_SSLVERSION_TLSv1_1",
+        Some(SslVersionPreference::TlsV1_2) => "CURL_SSLVERSION_TLSv1_2",
+        Some(SslVersionPreference::TlsV1_3) => "CURL_SSLVERSION_TLSv1_3",
+        None => return,
+    };
+    emit_raw_setopt(out, "CURLOPT_SSLVERSION", value);
 }
 
 fn emit_slist_append(out: &mut String, slist: &str, value: &str) {
