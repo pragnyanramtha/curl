@@ -59,6 +59,65 @@ env:
   WOLFSSL_VERSION: 5.9.1
 
 jobs:
+  rust-sidecar:
+    name: 'Rust sidecar'
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    steps:
+      - name: 'install prereqs'
+        run: |
+          sudo find /etc/apt/sources.list.d -type f -not -name 'ubuntu.sources' -delete -print
+          sudo sed -i 's/priority:1/priority:9/' /etc/apt/apt-mirrors.txt; cat /etc/apt/apt-mirrors.txt
+          sudo apt-get -o Dpkg::Use-Pty=0 update
+          sudo apt-get -o Dpkg::Use-Pty=0 install \
+            autoconf automake libtool pkgconf ninja-build libssl-dev
+
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
+
+      - name: 'rust toolchain'
+        run: rustup component add rustfmt clippy
+
+      - name: 'install test prereqs'
+        run: |
+          python3 -m venv ~/venv
+          ~/venv/bin/pip --disable-pip-version-check --no-input --no-cache-dir install --progress-bar off --prefer-binary -r tests/requirements.txt
+
+      - name: 'cargo fmt'
+        run: cargo fmt --all --check
+
+      - name: 'cargo test'
+        run: CARGO_TARGET_DIR=/tmp/curl-rust-target cargo test -p curl-rust --locked
+
+      - name: 'cargo clippy'
+        run: CARGO_TARGET_DIR=/tmp/curl-rust-target cargo clippy -p curl-rust --all-targets --locked -- -D warnings
+
+      - name: 'cargo build'
+        run: CARGO_TARGET_DIR=/tmp/curl-rust-target cargo build -p curl-rust --locked --bin curl
+
+      - name: 'curl-rust --version'
+        run: CARGO_TARGET_DIR=/tmp/curl-rust-target cargo run -q -p curl-rust --locked -- --version
+
+      - name: 'cmake rust sidecar'
+        run: |
+          source ~/venv/bin/activate
+          cmake -S . -B bld-rust-cm -G Ninja -DBUILD_RUST_CURL_EXE=ON -DCURL_USE_OPENSSL=ON
+          cmake --build bld-rust-cm --verbose
+          cmake --build bld-rust-cm --verbose --target curl-rust-test
+          cmake --build bld-rust-cm --verbose --target curl-rust-corpus-test
+
+      - name: 'autotools rust sidecar'
+        run: |
+          source ~/venv/bin/activate
+          autoreconf -fi
+          mkdir bld-rust-am
+          cd bld-rust-am
+          ../configure --enable-rust-curl --with-openssl --enable-debug --disable-dependency-tracking --enable-option-checking=fatal
+          make V=1
+          make V=1 -C rust rust-test
+          make V=1 -C rust rust-corpus-test
+
   linux:
     name: ${{ matrix.build.generate && 'CM' || 'AM' }} ${{ matrix.build.name }}
     runs-on: ${{ matrix.build.image || 'ubuntu-latest' }}
