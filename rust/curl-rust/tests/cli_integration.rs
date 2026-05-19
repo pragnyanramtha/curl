@@ -6057,6 +6057,147 @@ fn sftp_upload_file_writes_remote_file() {
 }
 
 #[test]
+fn sftp_upload_create_dirs_makes_missing_parent_directories() {
+    let Some(fixture) = SshdFixture::new() else {
+        return;
+    };
+    let temp = tempdir().unwrap();
+    let upload = temp.path().join("payload.txt");
+    std::fs::write(&upload, b"created parents\n").unwrap();
+    let remote = fixture
+        .root
+        .join("missing-parent")
+        .join("nested")
+        .join("payload.txt");
+    let url = fixture.url_for("sftp", &remote);
+
+    let mut command = Command::cargo_bin("curl").unwrap();
+    command.args([
+        "-q",
+        "-sS",
+        "--ftp-create-dirs",
+        "-T",
+        upload.to_str().unwrap(),
+    ]);
+    command.args(fixture.auth_args());
+    command.arg(url);
+    command.assert().success().stdout("");
+
+    assert_eq!(std::fs::read(remote).unwrap(), b"created parents\n");
+}
+
+#[test]
+fn sftp_upload_append_preserves_existing_remote_bytes() {
+    let Some(fixture) = SshdFixture::new() else {
+        return;
+    };
+    let temp = tempdir().unwrap();
+    let upload = temp.path().join("payload.txt");
+    std::fs::write(&upload, b"new").unwrap();
+    let remote = fixture.root.join("append-target.txt");
+    std::fs::write(&remote, b"old ").unwrap();
+    let url = fixture.url_for("sftp", &remote);
+
+    let mut command = Command::cargo_bin("curl").unwrap();
+    command.args(["-q", "-sS", "--append", "-T", upload.to_str().unwrap()]);
+    command.args(fixture.auth_args());
+    command.arg(url);
+    command.assert().success().stdout("");
+
+    assert_eq!(std::fs::read(remote).unwrap(), b"old new");
+}
+
+#[test]
+fn sftp_upload_continue_at_fixed_offset_skips_local_bytes() {
+    let Some(fixture) = SshdFixture::new() else {
+        return;
+    };
+    let temp = tempdir().unwrap();
+    let upload = temp.path().join("payload.txt");
+    std::fs::write(&upload, b"hello").unwrap();
+    let remote = fixture.root.join("resume-fixed.txt");
+    std::fs::write(&remote, b"he").unwrap();
+    let url = fixture.url_for("sftp", &remote);
+
+    let mut command = Command::cargo_bin("curl").unwrap();
+    command.args([
+        "-q",
+        "-sS",
+        "--continue-at",
+        "2",
+        "-T",
+        upload.to_str().unwrap(),
+    ]);
+    command.args(fixture.auth_args());
+    command.arg(url);
+    command.assert().success().stdout("");
+
+    assert_eq!(std::fs::read(remote).unwrap(), b"hello");
+}
+
+#[test]
+fn sftp_upload_continue_at_auto_uses_remote_size() {
+    let Some(fixture) = SshdFixture::new() else {
+        return;
+    };
+    let temp = tempdir().unwrap();
+    let upload = temp.path().join("payload.txt");
+    std::fs::write(&upload, b"hello").unwrap();
+    let remote = fixture.root.join("resume-auto.txt");
+    std::fs::write(&remote, b"he").unwrap();
+    let url = fixture.url_for("sftp", &remote);
+
+    let mut command = Command::cargo_bin("curl").unwrap();
+    command.args(["-q", "-sS", "-C", "-", "-T", upload.to_str().unwrap()]);
+    command.args(fixture.auth_args());
+    command.arg(url);
+    command.assert().success().stdout("");
+
+    assert_eq!(std::fs::read(remote).unwrap(), b"hello");
+}
+
+#[test]
+fn sftp_upload_continue_at_auto_missing_remote_uploads_full_file() {
+    let Some(fixture) = SshdFixture::new() else {
+        return;
+    };
+    let temp = tempdir().unwrap();
+    let upload = temp.path().join("payload.txt");
+    std::fs::write(&upload, b"fresh upload\n").unwrap();
+    let remote = fixture.root.join("resume-auto-missing.txt");
+    let url = fixture.url_for("sftp", &remote);
+
+    let mut command = Command::cargo_bin("curl").unwrap();
+    command.args(["-q", "-sS", "-C", "-", "-T", upload.to_str().unwrap()]);
+    command.args(fixture.auth_args());
+    command.arg(url);
+    command.assert().success().stdout("");
+
+    assert_eq!(std::fs::read(remote).unwrap(), b"fresh upload\n");
+}
+
+#[test]
+fn sftp_upload_continue_at_complete_skips_write() {
+    let Some(fixture) = SshdFixture::new() else {
+        return;
+    };
+    let temp = tempdir().unwrap();
+    let upload = temp.path().join("payload.txt");
+    std::fs::write(&upload, b"complete").unwrap();
+    let remote = fixture.root.join("resume-complete.txt");
+    std::fs::write(&remote, b"complete").unwrap();
+    let url = fixture.url_for("sftp", &remote);
+
+    let mut command = Command::cargo_bin("curl").unwrap();
+    command.args(["-q", "-sS", "-C", "-", "-T", upload.to_str().unwrap()]);
+    command.args(fixture.auth_args());
+    command.arg(url);
+    command.assert().success().stdout("");
+
+    assert_eq!(std::fs::read(remote).unwrap(), b"complete");
+}
+
+#[test]
 fn sftp_upload_postquote_removes_uploaded_file() {
     let Some(fixture) = SshdFixture::new() else {
         return;

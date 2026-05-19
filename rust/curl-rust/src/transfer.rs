@@ -1,5 +1,5 @@
 use std::error::Error as StdError;
-use std::io::{self, Read, Write};
+use std::io::{self, Read, Seek, SeekFrom, Write};
 use std::net::{IpAddr, SocketAddr, TcpStream as StdTcpStream, ToSocketAddrs};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -8,7 +8,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use percent_encoding::percent_decode;
 use ssh2::{
     CheckResult, ErrorCode as SshErrorCode, FileStat as SftpFileStat, HashType, KnownHostFileKind,
-    MethodType, RenameFlags, Session,
+    MethodType, OpenFlags, OpenType, RenameFlags, Session,
 };
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpStream, UdpSocket};
@@ -1904,7 +1904,14 @@ fn validate_ssh_transfer(
             "--oauth2-bearer for {scheme} URLs"
         )));
     }
-    if transfer.range.is_some() || transfer.continue_at.is_some() {
+    if transfer.range.is_some() {
+        return Err(CurlError::Unsupported(format!(
+            "range/resume for {scheme} URLs"
+        )));
+    }
+    if transfer.continue_at.is_some()
+        && !(protocol == SshProtocol::Sftp && transfer.upload_file.is_some())
+    {
         return Err(CurlError::Unsupported(format!(
             "range/resume for {scheme} URLs"
         )));
@@ -1942,7 +1949,7 @@ fn run_ssh_blocking(
 
     if let Some(upload_body) = upload_body {
         if protocol == SshProtocol::Sftp {
-            ssh_sftp_upload(&session, &path, &upload_body)?;
+            ssh_sftp_upload(transfer, &session, &path, &upload_body)?;
             return Ok(SshTransferResult::Upload { postquote });
         }
         return Err(CurlError::Unsupported(
@@ -2345,12 +2352,78 @@ fn sftp_quote_result(
     }
 }
 
-fn ssh_sftp_upload(session: &Session, path: &str, body: &[u8]) -> Result<()> {
+fn ssh_sftp_upload(
+    transfer: &TransferConfig,
+    session: &Session,
+    path: &str,
+    body: &[u8],
+) -> Result<()> {
     let sftp = session.sftp().map_err(ssh_error_to_curl)?;
-    let mut file = sftp.create(Path::new(path)).map_err(ssh_error_to_curl)?;
+    let path = Path::new(path);
+    let mut offset = 0_usize;
+    let flags = if transfer.ftp_append {
+        OpenFlags::WRITE | OpenFlags::CREATE | OpenFlags::APPEND
+    } else {
+        match transfer.continue_at {
+            Some(ContinueAt::Offset(value)) if value > 0 => {
+                offset = usize::try_from(value).unwrap_or(usize::MAX);
+                OpenFlags::WRITE
+            }
+            Some(ContinueAt::Auto) => {
+                if let Ok(stat) = sftp.stat(path)
+                    && let Some(size) = stat.size
+                    && size > 0
+                {
+                    offset = usize::try_from(size).unwrap_or(usize::MAX);
+                    OpenFlags::WRITE
+                } else {
+                    OpenFlags::WRITE | OpenFlags::TRUNCATE
+                }
+            }
+            _ => OpenFlags::WRITE | OpenFlags::TRUNCATE,
+        }
+    };
+
+    if transfer.continue_at.is_some() && !transfer.ftp_append && offset > 0 && offset >= body.len()
+    {
+        return Ok(());
+    }
+
+    let mut file = match sftp.open_mode(path, flags, 0o644, OpenType::File) {
+        Ok(file) => file,
+        Err(error) if transfer.ftp_create_dirs => {
+            ssh_sftp_create_missing_dirs(&sftp, path);
+            sftp.open_mode(path, flags, 0o644, OpenType::File)
+                .map_err(ssh_error_to_curl)?
+        }
+        Err(error) => return Err(ssh_error_to_curl(error)),
+    };
+    if offset > 0 && !transfer.ftp_append {
+        file.seek(SeekFrom::Start(offset as u64))
+            .map_err(|_| CurlError::FtpCouldntUseRest)?;
+    }
+    let body = if offset > 0 && !transfer.ftp_append {
+        &body[offset..]
+    } else {
+        body
+    };
     file.write_all(body).map_err(|_| CurlError::SendError)?;
     file.close().map_err(ssh_error_to_curl)?;
     Ok(())
+}
+
+fn ssh_sftp_create_missing_dirs(sftp: &ssh2::Sftp, path: &Path) {
+    let Some(parent) = path.parent() else {
+        return;
+    };
+    let mut current = PathBuf::new();
+    for component in parent.components() {
+        current.push(component.as_os_str());
+        if current.parent().is_none() {
+            continue;
+        }
+        let _ = sftp.mkdir(&current, 0o755);
+    }
 }
 
 fn ssh_connect(transfer: &TransferConfig, url: &Url) -> Result<Session> {
