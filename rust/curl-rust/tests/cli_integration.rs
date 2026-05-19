@@ -5818,6 +5818,180 @@ fn sftp_list_only_outputs_directory_names() {
 }
 
 #[test]
+fn sftp_quote_mkdir_runs_before_download() {
+    let Some(fixture) = SshdFixture::new() else {
+        return;
+    };
+    let remote_dir = fixture.root.join("quote created");
+    let quote = format!("mkdir \"{}\"", remote_dir.display());
+    let url = fixture.url_for("sftp", &fixture.root.join("data.txt"));
+
+    let mut command = Command::cargo_bin("curl").unwrap();
+    command.args(["-q", "-sS", "--quote", &quote]);
+    command.args(fixture.auth_args());
+    command.arg(url);
+    command.assert().success().stdout("ssh fixture body\n");
+
+    assert!(remote_dir.is_dir());
+}
+
+#[test]
+fn sftp_quote_failure_returns_21_before_transfer() {
+    let Some(fixture) = SshdFixture::new() else {
+        return;
+    };
+    let missing = fixture.root.join("missing-for-quote.txt");
+    let quote = format!("rm {}", missing.display());
+    let url = fixture.url_for("sftp", &fixture.root.join("data.txt"));
+
+    let mut command = Command::cargo_bin("curl").unwrap();
+    command.args(["-q", "-sS", "--quote", &quote]);
+    command.args(fixture.auth_args());
+    command.arg(url);
+    command.assert().failure().code(21).stdout("");
+}
+
+#[test]
+fn sftp_quote_acceptfail_continues() {
+    let Some(fixture) = SshdFixture::new() else {
+        return;
+    };
+    let missing = fixture.root.join("missing-for-accepted-quote.txt");
+    let quote = format!("*rm {}", missing.display());
+    let url = fixture.url_for("sftp", &fixture.root.join("data.txt"));
+
+    let mut command = Command::cargo_bin("curl").unwrap();
+    command.args(["-q", "-sS", "--quote", &quote]);
+    command.args(fixture.auth_args());
+    command.arg(url);
+    command.assert().success().stdout("ssh fixture body\n");
+}
+
+#[test]
+fn sftp_quote_statvfs_writes_header_data() {
+    let Some(fixture) = SshdFixture::new() else {
+        return;
+    };
+    let quote = format!("statvfs {}", fixture.root.display());
+    let url = fixture.url_for("sftp", &fixture.root.join("data.txt"));
+
+    let mut command = Command::cargo_bin("curl").unwrap();
+    command.args(["-q", "-sS", "-i", "--quote", &quote]);
+    command.args(fixture.auth_args());
+    command.arg(url);
+    let output = command.output().unwrap();
+
+    assert!(output.status.success());
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    assert!(stdout.starts_with("statvfs:\nf_bsize: "));
+    assert!(stdout.contains("\nf_namemax: "));
+    assert!(stdout.ends_with("ssh fixture body\n"));
+}
+
+#[test]
+fn sftp_quote_rejects_trailing_junk() {
+    let Some(fixture) = SshdFixture::new() else {
+        return;
+    };
+    let remote_dir = fixture.root.join("junk-dir");
+    let quote = format!("mkdir {} trailing", remote_dir.display());
+    let url = fixture.url_for("sftp", &fixture.root.join("data.txt"));
+
+    let mut command = Command::cargo_bin("curl").unwrap();
+    command.args(["-q", "-sS", "--quote", &quote]);
+    command.args(fixture.auth_args());
+    command.arg(url);
+    command.assert().failure().code(21).stdout("");
+
+    assert!(!remote_dir.exists());
+}
+
+#[test]
+fn sftp_prequote_prefix_is_ignored() {
+    let Some(fixture) = SshdFixture::new() else {
+        return;
+    };
+    let remote_dir = fixture.root.join("sftp-prequote-ignored");
+    let quote = format!("+mkdir {}", remote_dir.display());
+    let url = fixture.url_for("sftp", &fixture.root.join("data.txt"));
+
+    let mut command = Command::cargo_bin("curl").unwrap();
+    command.args(["-q", "-sS", "--quote", &quote]);
+    command.args(fixture.auth_args());
+    command.arg(url);
+    command.assert().success().stdout("ssh fixture body\n");
+
+    assert!(!remote_dir.exists());
+}
+
+#[test]
+fn sftp_postquote_rename_runs_after_download() {
+    let Some(fixture) = SshdFixture::new() else {
+        return;
+    };
+    let source = fixture.root.join("data.txt");
+    let renamed = fixture.root.join("data-renamed.txt");
+    let quote = format!("-rename {} {}", source.display(), renamed.display());
+    let url = fixture.url_for("sftp", &source);
+
+    let mut command = Command::cargo_bin("curl").unwrap();
+    command.args(["-q", "-sS", "--quote", &quote]);
+    command.args(fixture.auth_args());
+    command.arg(url);
+    command.assert().success().stdout("ssh fixture body\n");
+
+    assert!(!source.exists());
+    assert_eq!(std::fs::read(renamed).unwrap(), b"ssh fixture body\n");
+}
+
+#[test]
+fn sftp_postquote_failure_returns_21_after_body() {
+    let Some(fixture) = SshdFixture::new() else {
+        return;
+    };
+    let source = fixture.root.join("data.txt");
+    let quote = format!("-mkdir {}", source.display());
+    let url = fixture.url_for("sftp", &source);
+
+    let mut command = Command::cargo_bin("curl").unwrap();
+    command.args(["-q", "-sS", "--quote", &quote]);
+    command.args(fixture.auth_args());
+    command.arg(url);
+    command
+        .assert()
+        .failure()
+        .code(21)
+        .stdout("ssh fixture body\n");
+}
+
+#[test]
+fn sftp_postquote_is_skipped_after_output_write_failure() {
+    let Some(fixture) = SshdFixture::new() else {
+        return;
+    };
+    let temp = tempdir().unwrap();
+    let source = fixture.root.join("data.txt");
+    let output = temp.path().join("missing-parent").join("out.txt");
+    let quote = format!("-rm {}", source.display());
+    let url = fixture.url_for("sftp", &source);
+
+    let mut command = Command::cargo_bin("curl").unwrap();
+    command.args([
+        "-q",
+        "-sS",
+        "--quote",
+        &quote,
+        "-o",
+        output.to_str().unwrap(),
+    ]);
+    command.args(fixture.auth_args());
+    command.arg(url);
+    command.assert().failure().code(23).stdout("");
+
+    assert!(source.exists());
+}
+
+#[test]
 fn sftp_upload_file_writes_remote_file() {
     let Some(fixture) = SshdFixture::new() else {
         return;
@@ -5835,6 +6009,34 @@ fn sftp_upload_file_writes_remote_file() {
     command.assert().success().stdout("");
 
     assert_eq!(std::fs::read(remote).unwrap(), b"uploaded over sftp\n");
+}
+
+#[test]
+fn sftp_upload_postquote_removes_uploaded_file() {
+    let Some(fixture) = SshdFixture::new() else {
+        return;
+    };
+    let temp = tempdir().unwrap();
+    let upload = temp.path().join("payload.txt");
+    std::fs::write(&upload, b"upload then delete\n").unwrap();
+    let remote = fixture.root.join("upload-postquote.txt");
+    let quote = format!("-rm {}", remote.display());
+    let url = fixture.url_for("sftp", &remote);
+
+    let mut command = Command::cargo_bin("curl").unwrap();
+    command.args([
+        "-q",
+        "-sS",
+        "-T",
+        upload.to_str().unwrap(),
+        "--quote",
+        &quote,
+    ]);
+    command.args(fixture.auth_args());
+    command.arg(url);
+    command.assert().success().stdout("");
+
+    assert!(!remote.exists());
 }
 
 #[test]

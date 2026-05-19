@@ -7,7 +7,8 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use percent_encoding::percent_decode;
 use ssh2::{
-    CheckResult, ErrorCode as SshErrorCode, HashType, KnownHostFileKind, MethodType, Session,
+    CheckResult, ErrorCode as SshErrorCode, FileStat as SftpFileStat, HashType, KnownHostFileKind,
+    MethodType, RenameFlags, Session,
 };
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpStream, UdpSocket};
@@ -1695,11 +1696,22 @@ enum SshProtocol {
 struct SshDownload {
     body: Vec<u8>,
     headers: reqwest::header::HeaderMap,
+    quote_headers: Vec<u8>,
+}
+
+struct SshPostquoteContext {
+    session: Session,
+    current_path: String,
 }
 
 enum SshTransferResult {
-    Download(SshDownload),
-    Upload,
+    Download {
+        download: SshDownload,
+        postquote: Option<SshPostquoteContext>,
+    },
+    Upload {
+        postquote: Option<SshPostquoteContext>,
+    },
 }
 
 async fn run_scp_transfer(
@@ -1762,17 +1774,22 @@ async fn run_ssh_transfer(
     }
     .map_err(|error| CurlError::Transfer(format!("SSH transfer task failed: {error}")))??;
 
-    if matches!(download, SshTransferResult::Upload) {
+    if let SshTransferResult::Upload { postquote } = download {
         if let Some(path) = &transfer.dump_header {
             output::dump_headers(path, &[], transfer.create_dirs)?;
         }
         metrics.url_effective = url.to_string();
         metrics.size_download = 0;
         metrics.headers = reqwest::header::HeaderMap::new();
+        run_sftp_postquote(postquote, transfer).await?;
         return Ok(());
     }
 
-    let SshTransferResult::Download(download) = download else {
+    let SshTransferResult::Download {
+        download,
+        postquote,
+    } = download
+    else {
         unreachable!();
     };
 
@@ -1782,11 +1799,10 @@ async fn run_ssh_transfer(
     } else {
         limit_body_for_max_filesize(transfer, &download.body)
     };
-    let header_bytes = if is_head && !download.headers.is_empty() {
-        output::render_file_headers(&download.headers)
-    } else {
-        Vec::new()
-    };
+    let mut header_bytes = download.quote_headers.clone();
+    if is_head && !download.headers.is_empty() {
+        header_bytes.extend_from_slice(&output::render_file_headers(&download.headers));
+    }
 
     if let Some(path) = &transfer.dump_header {
         output::dump_headers(path, &header_bytes, transfer.create_dirs)?;
@@ -1795,6 +1811,9 @@ async fn run_ssh_transfer(
     let mut bytes = Vec::new();
     if is_head {
         bytes.extend_from_slice(&header_bytes);
+    } else if transfer.include_headers && !header_bytes.is_empty() {
+        bytes.extend_from_slice(&header_bytes);
+        bytes.extend_from_slice(body_bytes);
     } else {
         bytes.extend_from_slice(body_bytes);
     }
@@ -1815,7 +1834,29 @@ async fn run_ssh_transfer(
     if max_filesize_exceeded {
         return Err(CurlError::FileSizeExceeded);
     }
+    run_sftp_postquote(postquote, transfer).await?;
     Ok(())
+}
+
+async fn run_sftp_postquote(
+    postquote: Option<SshPostquoteContext>,
+    transfer: &TransferConfig,
+) -> Result<()> {
+    let Some(postquote) = postquote else {
+        return Ok(());
+    };
+    let commands = transfer.ftp_postquote.clone();
+    let task = tokio::task::spawn_blocking(move || {
+        let mut quote_headers = Vec::new();
+        ssh_sftp_run_quote_commands(
+            &postquote.session,
+            &commands,
+            &postquote.current_path,
+            &mut quote_headers,
+        )
+    });
+    task.await
+        .map_err(|error| CurlError::Transfer(format!("SSH postquote task failed: {error}")))?
 }
 
 fn validate_ssh_transfer(
@@ -1863,7 +1904,7 @@ fn validate_ssh_transfer(
             "--oauth2-bearer for {scheme} URLs"
         )));
     }
-    if transfer_has_ftp_quote_commands(transfer) {
+    if protocol == SshProtocol::Scp && transfer_has_ftp_quote_commands(transfer) {
         return Err(CurlError::Unsupported(format!(
             "quote commands for {scheme} URLs in the Rust sidecar"
         )));
@@ -1898,10 +1939,22 @@ fn run_ssh_blocking(
     let path = ssh_url_path(&url, protocol)?;
     let session = ssh_connect(transfer, &url)?;
 
+    let mut quote_headers = Vec::new();
+    if protocol == SshProtocol::Sftp {
+        ssh_sftp_run_quote_commands(&session, &transfer.ftp_quote, &path, &mut quote_headers)?;
+    }
+    let postquote =
+        (protocol == SshProtocol::Sftp && !transfer.ftp_postquote.is_empty()).then(|| {
+            SshPostquoteContext {
+                session: session.clone(),
+                current_path: path.clone(),
+            }
+        });
+
     if let Some(upload_body) = upload_body {
         if protocol == SshProtocol::Sftp {
             ssh_sftp_upload(&session, &path, &upload_body)?;
-            return Ok(SshTransferResult::Upload);
+            return Ok(SshTransferResult::Upload { postquote });
         }
         return Err(CurlError::Unsupported(
             "SCP uploads in the Rust sidecar".to_string(),
@@ -1910,10 +1963,19 @@ fn run_ssh_blocking(
 
     match protocol {
         SshProtocol::Scp => {
-            ssh_scp_download(&session, &path, method).map(SshTransferResult::Download)
+            ssh_scp_download(&session, &path, method).map(|download| SshTransferResult::Download {
+                download,
+                postquote: None,
+            })
         }
         SshProtocol::Sftp => {
-            ssh_sftp_download(transfer, &session, &path, method).map(SshTransferResult::Download)
+            ssh_sftp_download(transfer, &session, &path, method).map(|mut download| {
+                download.quote_headers = quote_headers;
+                SshTransferResult::Download {
+                    download,
+                    postquote,
+                }
+            })
         }
     }
 }
@@ -1933,7 +1995,11 @@ fn ssh_scp_download(session: &Session, path: &str, method: &str) -> Result<SshDo
             .read_to_end(&mut body)
             .map_err(|error| CurlError::Transfer(error.to_string()))?;
     }
-    Ok(SshDownload { body, headers })
+    Ok(SshDownload {
+        body,
+        headers,
+        quote_headers: Vec::new(),
+    })
 }
 
 fn ssh_sftp_download(
@@ -1953,6 +2019,7 @@ fn ssh_sftp_download(
         return Ok(SshDownload {
             body,
             headers: reqwest::header::HeaderMap::new(),
+            quote_headers: Vec::new(),
         });
     }
 
@@ -1964,7 +2031,329 @@ fn ssh_sftp_download(
         file.read_to_end(&mut body)
             .map_err(|error| CurlError::Transfer(error.to_string()))?;
     }
-    Ok(SshDownload { body, headers })
+    Ok(SshDownload {
+        body,
+        headers,
+        quote_headers: Vec::new(),
+    })
+}
+
+fn ssh_sftp_run_quote_commands(
+    session: &Session,
+    commands: &[String],
+    current_path: &str,
+    quote_headers: &mut Vec<u8>,
+) -> Result<()> {
+    if commands.is_empty() {
+        return Ok(());
+    }
+    let sftp = session.sftp().map_err(ssh_error_to_curl)?;
+    for command in commands {
+        ssh_sftp_run_quote_command(&sftp, command, current_path, quote_headers)?;
+    }
+    Ok(())
+}
+
+fn ssh_sftp_run_quote_command(
+    sftp: &ssh2::Sftp,
+    command: &str,
+    current_path: &str,
+    quote_headers: &mut Vec<u8>,
+) -> Result<()> {
+    let (command, accept_fail) = sftp_quote_accept_failure(command);
+    let command = command.trim_start();
+    if command.eq_ignore_ascii_case("pwd") {
+        quote_headers.extend_from_slice(
+            format!("257 \"{current_path}\" is current directory.\n").as_bytes(),
+        );
+        return Ok(());
+    }
+    let Some(split_at) = command.find(char::is_whitespace) else {
+        return Err(CurlError::QuoteError);
+    };
+    let operation = &command[..split_at];
+    let arguments = &command[split_at..];
+
+    match operation {
+        "chgrp" => {
+            let (group, remaining) = parse_sftp_quote_path(arguments)?;
+            let (path, remaining) = parse_sftp_quote_path(remaining)?;
+            ensure_no_sftp_quote_trailing_data(remaining)?;
+            let gid = parse_sftp_quote_decimal(&group)?;
+            let stat = match sftp.stat(Path::new(&path)) {
+                Ok(stat) => stat,
+                Err(error) => return sftp_quote_result(Err(error), accept_fail),
+            };
+            sftp_quote_result(
+                sftp.setstat(
+                    Path::new(&path),
+                    SftpFileStat {
+                        gid: Some(gid),
+                        uid: stat.uid,
+                        size: None,
+                        perm: None,
+                        atime: None,
+                        mtime: None,
+                    },
+                ),
+                accept_fail,
+            )
+        }
+        "chmod" => {
+            let (mode, remaining) = parse_sftp_quote_path(arguments)?;
+            let (path, remaining) = parse_sftp_quote_path(remaining)?;
+            ensure_no_sftp_quote_trailing_data(remaining)?;
+            let mode = parse_sftp_quote_octal(&mode)?;
+            sftp_quote_result(
+                sftp.setstat(
+                    Path::new(&path),
+                    SftpFileStat {
+                        perm: Some(mode),
+                        size: None,
+                        uid: None,
+                        gid: None,
+                        atime: None,
+                        mtime: None,
+                    },
+                ),
+                accept_fail,
+            )
+        }
+        "chown" => {
+            let (user, remaining) = parse_sftp_quote_path(arguments)?;
+            let (path, remaining) = parse_sftp_quote_path(remaining)?;
+            ensure_no_sftp_quote_trailing_data(remaining)?;
+            let uid = parse_sftp_quote_decimal(&user)?;
+            let stat = match sftp.stat(Path::new(&path)) {
+                Ok(stat) => stat,
+                Err(error) => return sftp_quote_result(Err(error), accept_fail),
+            };
+            sftp_quote_result(
+                sftp.setstat(
+                    Path::new(&path),
+                    SftpFileStat {
+                        uid: Some(uid),
+                        gid: stat.gid,
+                        size: None,
+                        perm: None,
+                        atime: None,
+                        mtime: None,
+                    },
+                ),
+                accept_fail,
+            )
+        }
+        "atime" | "mtime" => {
+            let (date, remaining) = parse_sftp_quote_path(arguments)?;
+            let (path, remaining) = parse_sftp_quote_path(remaining)?;
+            ensure_no_sftp_quote_trailing_data(remaining)?;
+            let timestamp = parse_sftp_quote_date(&date)?;
+            let stat = match sftp.stat(Path::new(&path)) {
+                Ok(stat) => stat,
+                Err(error) => return sftp_quote_result(Err(error), accept_fail),
+            };
+            let (atime, mtime) = if operation == "atime" {
+                (Some(timestamp), stat.mtime)
+            } else {
+                (stat.atime, Some(timestamp))
+            };
+            sftp_quote_result(
+                sftp.setstat(
+                    Path::new(&path),
+                    SftpFileStat {
+                        atime,
+                        mtime,
+                        size: None,
+                        uid: None,
+                        gid: None,
+                        perm: None,
+                    },
+                ),
+                accept_fail,
+            )
+        }
+        "ln" | "symlink" => {
+            let (source, remaining) = parse_sftp_quote_path(arguments)?;
+            let (target, remaining) = parse_sftp_quote_path(remaining)?;
+            ensure_no_sftp_quote_trailing_data(remaining)?;
+            sftp_quote_result(
+                sftp.symlink(Path::new(&source), Path::new(&target)),
+                accept_fail,
+            )
+        }
+        "mkdir" => {
+            let (path, remaining) = parse_sftp_quote_path(arguments)?;
+            ensure_no_sftp_quote_trailing_data(remaining)?;
+            sftp_quote_result(sftp.mkdir(Path::new(&path), 0o755), accept_fail)
+        }
+        "rename" => {
+            let (source, remaining) = parse_sftp_quote_path(arguments)?;
+            let (target, remaining) = parse_sftp_quote_path(remaining)?;
+            ensure_no_sftp_quote_trailing_data(remaining)?;
+            sftp_quote_result(
+                sftp.rename(
+                    Path::new(&source),
+                    Path::new(&target),
+                    Some(RenameFlags::ATOMIC | RenameFlags::OVERWRITE | RenameFlags::NATIVE),
+                ),
+                accept_fail,
+            )
+        }
+        "rm" => {
+            let (path, remaining) = parse_sftp_quote_path(arguments)?;
+            ensure_no_sftp_quote_trailing_data(remaining)?;
+            sftp_quote_result(sftp.unlink(Path::new(&path)), accept_fail)
+        }
+        "rmdir" => {
+            let (path, remaining) = parse_sftp_quote_path(arguments)?;
+            ensure_no_sftp_quote_trailing_data(remaining)?;
+            sftp_quote_result(sftp.rmdir(Path::new(&path)), accept_fail)
+        }
+        "statvfs" => {
+            let (path, remaining) = parse_sftp_quote_path(arguments)?;
+            ensure_no_sftp_quote_trailing_data(remaining)?;
+            match sftp_quote_statvfs(sftp, Path::new(&path), quote_headers) {
+                Ok(()) => Ok(()),
+                Err(_) if accept_fail => Ok(()),
+                Err(error) => Err(error),
+            }
+        }
+        _ => Err(CurlError::QuoteError),
+    }
+}
+
+fn sftp_quote_statvfs(sftp: &ssh2::Sftp, path: &Path, quote_headers: &mut Vec<u8>) -> Result<()> {
+    let mut handle = match sftp.open(path) {
+        Ok(handle) => handle,
+        Err(_) => sftp.opendir(path).map_err(|_| CurlError::QuoteError)?,
+    };
+    let statvfs = handle.statvfs().map_err(|_| CurlError::QuoteError)?;
+    quote_headers.extend_from_slice(
+        format!(
+            "statvfs:\n\
+             f_bsize: {}\n\
+             f_frsize: {}\n\
+             f_blocks: {}\n\
+             f_bfree: {}\n\
+             f_bavail: {}\n\
+             f_files: {}\n\
+             f_ffree: {}\n\
+             f_favail: {}\n\
+             f_fsid: {}\n\
+             f_flag: {}\n\
+             f_namemax: {}\n",
+            statvfs.f_bsize,
+            statvfs.f_frsize,
+            statvfs.f_blocks,
+            statvfs.f_bfree,
+            statvfs.f_bavail,
+            statvfs.f_files,
+            statvfs.f_ffree,
+            statvfs.f_favail,
+            statvfs.f_fsid,
+            statvfs.f_flag,
+            statvfs.f_namemax
+        )
+        .as_bytes(),
+    );
+    Ok(())
+}
+
+fn sftp_quote_accept_failure(command: &str) -> (&str, bool) {
+    command
+        .strip_prefix('*')
+        .map(|command| (command, true))
+        .unwrap_or((command, false))
+}
+
+fn parse_sftp_quote_path(input: &str) -> Result<(String, &str)> {
+    let input = input.trim_start_matches(char::is_whitespace);
+    if input.is_empty() {
+        return Err(CurlError::QuoteError);
+    }
+    let mut chars = input.char_indices();
+    let (_, first) = chars.next().ok_or(CurlError::QuoteError)?;
+    if first == '"' || first == '\'' {
+        let mut output = String::new();
+        let mut escaped = false;
+        for (index, ch) in chars {
+            if escaped {
+                if ch != '\'' && ch != '"' && ch != '\\' {
+                    return Err(CurlError::QuoteError);
+                }
+                output.push(ch);
+                escaped = false;
+                continue;
+            }
+            if ch == '\\' {
+                escaped = true;
+                continue;
+            }
+            if ch == first {
+                if output.is_empty() {
+                    return Err(CurlError::QuoteError);
+                }
+                let rest = &input[index + ch.len_utf8()..];
+                return Ok((output, rest.trim_start_matches(char::is_whitespace)));
+            }
+            output.push(ch);
+        }
+        return Err(CurlError::QuoteError);
+    }
+
+    let end = input.find(char::is_whitespace).unwrap_or(input.len());
+    let path = &input[..end];
+    if path.is_empty() {
+        return Err(CurlError::QuoteError);
+    }
+    Ok((
+        path.to_string(),
+        input[end..].trim_start_matches(char::is_whitespace),
+    ))
+}
+
+fn ensure_no_sftp_quote_trailing_data(input: &str) -> Result<()> {
+    if input.is_empty() {
+        Ok(())
+    } else {
+        Err(CurlError::QuoteError)
+    }
+}
+
+fn parse_sftp_quote_decimal(value: &str) -> Result<u32> {
+    value.parse::<u32>().map_err(|_| CurlError::QuoteError)
+}
+
+fn parse_sftp_quote_octal(value: &str) -> Result<u32> {
+    if value.is_empty() || !value.bytes().all(|byte| (b'0'..=b'7').contains(&byte)) {
+        return Err(CurlError::QuoteError);
+    }
+    u32::from_str_radix(value, 8)
+        .ok()
+        .filter(|mode| *mode <= 0o7777)
+        .ok_or(CurlError::QuoteError)
+}
+
+fn parse_sftp_quote_date(value: &str) -> Result<u64> {
+    if let Ok(seconds) = value.parse::<u64>() {
+        return Ok(seconds);
+    }
+    let timestamp = httpdate::parse_http_date(value).map_err(|_| CurlError::QuoteError)?;
+    timestamp
+        .duration_since(UNIX_EPOCH)
+        .map_err(|_| CurlError::QuoteError)
+        .map(|duration| duration.as_secs())
+}
+
+fn sftp_quote_result(
+    result: std::result::Result<(), ssh2::Error>,
+    accept_fail: bool,
+) -> Result<()> {
+    match result {
+        Ok(()) => Ok(()),
+        Err(_) if accept_fail => Ok(()),
+        Err(_) => Err(CurlError::QuoteError),
+    }
 }
 
 fn ssh_sftp_upload(session: &Session, path: &str, body: &[u8]) -> Result<()> {
