@@ -2523,14 +2523,339 @@ fn parse_sftp_quote_octal(value: &str) -> Result<u32> {
 }
 
 fn parse_sftp_quote_date(value: &str) -> Result<u64> {
-    if let Ok(seconds) = value.parse::<u64>() {
-        return Ok(seconds);
+    if let Ok(timestamp) = httpdate::parse_http_date(value) {
+        let seconds = timestamp
+            .duration_since(UNIX_EPOCH)
+            .map_err(|_| CurlError::QuoteError)?
+            .as_secs();
+        return ensure_sftp_quote_timestamp_range(seconds);
     }
-    let timestamp = httpdate::parse_http_date(value).map_err(|_| CurlError::QuoteError)?;
-    timestamp
-        .duration_since(UNIX_EPOCH)
-        .map_err(|_| CurlError::QuoteError)
-        .map(|duration| duration.as_secs())
+    parse_curl_style_sftp_quote_date(value)
+}
+
+#[derive(Clone, Copy)]
+enum SftpQuoteDateAssume {
+    MonthDay,
+    Year,
+}
+
+#[derive(Default)]
+struct SftpQuoteDateParts {
+    month: Option<u32>,
+    month_day: Option<u32>,
+    hour: Option<u32>,
+    minute: Option<u32>,
+    second: Option<u32>,
+    year: Option<i32>,
+    tz_offset: Option<i64>,
+}
+
+fn ensure_sftp_quote_timestamp_range(seconds: u64) -> Result<u64> {
+    if seconds <= u64::from(u32::MAX) {
+        Ok(seconds)
+    } else {
+        Err(CurlError::QuoteError)
+    }
+}
+
+fn parse_curl_style_sftp_quote_date(value: &str) -> Result<u64> {
+    let bytes = value.as_bytes();
+    let mut index = 0;
+    let mut parts = 0;
+    let mut next_number = SftpQuoteDateAssume::MonthDay;
+    let mut parsed = SftpQuoteDateParts::default();
+
+    while index < bytes.len() && parts < 6 {
+        while index < bytes.len() && !bytes[index].is_ascii_alphanumeric() {
+            index += 1;
+        }
+        if index >= bytes.len() {
+            break;
+        }
+        if bytes[index].is_ascii_alphabetic() {
+            let start = index;
+            while index < bytes.len() && bytes[index].is_ascii_alphabetic() {
+                index += 1;
+            }
+            parse_sftp_quote_date_word(&value[start..index], &mut parsed)?;
+        } else {
+            let before_number = index
+                .checked_sub(1)
+                .and_then(|pos| value.as_bytes().get(pos));
+            index = parse_sftp_quote_date_number(
+                value,
+                index,
+                before_number.copied(),
+                &mut parsed,
+                &mut next_number,
+            )?;
+        }
+        parts += 1;
+    }
+
+    let seconds = sftp_quote_date_to_epoch(&parsed)?;
+    let seconds = u64::try_from(seconds).map_err(|_| CurlError::QuoteError)?;
+    ensure_sftp_quote_timestamp_range(seconds)
+}
+
+fn parse_sftp_quote_date_word(word: &str, parsed: &mut SftpQuoteDateParts) -> Result<()> {
+    if parsed.month.is_none()
+        && let Some(month) = sftp_quote_date_month(word)
+    {
+        parsed.month = Some(month);
+        return Ok(());
+    }
+    if sftp_quote_date_weekday(word) {
+        return Ok(());
+    }
+    if parsed.tz_offset.is_none()
+        && let Some(offset) = sftp_quote_date_timezone(word)
+    {
+        parsed.tz_offset = Some(offset);
+        return Ok(());
+    }
+    Err(CurlError::QuoteError)
+}
+
+fn parse_sftp_quote_date_number(
+    value: &str,
+    start: usize,
+    before_number: Option<u8>,
+    parsed: &mut SftpQuoteDateParts,
+    next_number: &mut SftpQuoteDateAssume,
+) -> Result<usize> {
+    if parsed.second.is_none()
+        && let Some(end) = parse_sftp_quote_time(value, start, parsed)?
+    {
+        return Ok(end);
+    }
+
+    let bytes = value.as_bytes();
+    let mut end = start;
+    while end < bytes.len() && bytes[end].is_ascii_digit() {
+        end += 1;
+    }
+    let digits = end - start;
+    if digits == 0 || digits > 8 {
+        return Err(CurlError::QuoteError);
+    }
+    let number = value[start..end]
+        .parse::<u32>()
+        .map_err(|_| CurlError::QuoteError)?;
+
+    if parsed.tz_offset.is_none()
+        && digits == 4
+        && number <= 1400
+        && matches!(before_number, Some(b'+' | b'-'))
+    {
+        let seconds = i64::from((number / 100) * 60 + (number % 100)) * 60;
+        parsed.tz_offset = Some(if before_number == Some(b'+') {
+            -seconds
+        } else {
+            seconds
+        });
+        return Ok(end);
+    }
+
+    if digits == 8 && parsed.year.is_none() && parsed.month.is_none() && parsed.month_day.is_none()
+    {
+        parsed.year = Some((number / 10_000) as i32);
+        parsed.month = Some((number % 10_000) / 100);
+        parsed.month_day = Some(number % 100);
+        return Ok(end);
+    }
+
+    match *next_number {
+        SftpQuoteDateAssume::MonthDay if parsed.month_day.is_none() => {
+            if (1..32).contains(&number) {
+                parsed.month_day = Some(number);
+                *next_number = SftpQuoteDateAssume::Year;
+                return Ok(end);
+            }
+            *next_number = SftpQuoteDateAssume::Year;
+        }
+        SftpQuoteDateAssume::Year => {}
+        SftpQuoteDateAssume::MonthDay => {}
+    }
+
+    if matches!(*next_number, SftpQuoteDateAssume::Year) && parsed.year.is_none() {
+        let mut year = number as i32;
+        if year < 100 {
+            year += if year > 70 { 1900 } else { 2000 };
+        }
+        parsed.year = Some(year);
+        if parsed.month_day.is_none() {
+            *next_number = SftpQuoteDateAssume::MonthDay;
+        }
+        return Ok(end);
+    }
+
+    Err(CurlError::QuoteError)
+}
+
+fn parse_sftp_quote_time(
+    value: &str,
+    start: usize,
+    parsed: &mut SftpQuoteDateParts,
+) -> Result<Option<usize>> {
+    let Some((hour, after_hour)) = parse_one_or_two_digits(value, start) else {
+        return Ok(None);
+    };
+    if hour > 23 || value.as_bytes().get(after_hour) != Some(&b':') {
+        return Ok(None);
+    }
+    let minute_start = after_hour + 1;
+    let Some((minute, after_minute)) = parse_one_or_two_digits(value, minute_start) else {
+        return Ok(None);
+    };
+    if minute > 59 {
+        return Ok(None);
+    }
+    let (second, end) = if value.as_bytes().get(after_minute) == Some(&b':') {
+        let second_start = after_minute + 1;
+        let Some((second, after_second)) = parse_one_or_two_digits(value, second_start) else {
+            return Ok(None);
+        };
+        if second > 60 {
+            return Ok(None);
+        }
+        (second, after_second)
+    } else {
+        (0, after_minute)
+    };
+    parsed.hour = Some(hour);
+    parsed.minute = Some(minute);
+    parsed.second = Some(second);
+    Ok(Some(end))
+}
+
+fn parse_one_or_two_digits(value: &str, start: usize) -> Option<(u32, usize)> {
+    let bytes = value.as_bytes();
+    let first = bytes.get(start).filter(|byte| byte.is_ascii_digit())?;
+    let mut number = u32::from(first - b'0');
+    let mut end = start + 1;
+    if let Some(second) = bytes.get(end).filter(|byte| byte.is_ascii_digit()) {
+        number = number * 10 + u32::from(second - b'0');
+        end += 1;
+    }
+    Some((number, end))
+}
+
+fn sftp_quote_date_to_epoch(parsed: &SftpQuoteDateParts) -> Result<i64> {
+    let year = parsed.year.ok_or(CurlError::QuoteError)?;
+    let month = parsed.month.ok_or(CurlError::QuoteError)?;
+    let day = parsed.month_day.ok_or(CurlError::QuoteError)?;
+    let hour = parsed.hour.unwrap_or(0);
+    let minute = parsed.minute.unwrap_or(0);
+    let second = parsed.second.unwrap_or(0);
+    if year < 1583
+        || !(1..=12).contains(&month)
+        || !(1..=31).contains(&day)
+        || hour > 23
+        || minute > 59
+        || second > 60
+    {
+        return Err(CurlError::QuoteError);
+    }
+    days_from_civil(year, month, day)
+        .checked_mul(86_400)
+        .and_then(|seconds| seconds.checked_add(i64::from(hour) * 3_600))
+        .and_then(|seconds| seconds.checked_add(i64::from(minute) * 60))
+        .and_then(|seconds| seconds.checked_add(i64::from(second)))
+        .and_then(|seconds| seconds.checked_add(parsed.tz_offset.unwrap_or(0)))
+        .ok_or(CurlError::QuoteError)
+}
+
+fn sftp_quote_date_month(word: &str) -> Option<u32> {
+    [
+        "Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec",
+    ]
+    .iter()
+    .position(|month| word.eq_ignore_ascii_case(month))
+    .map(|index| index as u32 + 1)
+}
+
+fn sftp_quote_date_weekday(word: &str) -> bool {
+    [
+        "Mon",
+        "Tue",
+        "Wed",
+        "Thu",
+        "Fri",
+        "Sat",
+        "Sun",
+        "Monday",
+        "Tuesday",
+        "Wednesday",
+        "Thursday",
+        "Friday",
+        "Saturday",
+        "Sunday",
+    ]
+    .iter()
+    .any(|weekday| word.eq_ignore_ascii_case(weekday))
+}
+
+fn sftp_quote_date_timezone(word: &str) -> Option<i64> {
+    let minutes = match word {
+        "GMT" | "UT" | "UTC" | "Z" => 0,
+        "ADT" => 180,
+        "AHST" => 600,
+        "AST" => 240,
+        "BST" => -60,
+        "CAT" => 600,
+        "CCT" => -480,
+        "CET" | "MET" | "MEWT" | "FWT" => -60,
+        "CEST" | "MEST" | "MESZ" | "FST" => -120,
+        "EET" => -120,
+        "EADT" => -660,
+        "EAST" | "GST" => -600,
+        "WET" => 0,
+        "HDT" => 540,
+        "HST" => 600,
+        "IDLE" => -720,
+        "IDLW" => 720,
+        "JST" => -540,
+        "NT" => 660,
+        "NZDT" => -780,
+        "NZST" | "NZT" => -720,
+        "WADT" => -480,
+        "WAST" => -420,
+        "WAT" => 60,
+        "YDT" => 480,
+        "YST" => 540,
+        "EST" | "CDT" => 300,
+        "EDT" => 240,
+        "CST" | "MDT" => 360,
+        "MST" | "PDT" => 420,
+        "PST" => 480,
+        "A" => -60,
+        "B" => -120,
+        "C" => -180,
+        "D" => -240,
+        "E" => -300,
+        "F" => -360,
+        "G" => -420,
+        "H" => -480,
+        "I" => -540,
+        "K" => -600,
+        "L" => -660,
+        "M" => -720,
+        "N" => 60,
+        "O" => 120,
+        "P" => 180,
+        "Q" => 240,
+        "R" => 300,
+        "S" => 360,
+        "T" => 420,
+        "U" => 480,
+        "V" => 540,
+        "W" => 600,
+        "X" => 660,
+        "Y" => 720,
+        _ => return None,
+    };
+    Some(i64::from(minutes) * 60)
 }
 
 fn sftp_quote_result(

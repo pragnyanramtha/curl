@@ -1,6 +1,8 @@
 use std::io::ErrorKind;
 use std::io::{Read, Write};
 use std::net::{Shutdown, TcpListener, UdpSocket};
+#[cfg(unix)]
+use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command as StdCommand, Stdio};
 use std::sync::mpsc::{self, Receiver};
@@ -6455,6 +6457,53 @@ fn sftp_quote_path_expands_remote_home() {
     command.assert().success().stdout("ssh fixture body\n");
 
     assert!(!remote_file.exists());
+}
+
+#[test]
+#[cfg(unix)]
+fn sftp_quote_mtime_accepts_curl_getdate_formats() {
+    let Some(fixture) = SshdFixture::new() else {
+        return;
+    };
+
+    for (name, date, expected_mtime) in [
+        ("asctime", "Sun Nov  6 08:49:37 1994", 784_111_777),
+        ("named-tz", "Sun, 06 Nov 1994 08:49:37 CET", 784_108_177),
+        ("compact-tz", "20040912 15:05:58 -0700", 1_095_026_758),
+    ] {
+        let remote_file = fixture.root.join(format!("mtime-{name}.txt"));
+        std::fs::write(&remote_file, b"date quote\n").unwrap();
+        let quote = format!("mtime \"{date}\" {}", remote_file.display());
+        let url = fixture.url_for("sftp", &fixture.root.join("data.txt"));
+
+        let mut command = Command::cargo_bin("curl").unwrap();
+        command.args(["-q", "-sS", "--quote", &quote]);
+        command.args(fixture.auth_args());
+        command.arg(url);
+        command.assert().success().stdout("ssh fixture body\n");
+
+        assert_eq!(
+            std::fs::metadata(remote_file).unwrap().mtime(),
+            expected_mtime
+        );
+    }
+}
+
+#[test]
+fn sftp_quote_mtime_rejects_bad_date() {
+    let Some(fixture) = SshdFixture::new() else {
+        return;
+    };
+    let remote_file = fixture.root.join("mtime-bad-date.txt");
+    std::fs::write(&remote_file, b"bad date quote\n").unwrap();
+    let quote = format!("mtime \"1994-11-06T08:49:37Z\" {}", remote_file.display());
+    let url = fixture.url_for("sftp", &fixture.root.join("data.txt"));
+
+    let mut command = Command::cargo_bin("curl").unwrap();
+    command.args(["-q", "-sS", "--quote", &quote]);
+    command.args(fixture.auth_args());
+    command.arg(url);
+    command.assert().failure().code(21).stdout("");
 }
 
 #[test]
