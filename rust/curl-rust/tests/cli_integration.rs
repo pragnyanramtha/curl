@@ -5750,6 +5750,104 @@ fn sftp_range_fixture_file(fixture: &SshdFixture) -> PathBuf {
 }
 
 #[test]
+fn scp_download_range_is_ignored_and_outputs_full_file() {
+    let Some(fixture) = SshdFixture::new() else {
+        return;
+    };
+    let path = sftp_range_fixture_file(&fixture);
+    let url = fixture.url_for("scp", &path);
+
+    for range in ["5-9", "99-"] {
+        let mut command = Command::cargo_bin("curl").unwrap();
+        command.args(["-q", "-sS", "--range", range]);
+        command.args(fixture.auth_args());
+        command.arg(&url);
+        command
+            .assert()
+            .success()
+            .stdout("Test data\nfor ssh test\n");
+    }
+}
+
+#[test]
+fn scp_download_continue_at_fixed_to_stdout_is_ignored() {
+    let Some(fixture) = SshdFixture::new() else {
+        return;
+    };
+    let path = sftp_range_fixture_file(&fixture);
+    let url = fixture.url_for("scp", &path);
+
+    let mut command = Command::cargo_bin("curl").unwrap();
+    command.args(["-q", "-sS", "--continue-at", "5"]);
+    command.args(fixture.auth_args());
+    command.arg(url);
+    command
+        .assert()
+        .success()
+        .stdout("Test data\nfor ssh test\n");
+}
+
+#[test]
+fn scp_download_continue_at_fixed_appends_full_file_to_output() {
+    let Some(fixture) = SshdFixture::new() else {
+        return;
+    };
+    let temp = tempdir().unwrap();
+    let output = temp.path().join("out.txt");
+    std::fs::write(&output, b"local prefix\n").unwrap();
+    let path = sftp_range_fixture_file(&fixture);
+    let url = fixture.url_for("scp", &path);
+
+    let mut command = Command::cargo_bin("curl").unwrap();
+    command.args([
+        "-q",
+        "-sS",
+        "--continue-at",
+        "13",
+        "-o",
+        output.to_str().unwrap(),
+    ]);
+    command.args(fixture.auth_args());
+    command.arg(url);
+    command.assert().success().stdout("");
+
+    assert_eq!(
+        std::fs::read(output).unwrap(),
+        b"local prefix\nTest data\nfor ssh test\n"
+    );
+}
+
+#[test]
+fn scp_download_continue_at_auto_appends_full_file_to_output() {
+    let Some(fixture) = SshdFixture::new() else {
+        return;
+    };
+    let temp = tempdir().unwrap();
+    let output = temp.path().join("out.txt");
+    std::fs::write(&output, b"local prefix\n").unwrap();
+    let path = sftp_range_fixture_file(&fixture);
+    let url = fixture.url_for("scp", &path);
+
+    let mut command = Command::cargo_bin("curl").unwrap();
+    command.args([
+        "-q",
+        "-sS",
+        "--continue-at",
+        "-",
+        "-o",
+        output.to_str().unwrap(),
+    ]);
+    command.args(fixture.auth_args());
+    command.arg(url);
+    command.assert().success().stdout("");
+
+    assert_eq!(
+        std::fs::read(output).unwrap(),
+        b"local prefix\nTest data\nfor ssh test\n"
+    );
+}
+
+#[test]
 fn sftp_download_range_fixed_outputs_requested_bytes() {
     let Some(fixture) = SshdFixture::new() else {
         return;

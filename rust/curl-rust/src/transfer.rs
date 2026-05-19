@@ -1753,7 +1753,10 @@ async fn run_ssh_transfer(
         .as_deref()
         .map(data::read_upload_body)
         .transpose()?;
-    let resume_from = if upload_body.is_none() && protocol == SshProtocol::Sftp {
+    let resume_from = if upload_body.is_none()
+        && matches!(protocol, SshProtocol::Scp | SshProtocol::Sftp)
+        && transfer.continue_at.is_some()
+    {
         resume_offset(
             transfer,
             &url,
@@ -1917,12 +1920,15 @@ fn validate_ssh_transfer(
         )));
     }
     let is_sftp_download = protocol == SshProtocol::Sftp && !is_upload;
-    if transfer.range.is_some() && !(is_sftp_download || is_scp_upload) {
+    let is_scp_download = protocol == SshProtocol::Scp && !is_upload;
+    if transfer.range.is_some() && !(is_sftp_download || is_scp_download || is_scp_upload) {
         return Err(CurlError::Unsupported(format!(
             "range/resume for {scheme} URLs"
         )));
     }
-    if transfer.continue_at.is_some() && protocol != SshProtocol::Sftp && !is_scp_upload {
+    if transfer.continue_at.is_some()
+        && !(protocol == SshProtocol::Sftp || is_scp_download || is_scp_upload)
+    {
         return Err(CurlError::Unsupported(format!(
             "range/resume for {scheme} URLs"
         )));
@@ -1970,9 +1976,11 @@ fn run_ssh_blocking(
 
     match protocol {
         SshProtocol::Scp => {
-            ssh_scp_download(&session, &path, method).map(|download| SshTransferResult::Download {
-                download,
-                postquote: None,
+            ssh_scp_download(&session, &path, method, resume_from).map(|download| {
+                SshTransferResult::Download {
+                    download,
+                    postquote: None,
+                }
             })
         }
         SshProtocol::Sftp => {
@@ -1987,7 +1995,12 @@ fn run_ssh_blocking(
     }
 }
 
-fn ssh_scp_download(session: &Session, path: &str, method: &str) -> Result<SshDownload> {
+fn ssh_scp_download(
+    session: &Session,
+    path: &str,
+    method: &str,
+    resume_from: u64,
+) -> Result<SshDownload> {
     let (mut channel, stat) = session
         .scp_recv(Path::new(path))
         .map_err(ssh_error_to_curl)?;
@@ -2006,7 +2019,7 @@ fn ssh_scp_download(session: &Session, path: &str, method: &str) -> Result<SshDo
         body,
         headers,
         quote_headers: Vec::new(),
-        resume_from: 0,
+        resume_from,
     })
 }
 
