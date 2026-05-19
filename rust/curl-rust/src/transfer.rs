@@ -257,9 +257,23 @@ fn spawn_parallel_job(active: &mut JoinSet<Result<(usize, i32)>>, job: ParallelJ
 
 fn expand_urls(transfer: &TransferConfig) -> Result<Vec<glob::ExpandedUrl>> {
     let mut expanded = Vec::new();
-    for url in &transfer.urls {
+    for (index, url) in transfer.urls.iter().enumerate() {
         let url = glob::apply_default_protocol(url, transfer.proto_default.as_deref());
-        expanded.extend(glob::expand_url(&url, transfer.globoff)?);
+        let globoff =
+            transfer.globoff || transfer.url_globoffs.get(index).copied().unwrap_or(false);
+        let remote_name = transfer
+            .url_remote_names
+            .get(index)
+            .copied()
+            .unwrap_or(false);
+        expanded.extend(
+            glob::expand_url(&url, globoff)?
+                .into_iter()
+                .map(|mut expanded_url| {
+                    expanded_url.remote_name = remote_name;
+                    expanded_url
+                }),
+        );
     }
     Ok(expanded)
 }
@@ -429,6 +443,7 @@ async fn run_expanded_url(
         Ok(Some(url)) => glob::ExpandedUrl {
             url,
             variables: expanded.variables,
+            remote_name: expanded.remote_name,
         },
         Ok(None) => expanded,
         Err(error) => {
@@ -448,6 +463,18 @@ async fn run_expanded_url(
         method_label = Method::PUT.as_str().to_string();
         metrics.method = method_label.clone();
     }
+
+    let owned_transfer;
+    let transfer = if expanded.remote_name && !transfer.remote_name {
+        owned_transfer = {
+            let mut transfer = transfer.clone();
+            transfer.remote_name = true;
+            transfer
+        };
+        &owned_transfer
+    } else {
+        transfer
+    };
 
     let userinfo_check = if transfer.disallow_username_in_url {
         reject_url_userinfo(&expanded.url)
@@ -7402,14 +7429,7 @@ fn auto_referer_value(previous: &Url) -> String {
 fn parse_headers(headers: &[String]) -> Result<Vec<(HeaderName, Option<HeaderValue>)>> {
     let mut parsed = Vec::new();
     for header in headers {
-        if let Some(path) = header.strip_prefix('@') {
-            let text = std::fs::read_to_string(path)?;
-            for line in text.lines().filter(|line| !line.trim().is_empty()) {
-                parsed.push(parse_header(line)?);
-            }
-        } else {
-            parsed.push(parse_header(header)?);
-        }
+        parsed.push(parse_header(header)?);
     }
     Ok(parsed)
 }

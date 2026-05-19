@@ -30,6 +30,8 @@ pub struct Config {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TransferConfig {
     pub urls: Vec<String>,
+    pub url_remote_names: Vec<bool>,
+    pub url_globoffs: Vec<bool>,
     pub method: Option<String>,
     pub head: bool,
     pub get: bool,
@@ -137,6 +139,8 @@ impl Default for TransferConfig {
     fn default() -> Self {
         Self {
             urls: Vec::new(),
+            url_remote_names: Vec::new(),
+            url_globoffs: Vec::new(),
             method: None,
             head: false,
             get: false,
@@ -252,7 +256,7 @@ impl Parser {
         while let Some(arg) = self.next() {
             if arg == "--" {
                 while let Some(url) = self.next() {
-                    self.current().urls.push(url);
+                    self.append_url_value(url)?;
                 }
                 break;
             }
@@ -262,7 +266,7 @@ impl Parser {
             } else if arg.starts_with('-') && arg.len() > 1 {
                 self.parse_short(&arg[1..])?;
             } else {
-                self.current().urls.push(arg);
+                self.append_url_value(arg)?;
             }
         }
 
@@ -337,7 +341,7 @@ impl Parser {
             }
             "url" => {
                 let value = self.value_for(name, inline_value)?;
-                self.current().urls.push(value);
+                self.append_url_value(value)?;
             }
             "next" => {
                 self.config.transfers.push(TransferConfig::default());
@@ -368,7 +372,7 @@ impl Parser {
             "include" => self.current().include_headers = true,
             "header" => {
                 let value = self.value_for(name, inline_value)?;
-                self.current().headers.push(value);
+                self.append_header_value(value)?;
             }
             "referer" => {
                 let value = self.value_for(name, inline_value)?;
@@ -522,7 +526,7 @@ impl Parser {
             }
             "write-out" => {
                 let value = self.value_for(name, inline_value)?;
-                self.current().write_out = Some(value);
+                self.current().write_out = Some(self.read_write_out_value(&value)?);
             }
             "location" | "location-trusted" => self.current().follow_location = true,
             "max-redirs" => {
@@ -683,7 +687,7 @@ impl Parser {
                     if rest.is_empty() {
                         self.config.show_help = true;
                     } else {
-                        self.current().headers.push(rest.to_string());
+                        self.append_header_value(rest.to_string())?;
                         break;
                     }
                 }
@@ -707,7 +711,7 @@ impl Parser {
                 'i' => self.current().include_headers = true,
                 'H' => {
                     let value = self.short_value('H', rest)?;
-                    self.current().headers.push(value);
+                    self.append_header_value(value)?;
                     break;
                 }
                 'e' => {
@@ -778,7 +782,7 @@ impl Parser {
                 }
                 'w' => {
                     let value = self.short_value('w', rest)?;
-                    self.current().write_out = Some(value);
+                    self.current().write_out = Some(self.read_write_out_value(&value)?);
                     break;
                 }
                 'L' => self.current().follow_location = true,
@@ -915,6 +919,44 @@ impl Parser {
         } else {
             transfer.auto_referer = false;
             transfer.referer = (!value.is_empty()).then_some(value);
+        }
+    }
+
+    fn push_url(&mut self, url: String, remote_name: bool, globoff: bool) {
+        let transfer = self.current();
+        transfer.urls.push(url);
+        transfer.url_remote_names.push(remote_name);
+        transfer.url_globoffs.push(globoff);
+    }
+
+    fn append_url_value(&mut self, value: String) -> Result<()> {
+        if let Some(lines) = read_at_lines_argument(&value)? {
+            for line in lines {
+                self.push_url(line, true, true);
+            }
+        } else {
+            self.push_url(value, false, false);
+        }
+        Ok(())
+    }
+
+    fn append_header_value(&mut self, value: String) -> Result<()> {
+        if let Some(lines) = read_at_lines_argument(&value)? {
+            self.current().headers.extend(lines);
+        } else {
+            self.current().headers.push(value);
+        }
+        Ok(())
+    }
+
+    fn read_write_out_value(&mut self, value: &str) -> Result<String> {
+        if let Some(text) = read_at_text_argument(value)? {
+            Ok(text
+                .chars()
+                .filter(|ch| !matches!(ch, '\r' | '\n'))
+                .collect())
+        } else {
+            Ok(value.to_string())
         }
     }
 
@@ -1824,11 +1866,41 @@ fn shell_words(line: &str) -> Result<Vec<String>> {
     Ok(words)
 }
 
+fn read_at_lines_argument(value: &str) -> Result<Option<Vec<String>>> {
+    let Some(text) = read_at_text_argument(value)? else {
+        return Ok(None);
+    };
+    let lines = text
+        .lines()
+        .filter(|line| {
+            let trimmed = line.trim_start();
+            !trimmed.is_empty() && !trimmed.starts_with('#')
+        })
+        .map(ToString::to_string)
+        .collect();
+    Ok(Some(lines))
+}
+
+fn read_at_text_argument(value: &str) -> Result<Option<String>> {
+    let Some(path) = value.strip_prefix('@') else {
+        return Ok(None);
+    };
+    let text = if path == "-" {
+        let mut text = String::new();
+        std::io::stdin().read_to_string(&mut text)?;
+        text
+    } else {
+        std::fs::read_to_string(path).map_err(|error| CurlError::ReadError(error.to_string()))?
+    };
+    Ok(Some(text))
+}
+
 #[cfg(test)]
 mod tests {
     use std::path::Path;
 
     use super::*;
+    use tempfile::tempdir;
 
     #[test]
     fn parses_common_request_options() {
@@ -1874,6 +1946,45 @@ mod tests {
 
         let transfer = &config.transfers[0];
         assert_eq!(transfer.urls, ["file:///tmp/input"]);
+    }
+
+    #[test]
+    fn expands_at_file_arguments_while_parsing() {
+        let temp = tempdir().unwrap();
+        let urls = temp.path().join("urls.txt");
+        let headers = temp.path().join("headers.txt");
+        let writeout = temp.path().join("writeout.txt");
+        std::fs::write(
+            &urls,
+            "# skipped\nhttps://example.com/one\n\nhttps://example.com/two\n",
+        )
+        .unwrap();
+        std::fs::write(&headers, "# skipped\nAccept:\nX-Blank;\n").unwrap();
+        std::fs::write(&writeout, "code=%{http_code}\nsize=%{size_download}\r\n").unwrap();
+
+        let config = parse_args([
+            "-q",
+            "--url",
+            &format!("@{}", urls.display()),
+            "-H",
+            &format!("@{}", headers.display()),
+            "-w",
+            &format!("@{}", writeout.display()),
+        ])
+        .unwrap();
+
+        let transfer = &config.transfers[0];
+        assert_eq!(
+            transfer.urls,
+            ["https://example.com/one", "https://example.com/two"]
+        );
+        assert_eq!(transfer.url_remote_names, [true, true]);
+        assert_eq!(transfer.url_globoffs, [true, true]);
+        assert_eq!(transfer.headers, ["Accept:", "X-Blank;"]);
+        assert_eq!(
+            transfer.write_out.as_deref(),
+            Some("code=%{http_code}size=%{size_download}")
+        );
     }
 
     #[test]
@@ -2132,6 +2243,36 @@ mod tests {
                 "https://example.com"
             ]
         );
+    }
+
+    #[test]
+    fn config_options_use_at_file_expansion() {
+        let temp = tempdir().unwrap();
+        let urls = temp.path().join("urls.txt");
+        let headers = temp.path().join("headers.txt");
+        let writeout = temp.path().join("writeout.txt");
+        let config_file = temp.path().join("curlrc");
+        std::fs::write(&urls, "https://example.com/config\n").unwrap();
+        std::fs::write(&headers, "X-Config: yes\n").unwrap();
+        std::fs::write(&writeout, "%{http_code}\n").unwrap();
+        std::fs::write(
+            &config_file,
+            format!(
+                "url = @{}\nheader = @{}\nwrite-out = @{}\n",
+                urls.display(),
+                headers.display(),
+                writeout.display()
+            ),
+        )
+        .unwrap();
+
+        let config = parse_args(["-q", "-K", config_file.to_str().unwrap()]).unwrap();
+        let transfer = &config.transfers[0];
+        assert_eq!(transfer.urls, ["https://example.com/config"]);
+        assert_eq!(transfer.url_remote_names, [true]);
+        assert_eq!(transfer.url_globoffs, [true]);
+        assert_eq!(transfer.headers, ["X-Config: yes"]);
+        assert_eq!(transfer.write_out.as_deref(), Some("%{http_code}"));
     }
 
     #[test]

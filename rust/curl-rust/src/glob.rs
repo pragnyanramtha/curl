@@ -4,6 +4,7 @@ use crate::error::{CurlError, Result};
 pub struct ExpandedUrl {
     pub url: String,
     pub variables: Vec<String>,
+    pub remote_name: bool,
 }
 
 pub fn expand_url(input: &str, globoff: bool) -> Result<Vec<ExpandedUrl>> {
@@ -11,6 +12,7 @@ pub fn expand_url(input: &str, globoff: bool) -> Result<Vec<ExpandedUrl>> {
         return Ok(vec![ExpandedUrl {
             url: input.to_string(),
             variables: Vec::new(),
+            remote_name: false,
         }]);
     }
 
@@ -32,6 +34,7 @@ fn expand_recursive(input: &str, variables: Vec<String>) -> Result<Vec<ExpandedU
         return Ok(vec![ExpandedUrl {
             url: input.to_string(),
             variables,
+            remote_name: false,
         }]);
     };
 

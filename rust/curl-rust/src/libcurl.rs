@@ -373,9 +373,11 @@ fn effective_urls(
     body: Option<&PreparedBody>,
 ) -> Result<Vec<String>> {
     let mut urls = Vec::new();
-    for raw in &transfer.urls {
+    for (index, raw) in transfer.urls.iter().enumerate() {
         let raw = glob::apply_default_protocol(raw, transfer.proto_default.as_deref());
-        for expanded in glob::expand_url(&raw, transfer.globoff)? {
+        let globoff =
+            transfer.globoff || transfer.url_globoffs.get(index).copied().unwrap_or(false);
+        for expanded in glob::expand_url(&raw, globoff)? {
             let effective_url =
                 ipfs::maybe_rewrite_url(&expanded.url, transfer.ipfs_gateway.as_deref())?
                     .unwrap_or(expanded.url);
@@ -402,7 +404,7 @@ fn effective_headers(
     transfer: &TransferConfig,
     body: Option<&PreparedBody>,
 ) -> Result<Vec<String>> {
-    let mut headers = expand_header_arguments(&transfer.headers)?;
+    let mut headers = transfer.headers.clone();
     let has_accept = headers
         .iter()
         .any(|header| header_name_is(header, "accept"));
@@ -420,24 +422,6 @@ fn effective_headers(
     }
 
     Ok(headers)
-}
-
-fn expand_header_arguments(headers: &[String]) -> Result<Vec<String>> {
-    let mut expanded = Vec::new();
-    for header in headers {
-        if let Some(path) = header.strip_prefix('@') {
-            let text = std::fs::read_to_string(path)?;
-            expanded.extend(
-                text.lines()
-                    .map(str::trim)
-                    .filter(|line| !line.is_empty())
-                    .map(ToString::to_string),
-            );
-        } else {
-            expanded.push(header.clone());
-        }
-    }
-    Ok(expanded)
 }
 
 fn header_name_is(header: &str, expected: &str) -> bool {

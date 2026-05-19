@@ -1819,6 +1819,56 @@ fn downloads_http_and_renders_writeout() {
 }
 
 #[test]
+fn write_out_at_file_reads_format() {
+    let temp = tempdir().unwrap();
+    let format = temp.path().join("writeout.txt");
+    std::fs::write(&format, " code=%{http_code}\n").unwrap();
+    let (url, rx) = spawn_server(b"HTTP/1.1 200 OK\r\nContent-Length: 5\r\n\r\nhello");
+
+    let mut command = Command::cargo_bin("curl").unwrap();
+    command.args(["-q", "-sS", "-w", &format!("@{}", format.display()), &url]);
+    command.assert().success().stdout("hello code=200");
+
+    let request = rx.recv().unwrap();
+    assert!(request.start_line.starts_with("GET /resource HTTP/1.1"));
+}
+
+#[test]
+fn url_at_file_downloads_each_url_as_remote_name() {
+    let temp = tempdir().unwrap();
+    let (url, rx) = spawn_sequence_server(vec![
+        b"HTTP/1.1 200 OK\r\nContent-Length: 3\r\n\r\none",
+        b"HTTP/1.1 200 OK\r\nContent-Length: 3\r\n\r\ntwo",
+    ]);
+    let origin = gateway_origin(&url);
+    let urls = temp.path().join("urls.txt");
+    std::fs::write(
+        &urls,
+        format!("# skipped\n{origin}/one.txt\n\n{origin}/two.txt\n"),
+    )
+    .unwrap();
+
+    let mut command = Command::cargo_bin("curl").unwrap();
+    command
+        .current_dir(temp.path())
+        .args(["-q", "-sS", "--url", &format!("@{}", urls.display())]);
+    command.assert().success().stdout("");
+
+    assert_eq!(
+        std::fs::read_to_string(temp.path().join("one.txt")).unwrap(),
+        "one"
+    );
+    assert_eq!(
+        std::fs::read_to_string(temp.path().join("two.txt")).unwrap(),
+        "two"
+    );
+    let first = rx.recv().unwrap();
+    let second = rx.recv().unwrap();
+    assert!(first.start_line.starts_with("GET /one.txt HTTP/1.1"));
+    assert!(second.start_line.starts_with("GET /two.txt HTTP/1.1"));
+}
+
+#[test]
 fn custom_user_agent_and_accept_headers_suppress_defaults() {
     let (url, rx) = spawn_server(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok");
 
