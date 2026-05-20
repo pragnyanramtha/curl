@@ -841,6 +841,23 @@ mod tests {
     }
 
     #[test]
+    fn renders_oauth2_bearer_option() {
+        let config = parse_args([
+            "-q",
+            "--libcurl",
+            "client.c",
+            "--oauth2-bearer",
+            "token123",
+            "https://example.com",
+        ])
+        .unwrap();
+
+        let source = render_source(&config).unwrap();
+
+        assert!(source.contains("CURLOPT_XOAUTH2_BEARER, \"token123\""));
+    }
+
+    #[test]
     fn renders_get_data_as_query_and_expands_globs() {
         let config =
             parse_args(["-q", "-G", "-d", "a=b", "https://example.com/item[1-2]"]).unwrap();

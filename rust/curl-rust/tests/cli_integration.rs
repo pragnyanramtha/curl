@@ -8723,6 +8723,8 @@ fn libcurl_writes_source_file_for_supported_options() {
         "alice:secret",
         "-A",
         "MyUA",
+        "--oauth2-bearer",
+        "token123",
         "--resolve",
         &resolve_entry,
         "--connect-to",
@@ -8758,6 +8760,7 @@ fn libcurl_writes_source_file_for_supported_options() {
     assert!(text.contains("CURLOPT_POSTFIELDS, \"a=b\""));
     assert!(text.contains("CURLOPT_POSTFIELDSIZE_LARGE, (curl_off_t)3"));
     assert!(text.contains("CURLOPT_USERPWD, \"alice:secret\""));
+    assert!(text.contains("CURLOPT_XOAUTH2_BEARER, \"token123\""));
     assert!(text.contains("CURLOPT_USERAGENT, \"MyUA\""));
     assert!(text.contains(&format!("curl_slist_append(slist2, \"{resolve_entry}\");")));
     assert!(text.contains("CURLOPT_RESOLVE, slist2"));
