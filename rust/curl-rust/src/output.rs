@@ -8,7 +8,7 @@ use reqwest::header::{
 use reqwest::{StatusCode, Version};
 use url::Url;
 
-use crate::cli::TransferConfig;
+use crate::cli::{FileClobberMode, TransferConfig};
 use crate::error::Result;
 use crate::glob;
 
@@ -77,14 +77,14 @@ pub fn write_response(
                     .append(true)
                     .open(&path)?
                     .write_all(bytes)?;
-            } else if is_header_filename_output {
-                OpenOptions::new()
-                    .write(true)
-                    .create_new(true)
-                    .open(&path)?
-                    .write_all(bytes)?;
             } else {
-                std::fs::write(&path, bytes)?;
+                let (mut file, effective_path) =
+                    open_output_file(&path, transfer.file_clobber_mode, is_header_filename_output)?;
+                if let Err(error) = file.write_all(bytes) {
+                    remove_output_on_write_error(transfer, &effective_path);
+                    return Err(error.into());
+                }
+                return Ok(Some(effective_path));
             }
             Ok(Some(path))
         }
@@ -92,6 +92,81 @@ pub fn write_response(
             io::stdout().write_all(bytes)?;
             Ok(None)
         }
+    }
+}
+
+fn open_output_file(
+    path: &Path,
+    clobber_mode: FileClobberMode,
+    is_header_filename_output: bool,
+) -> io::Result<(std::fs::File, PathBuf)> {
+    if clobber_mode == FileClobberMode::Always
+        || (clobber_mode == FileClobberMode::Default && !is_header_filename_output)
+    {
+        let file = OpenOptions::new()
+            .create(true)
+            .write(true)
+            .truncate(true)
+            .open(path)?;
+        return Ok((file, path.to_path_buf()));
+    }
+
+    if clobber_mode == FileClobberMode::Never {
+        return open_numbered_output_file(path);
+    }
+
+    let file = OpenOptions::new().write(true).create_new(true).open(path)?;
+    Ok((file, path.to_path_buf()))
+}
+
+fn open_numbered_output_file(path: &Path) -> io::Result<(std::fs::File, PathBuf)> {
+    let mut last_error = match OpenOptions::new().write(true).create_new(true).open(path) {
+        Ok(file) => return Ok((file, path.to_path_buf())),
+        Err(error) if should_try_numbered_output(&error) => error,
+        Err(error) => return Err(error),
+    };
+
+    for number in 1..100 {
+        let candidate = numbered_output_path(path, number);
+        match OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&candidate)
+        {
+            Ok(file) => return Ok((file, candidate)),
+            Err(error) if should_try_numbered_output(&error) => last_error = error,
+            Err(error) => return Err(error),
+        }
+    }
+
+    Err(last_error)
+}
+
+fn should_try_numbered_output(error: &io::Error) -> bool {
+    matches!(
+        error.kind(),
+        io::ErrorKind::AlreadyExists | io::ErrorKind::IsADirectory
+    )
+}
+
+fn numbered_output_path(path: &Path, number: u8) -> PathBuf {
+    let mut name = path.as_os_str().to_os_string();
+    name.push(format!(".{number}"));
+    PathBuf::from(name)
+}
+
+fn remove_output_on_write_error(transfer: &TransferConfig, path: &Path) {
+    if !transfer.remove_on_error {
+        return;
+    }
+    let Ok(metadata) = std::fs::metadata(path) else {
+        return;
+    };
+    if !metadata.is_file() {
+        return;
+    }
+    if std::fs::remove_file(path).is_ok() && (transfer.verbose || transfer.trace_output) {
+        eprintln!("Note: Removed output file: {}", path.display());
     }
 }
 

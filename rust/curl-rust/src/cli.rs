@@ -76,6 +76,8 @@ pub struct TransferConfig {
     pub remote_name_all: bool,
     pub remote_header_name: bool,
     pub skip_existing: bool,
+    pub file_clobber_mode: FileClobberMode,
+    pub remove_on_error: bool,
     pub dump_header: Option<PathBuf>,
     pub etag_compare: Option<PathBuf>,
     pub etag_save: Option<PathBuf>,
@@ -155,6 +157,13 @@ impl LocalPortRange {
 pub enum ContinueAt {
     Offset(u64),
     Auto,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FileClobberMode {
+    Default,
+    Never,
+    Always,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -478,6 +487,8 @@ impl Default for TransferConfig {
             remote_name_all: false,
             remote_header_name: false,
             skip_existing: false,
+            file_clobber_mode: FileClobberMode::Default,
+            remove_on_error: false,
             dump_header: None,
             etag_compare: None,
             etag_save: None,
@@ -743,6 +754,7 @@ impl Parser {
                         "--continue-at is mutually exclusive with --range".to_string(),
                     ));
                 }
+                self.reject_continue_at_output_conflicts()?;
                 self.current().continue_at = Some(parse_continue_at(name, &value)?);
             }
             "data" | "data-ascii" => {
@@ -860,6 +872,15 @@ impl Parser {
             "remote-name" => self.set_output_remote_name(),
             "remote-header-name" => self.current().remote_header_name = true,
             "skip-existing" => self.current().skip_existing = true,
+            "clobber" => self.current().file_clobber_mode = FileClobberMode::Always,
+            "remove-on-error" => {
+                if self.current().continue_at.is_some() {
+                    return Err(CurlError::Usage(
+                        "--continue-at is mutually exclusive with --remove-on-error".to_string(),
+                    ));
+                }
+                self.current().remove_on_error = true;
+            }
             "dump-header" => {
                 let value = self.value_for(name, inline_value)?;
                 self.current().dump_header = Some(PathBuf::from(value));
@@ -1070,6 +1091,15 @@ impl Parser {
             "remote-name-all" => self.current().remote_name_all = false,
             "remote-header-name" => self.current().remote_header_name = false,
             "skip-existing" => self.current().skip_existing = false,
+            "clobber" => {
+                if self.current().continue_at.is_some() {
+                    return Err(CurlError::Usage(
+                        "--continue-at is mutually exclusive with --no-clobber".to_string(),
+                    ));
+                }
+                self.current().file_clobber_mode = FileClobberMode::Never;
+            }
+            "remove-on-error" => self.current().remove_on_error = false,
             "location" => self.current().follow_location = false,
             "location-trusted" => {
                 let transfer = self.current();
@@ -1188,6 +1218,7 @@ impl Parser {
                             "--continue-at is mutually exclusive with --range".to_string(),
                         ));
                     }
+                    self.reject_continue_at_output_conflicts()?;
                     self.current().continue_at = Some(parse_continue_at("continue-at", &value)?);
                     break;
                 }
@@ -1499,6 +1530,25 @@ impl Parser {
         append_header_values(&mut self.current().proxy_headers, value)
     }
 
+    fn reject_continue_at_output_conflicts(&self) -> Result<()> {
+        let transfer = self
+            .config
+            .transfers
+            .last()
+            .expect("parser always has a current transfer");
+        if transfer.remove_on_error {
+            return Err(CurlError::Usage(
+                "--continue-at is mutually exclusive with --remove-on-error".to_string(),
+            ));
+        }
+        if transfer.file_clobber_mode == FileClobberMode::Never {
+            return Err(CurlError::Usage(
+                "--continue-at is mutually exclusive with --no-clobber".to_string(),
+            ));
+        }
+        Ok(())
+    }
+
     fn read_write_out_value(&mut self, value: &str) -> Result<String> {
         if let Some(text) = read_at_text_argument(value)? {
             Ok(text
@@ -1709,6 +1759,8 @@ impl TransferConfig {
             || self.remote_name_all
             || self.remote_header_name
             || self.skip_existing
+            || self.file_clobber_mode != FileClobberMode::Default
+            || self.remove_on_error
             || self.dump_header.is_some()
             || self.etag_compare.is_some()
             || self.etag_save.is_some()
@@ -2548,6 +2600,8 @@ fn print_common_help() {
            -O, --remote-name           Write output to remote filename\n\
                --remote-name-all       Use remote filename for all URLs\n\
                --skip-existing         Skip output paths that already exist\n\
+               --no-clobber            Do not overwrite files\n\
+               --remove-on-error       Remove output file on transfer error\n\
                --etag-compare <file>   Load ETag from file\n\
                --etag-save <file>      Save response ETag to file\n\
            -z, --time-cond <time>      Transfer based on time condition\n\
@@ -3038,6 +3092,56 @@ mod tests {
         ])
         .unwrap();
         assert!(!config.transfers[0].skip_existing);
+    }
+
+    #[test]
+    fn parses_clobber_and_remove_on_error_options() {
+        let config = parse_args([
+            "-q",
+            "--no-clobber",
+            "--remove-on-error",
+            "https://example.com",
+        ])
+        .unwrap();
+        let transfer = &config.transfers[0];
+        assert_eq!(transfer.file_clobber_mode, FileClobberMode::Never);
+        assert!(transfer.remove_on_error);
+
+        let config = parse_args([
+            "-q",
+            "--no-clobber",
+            "--clobber",
+            "--remove-on-error",
+            "--no-remove-on-error",
+            "https://example.com",
+        ])
+        .unwrap();
+        let transfer = &config.transfers[0];
+        assert_eq!(transfer.file_clobber_mode, FileClobberMode::Always);
+        assert!(!transfer.remove_on_error);
+    }
+
+    #[test]
+    fn rejects_continue_at_clobber_and_remove_on_error_combinations() {
+        let error = parse_args([
+            "-q",
+            "--no-clobber",
+            "--continue-at",
+            "1",
+            "https://example.com",
+        ])
+        .unwrap_err();
+        assert!(error.to_string().contains("--no-clobber"));
+
+        let error = parse_args([
+            "-q",
+            "--continue-at",
+            "1",
+            "--remove-on-error",
+            "https://example.com",
+        ])
+        .unwrap_err();
+        assert!(error.to_string().contains("--remove-on-error"));
     }
 
     #[test]

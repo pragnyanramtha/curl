@@ -2732,6 +2732,127 @@ fn skip_existing_globbed_outputs_skip_each_expanded_url() {
 }
 
 #[test]
+fn no_clobber_existing_output_writes_numbered_file_and_reports_effective_name() {
+    let temp = tempdir().unwrap();
+    let output = temp.path().join("save");
+    let numbered = temp.path().join("save.1");
+    std::fs::write(&output, "existing").unwrap();
+    let (url, rx) = spawn_server(b"HTTP/1.1 200 OK\r\nContent-Length: 6\r\n\r\n-foo-\n");
+
+    let mut command = Command::cargo_bin("curl").unwrap();
+    command.args([
+        "-q",
+        "-sS",
+        "-o",
+        output.to_str().unwrap(),
+        "--no-clobber",
+        "-w",
+        "%{filename_effective}\n",
+        &url,
+    ]);
+    command
+        .assert()
+        .success()
+        .stdout(format!("{}\n", numbered.display()))
+        .stderr("");
+
+    assert_eq!(std::fs::read_to_string(&output).unwrap(), "existing");
+    assert_eq!(std::fs::read_to_string(&numbered).unwrap(), "-foo-\n");
+    let request = rx.recv().unwrap();
+    assert_eq!(request.start_line, "GET /resource HTTP/1.1");
+}
+
+#[test]
+fn no_clobber_existing_numbered_outputs_fail_after_limit() {
+    let temp = tempdir().unwrap();
+    let output = temp.path().join("save");
+    std::fs::write(&output, "existing").unwrap();
+    for number in 1..100 {
+        std::fs::write(temp.path().join(format!("save.{number}")), "existing").unwrap();
+    }
+    let (url, _rx) = spawn_server(b"HTTP/1.1 200 OK\r\nContent-Length: 6\r\n\r\n-foo-\n");
+
+    let mut command = Command::cargo_bin("curl").unwrap();
+    command.args([
+        "-q",
+        "-sS",
+        "-o",
+        output.to_str().unwrap(),
+        "--no-clobber",
+        &url,
+    ]);
+    command.assert().failure().code(23).stdout("");
+
+    assert_eq!(std::fs::read_to_string(&output).unwrap(), "existing");
+    assert!(!temp.path().join("save.100").exists());
+}
+
+#[test]
+fn clobber_overwrites_existing_output() {
+    let temp = tempdir().unwrap();
+    let output = temp.path().join("save");
+    std::fs::write(&output, "existing").unwrap();
+    let (url, _rx) = spawn_server(b"HTTP/1.1 200 OK\r\nContent-Length: 6\r\n\r\n-foo-\n");
+
+    let mut command = Command::cargo_bin("curl").unwrap();
+    command.args([
+        "-q",
+        "-sS",
+        "-o",
+        output.to_str().unwrap(),
+        "--clobber",
+        &url,
+    ]);
+    command.assert().success().stdout("").stderr("");
+
+    assert_eq!(std::fs::read_to_string(&output).unwrap(), "-foo-\n");
+}
+
+#[test]
+fn remove_on_error_removes_partial_output() {
+    let temp = tempdir().unwrap();
+    let output = temp.path().join("save");
+    let (url, _rx) = spawn_server(b"HTTP/1.1 200 OK\r\nContent-Length: 75\r\n\r\n-foo-\n");
+
+    let mut command = Command::cargo_bin("curl").unwrap();
+    command.args([
+        "-q",
+        "-sS",
+        "-o",
+        output.to_str().unwrap(),
+        "--remove-on-error",
+        &url,
+    ]);
+    command.assert().failure().code(18).stdout("");
+
+    assert!(!output.exists());
+}
+
+#[test]
+fn remove_on_error_with_no_clobber_removes_numbered_output_only() {
+    let temp = tempdir().unwrap();
+    let output = temp.path().join("save");
+    let numbered = temp.path().join("save.1");
+    std::fs::write(&output, "existing").unwrap();
+    let (url, _rx) = spawn_server(b"HTTP/1.1 200 OK\r\nContent-Length: 75\r\n\r\n-foo-\n");
+
+    let mut command = Command::cargo_bin("curl").unwrap();
+    command.args([
+        "-q",
+        "-sS",
+        "-o",
+        output.to_str().unwrap(),
+        "--remove-on-error",
+        "--no-clobber",
+        &url,
+    ]);
+    command.assert().failure().code(18).stdout("");
+
+    assert_eq!(std::fs::read_to_string(&output).unwrap(), "existing");
+    assert!(!numbered.exists());
+}
+
+#[test]
 fn duplicate_location_headers_accept_exact_repeat() {
     let (url, rx) = spawn_server(
         b"HTTP/1.1 200 OK\r\nLocation: this\r\nLocation: this\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok",

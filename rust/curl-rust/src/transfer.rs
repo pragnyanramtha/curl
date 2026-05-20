@@ -843,10 +843,30 @@ async fn run_expanded_url(
         Err(error) => {
             metrics.exit_code = error.exit_code();
             metrics.errormsg = error.to_string();
+            remove_output_on_error(transfer, &metrics);
             report_error(transfer, &error);
             write_writeout(transfer, &metrics)?;
             Ok(metrics.exit_code)
         }
+    }
+}
+
+fn remove_output_on_error(transfer: &TransferConfig, metrics: &writeout::Metrics) {
+    if !transfer.remove_on_error {
+        return;
+    }
+    let Some(filename) = &metrics.filename_effective else {
+        return;
+    };
+    let path = Path::new(filename);
+    let Ok(metadata) = std::fs::metadata(path) else {
+        return;
+    };
+    if !metadata.is_file() {
+        return;
+    }
+    if std::fs::remove_file(path).is_ok() && (transfer.verbose || transfer.trace_output) {
+        eprintln!("Note: Removed output file: {}", path.display());
     }
 }
 
@@ -9807,6 +9827,7 @@ async fn raw_http_read_response(
     validate_redirect_location_headers(&headers)?;
     let retry_after = retry_after_delay(&headers);
     let resume_action = http_resume_action(method, resume_from, status, &headers)?;
+    let mut deferred_error = None;
     let body = if method == Method::HEAD || resume_action == HttpResumeAction::AlreadyComplete {
         Vec::new()
     } else if raw_transfer_decoding && raw_http_response_is_chunked(&headers) {
@@ -9819,8 +9840,12 @@ async fn raw_http_read_response(
             .and_then(|value| value.to_str().ok())
             .and_then(|value| value.parse::<usize>().ok())
     {
-        let mut body = vec![0_u8; length];
-        stream.read_exact(&mut body).await.map_err(tcp_io_error)?;
+        let mut body = Vec::with_capacity(length);
+        let mut limited = stream.take(length as u64);
+        limited.read_to_end(&mut body).await.map_err(tcp_io_error)?;
+        if body.len() < length {
+            deferred_error = Some(CurlError::PartialFile);
+        }
         body
     } else {
         let mut body = Vec::new();
@@ -9838,7 +9863,7 @@ async fn raw_http_read_response(
         body,
         retry_after,
         resume_from,
-        deferred_error: None,
+        deferred_error,
     })
 }
 
