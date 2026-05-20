@@ -53,6 +53,7 @@ set(_curl_rust_corpus_tests
   102
   104
   105
+  106
   107
   109
   112
@@ -72,6 +73,7 @@ set(_curl_rust_corpus_tests
   136
   137
   138
+  143
   147
   148
   182
@@ -259,6 +261,7 @@ set(_curl_rust_corpus_tests
   1027
   1049
   1062
+  1091
   1093
   1094
   1099
@@ -314,6 +317,9 @@ set(_curl_rust_corpus_tests
   1546
   1548
   1563
+  1584
+  1585
+  1613
   1617
   1673
   1714

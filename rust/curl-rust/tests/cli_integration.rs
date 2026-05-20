@@ -4843,6 +4843,70 @@ fn ftp_use_ascii_download_sends_type_a_without_size() {
 }
 
 #[test]
+fn ftp_url_type_ascii_download_strips_suffix_and_skips_size() {
+    let (url, rx) = spawn_ftp_server(
+        "//path%20with%20%20spaces//and%20things2/106;type=A",
+        ftp_options(b"ascii url type"),
+    );
+
+    let mut command = Command::cargo_bin("curl").unwrap();
+    command.args(["-q", "-sS", &url]);
+    command.assert().success().stdout("ascii url type");
+
+    let record = rx.recv().unwrap();
+    assert_eq!(
+        record.commands,
+        b"USER anonymous\r\nPASS ftp@example.com\r\nPWD\r\nCWD /\r\nCWD path with  spaces\r\nCWD and things2\r\nEPSV\r\nTYPE A\r\nRETR 106\r\nQUIT\r\n"
+    );
+    assert_eq!(record.data_connections, 1);
+}
+
+#[test]
+fn ftp_url_type_ascii_absolute_path_uses_type_a() {
+    let (url, rx) = spawn_ftp_server("/%2ftmp/moo/143;type=a", ftp_options(b"lower type a"));
+
+    let mut command = Command::cargo_bin("curl").unwrap();
+    command.args(["-q", "-sS", &url]);
+    command.assert().success().stdout("lower type a");
+
+    let record = rx.recv().unwrap();
+    assert_eq!(
+        record.commands,
+        b"USER anonymous\r\nPASS ftp@example.com\r\nPWD\r\nCWD /\r\nCWD tmp\r\nCWD moo\r\nEPSV\r\nTYPE A\r\nRETR 143\r\nQUIT\r\n"
+    );
+}
+
+#[test]
+fn ftp_url_type_binary_overrides_use_ascii() {
+    let (url, rx) = spawn_ftp_server("/%2ftmp/moo/1091;type=i", ftp_options(b"binary url type"));
+
+    let mut command = Command::cargo_bin("curl").unwrap();
+    command.args(["-q", "-sS", "--use-ascii", &url]);
+    command.assert().success().stdout("binary url type");
+
+    let record = rx.recv().unwrap();
+    assert_eq!(
+        record.commands,
+        b"USER anonymous\r\nPASS ftp@example.com\r\nPWD\r\nCWD /\r\nCWD tmp\r\nCWD moo\r\nEPSV\r\nTYPE I\r\nSIZE 1091\r\nRETR 1091\r\nQUIT\r\n"
+    );
+}
+
+#[test]
+fn ftp_url_type_directory_uses_nlst_for_file_path() {
+    let (url, rx) = spawn_ftp_server("/1570;type=D", ftp_options(b"type d listing"));
+
+    let mut command = Command::cargo_bin("curl").unwrap();
+    command.args(["-q", "-sS", &url]);
+    command.assert().success().stdout("type d listing");
+
+    let record = rx.recv().unwrap();
+    assert_eq!(
+        record.commands,
+        b"USER anonymous\r\nPASS ftp@example.com\r\nPWD\r\nEPSV\r\nTYPE A\r\nNLST\r\nQUIT\r\n"
+    );
+}
+
+#[test]
 fn ftp_directory_url_lists_with_type_a_and_list() {
     let listing = b"drwxr-xr-x pub\r\n-rw-r--r-- README\r\n";
     let (url, rx) = spawn_ftp_server("/pub/", ftp_options(&listing[..]));

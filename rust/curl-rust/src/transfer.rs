@@ -1070,21 +1070,21 @@ async fn run_ftp_exchange(
         .ok_or_else(|| CurlError::Url("FTP URL is missing a host".to_string()))?;
     let port = url.port().unwrap_or(FTP_DEFAULT_PORT);
     let path = ftp_path(&url)?;
+    let ftp_list_only = ftp_effective_list_only(transfer, &path);
+    let ftp_ascii = ftp_effective_ascii(transfer, &path);
     if transfer.range.is_some()
         && (upload.is_some()
             || method == "HEAD"
             || transfer.head
-            || transfer.use_ascii
-            || transfer.list_only
+            || ftp_ascii
+            || ftp_list_only
             || path.file.is_none())
     {
         return Err(CurlError::Unsupported(
             "FTP range requests in the Rust sidecar".to_string(),
         ));
     }
-    if upload.is_none()
-        && transfer.continue_at.is_some()
-        && (transfer.list_only || path.file.is_none())
+    if upload.is_none() && transfer.continue_at.is_some() && (ftp_list_only || path.file.is_none())
     {
         return Err(CurlError::Unsupported(
             "FTP resume for directory listings in the Rust sidecar".to_string(),
@@ -1288,6 +1288,14 @@ async fn run_ftp_exchange(
 struct FtpPath {
     directories: Vec<Vec<u8>>,
     file: Option<Vec<u8>>,
+    url_type: Option<FtpUrlType>,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum FtpUrlType {
+    Ascii,
+    Binary,
+    Directory,
 }
 
 struct FtpResponse {
@@ -1422,7 +1430,8 @@ async fn ftp_download_body(
 ) -> Result<FtpDownloadBody> {
     let mut data_stream =
         ftp_open_passive_data(transfer, stream, host, metrics, control_headers).await?;
-    let ascii = transfer.use_ascii || transfer.list_only || path.file.is_none();
+    let list_only = ftp_effective_list_only(transfer, path);
+    let ascii = ftp_effective_ascii(transfer, path);
     ftp_set_type(
         stream,
         if ascii { b'A' } else { b'I' },
@@ -1432,11 +1441,7 @@ async fn ftp_download_body(
     .await?;
     ftp_run_quote_commands(stream, &transfer.ftp_prequote, metrics, control_headers).await?;
 
-    if let Some(file) = path
-        .file
-        .as_ref()
-        .filter(|_| !transfer.use_ascii && !transfer.list_only)
-    {
+    if let Some(file) = path.file.as_ref().filter(|_| !ascii && !list_only) {
         let mut size_command = Vec::from(&b"SIZE "[..]);
         size_command.extend_from_slice(file);
         let response = ftp_command(stream, &size_command, metrics, control_headers).await?;
@@ -1476,7 +1481,7 @@ async fn ftp_download_body(
             ftp_require_code(&response, &[350], CurlError::FtpCouldntUseRest)?;
         }
 
-        let command = ftp_transfer_command(path, transfer.list_only);
+        let command = ftp_transfer_command(path, list_only);
         let response = ftp_command(stream, &command, metrics, control_headers).await?;
         if response.code / 100 != 1 {
             return if command.starts_with(b"RETR ") && response.code == 550 {
@@ -1516,7 +1521,7 @@ async fn ftp_download_body(
         return Ok(FtpDownloadBody::new(body));
     }
 
-    let command = ftp_transfer_command(path, transfer.list_only);
+    let command = ftp_transfer_command(path, list_only);
     let response = ftp_command(stream, &command, metrics, control_headers).await?;
     if response.code / 100 != 1 {
         return if command.starts_with(b"RETR ") && response.code == 550 {
@@ -1734,6 +1739,22 @@ fn ftp_transfer_command(path: &FtpPath, list_only: bool) -> Vec<u8> {
     }
 }
 
+fn ftp_effective_list_only(transfer: &TransferConfig, path: &FtpPath) -> bool {
+    transfer.list_only || path.url_type == Some(FtpUrlType::Directory)
+}
+
+fn ftp_effective_ascii(transfer: &TransferConfig, path: &FtpPath) -> bool {
+    if path.file.is_none() || ftp_effective_list_only(transfer, path) {
+        return true;
+    }
+    match path.url_type {
+        Some(FtpUrlType::Ascii) => true,
+        Some(FtpUrlType::Binary) => false,
+        Some(FtpUrlType::Directory) => true,
+        None => transfer.use_ascii,
+    }
+}
+
 async fn ftp_command(
     stream: &mut TcpStream,
     command: &[u8],
@@ -1905,6 +1926,7 @@ fn ftp_parse_pasv_numbers(bytes: &[u8]) -> Option<[u8; 6]> {
 
 fn ftp_path(url: &Url) -> Result<FtpPath> {
     let encoded = url.path().strip_prefix('/').unwrap_or(url.path());
+    let (encoded, url_type) = ftp_strip_url_type(encoded);
     let decoded = percent_decode(encoded.as_bytes()).collect::<Vec<_>>();
     if has_control_byte(&decoded) {
         return Err(CurlError::Url(
@@ -1930,7 +1952,22 @@ fn ftp_path(url: &Url) -> Result<FtpPath> {
     Ok(FtpPath {
         directories: ftp_directory_components(directory_bytes),
         file,
+        url_type,
     })
+}
+
+fn ftp_strip_url_type(path: &str) -> (&str, Option<FtpUrlType>) {
+    let bytes = path.as_bytes();
+    if bytes.len() < 7 || &bytes[bytes.len() - 7..bytes.len() - 1] != b";type=" {
+        return (path, None);
+    }
+
+    let url_type = match bytes[bytes.len() - 1].to_ascii_uppercase() {
+        b'A' => FtpUrlType::Ascii,
+        b'D' => FtpUrlType::Directory,
+        _ => FtpUrlType::Binary,
+    };
+    (&path[..path.len() - 7], Some(url_type))
 }
 
 fn ftp_directory_components(path: &[u8]) -> Vec<Vec<u8>> {
