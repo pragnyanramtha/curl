@@ -182,6 +182,7 @@ pub async fn run(config: Config) -> Result<i32> {
         let client = build_client(transfer, cookie_jar.clone())?;
         let expanded_urls = expand_urls(transfer)?;
         let mut session = TransferSession::default();
+        let mut stop_after_group = false;
 
         for expanded in expanded_urls {
             let code = run_expanded_url(
@@ -193,10 +194,18 @@ pub async fn run(config: Config) -> Result<i32> {
             )
             .await?;
             final_code = code;
+            if config.fail_early && code != 0 {
+                stop_after_group = true;
+                break;
+            }
         }
 
         if let (Some(path), Some(cookie_jar)) = (&transfer.cookie_jar, &cookie_jar) {
             cookie_jar.save_to_path(path, transfer.create_dirs, transfer.verbose);
+        }
+
+        if stop_after_group {
+            break;
         }
     }
 

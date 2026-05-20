@@ -7730,6 +7730,29 @@ fn unknown_url_scheme_exits_unsupported_protocol() {
 }
 
 #[test]
+fn fail_early_stops_after_first_sequential_error() {
+    let (url, rx) = spawn_server(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok");
+
+    let mut command = Command::cargo_bin("curl").unwrap();
+    command.args(["-q", "-sS", "--fail-early", "htfp://127.0.0.1:9/bad", &url]);
+    command.assert().failure().code(1).stdout("");
+
+    assert!(rx.recv_timeout(Duration::from_millis(100)).is_err());
+}
+
+#[test]
+fn no_fail_early_continues_after_sequential_error() {
+    let (url, rx) = spawn_server(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok");
+
+    let mut command = Command::cargo_bin("curl").unwrap();
+    command.args(["-q", "-sS", "htfp://127.0.0.1:9/bad", &url]);
+    command.assert().success().stdout("ok");
+
+    let request = rx.recv().unwrap();
+    assert!(request.start_line.starts_with("GET /resource HTTP/1.1"));
+}
+
+#[test]
 fn version_lists_smb_protocol() {
     let mut command = Command::cargo_bin("curl").unwrap();
     let output = command.args(["-q", "-V"]).output().unwrap();

@@ -24,6 +24,7 @@ pub struct Config {
     pub parallel_immediate: bool,
     pub parallel_max: usize,
     pub parallel_max_host: usize,
+    pub fail_early: bool,
     pub transfers: Vec<TransferConfig>,
 }
 
@@ -409,6 +410,7 @@ impl Default for Config {
             parallel_immediate: false,
             parallel_max: PARALLEL_DEFAULT,
             parallel_max_host: PARALLEL_MAX_HOST_DEFAULT,
+            fail_early: false,
             transfers: vec![TransferConfig::default()],
         }
     }
@@ -676,6 +678,7 @@ impl Parser {
                     PARALLEL_MAX_LIMIT,
                 )?;
             }
+            "fail-early" => self.config.fail_early = true,
             "request" => {
                 let value = self.value_for(name, inline_value)?;
                 self.current().method = Some(value);
@@ -1041,6 +1044,7 @@ impl Parser {
             "include" => self.current().include_headers = false,
             "parallel" => self.config.parallel = false,
             "parallel-immediate" => self.config.parallel_immediate = false,
+            "fail-early" => self.config.fail_early = false,
             "remote-name" => self.current().remote_name = false,
             "remote-header-name" => self.current().remote_header_name = false,
             "location" => self.current().follow_location = false,
@@ -2456,6 +2460,7 @@ fn print_common_help() {
                --post303               Keep POST after 303 redirect\n\
            -Z, --parallel              Perform transfers in parallel\n\
                --parallel-max <num>    Maximum parallel transfer count\n\
+               --fail-early            Fail on first transfer error\n\
                --retry <num>           Retry transient transfer problems\n\
                --retry-delay <seconds> Wait time between retries\n\
                --retry-max-time <sec>  Retry only within this period\n\
@@ -4330,6 +4335,46 @@ mod tests {
         ])
         .unwrap();
         assert!(!config.parallel_immediate);
+    }
+
+    #[test]
+    fn parses_fail_early_as_global_state() {
+        let config = parse_args(["-q", "--fail-early", "https://example.com"]).unwrap();
+        assert!(config.fail_early);
+
+        let config = parse_args([
+            "-q",
+            "--fail-early",
+            "--no-fail-early",
+            "https://example.com",
+        ])
+        .unwrap();
+        assert!(!config.fail_early);
+
+        let config = parse_args([
+            "-q",
+            "https://first.example",
+            "--next",
+            "--fail-early",
+            "https://second.example",
+        ])
+        .unwrap();
+        assert!(config.fail_early);
+        assert_eq!(config.transfers.len(), 2);
+    }
+
+    #[test]
+    fn config_files_parse_fail_early_global_option() {
+        let temp = tempdir().unwrap();
+        let config_file = temp.path().join("curlrc");
+        std::fs::write(
+            &config_file,
+            "fail-early\nno-fail-early\nurl = https://example.com\n",
+        )
+        .unwrap();
+
+        let config = parse_args(["-q", "--config", config_file.to_str().unwrap()]).unwrap();
+        assert!(!config.fail_early);
     }
 
     #[test]
