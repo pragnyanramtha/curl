@@ -5742,6 +5742,52 @@ fn tftp_rejects_decoded_nul_path() {
 }
 
 #[test]
+fn tftp_rejects_initial_request_packet_over_default_block_size() {
+    let filename = "a".repeat(504);
+    let url = format!("tftp://127.0.0.1:9/{filename}");
+
+    let mut command = Command::cargo_bin("curl").unwrap();
+    command.args(["-q", "-sS", "--max-time", "1", &url]);
+    command.assert().failure().code(71).stdout("");
+}
+
+#[test]
+fn tftp_requested_block_size_does_not_expand_initial_request_limit() {
+    let filename = "a".repeat(504);
+    let url = format!("tftp://127.0.0.1:9/{filename}");
+
+    let mut command = Command::cargo_bin("curl").unwrap();
+    command.args([
+        "-q",
+        "-sS",
+        "--max-time",
+        "1",
+        "--tftp-blksize",
+        "1024",
+        &url,
+    ]);
+    command.assert().failure().code(71).stdout("");
+}
+
+#[test]
+fn tftp_no_options_allows_initial_request_at_default_block_size() {
+    let filename = "a".repeat(503);
+    let path = format!("/{filename}");
+    let (url, rx) = spawn_tftp_server(vec![b"fits".to_vec()]);
+    let url = url.replace("/file.txt", &path);
+
+    let mut command = Command::cargo_bin("curl").unwrap();
+    command.args(["-q", "-sS", "--tftp-no-options", &url]);
+    command.assert().success().stdout("fits");
+
+    let record = rx.recv().unwrap();
+    assert_eq!(record.request.len(), 512);
+    assert_eq!(&record.request[..2], b"\0\x01");
+    assert_eq!(&record.request[2..2 + filename.len()], filename.as_bytes());
+    assert_eq!(&record.request[2 + filename.len()..], b"\0octet\0");
+}
+
+#[test]
 fn tftp_upload_file_sends_wrq_and_data() {
     let (url, rx) = spawn_tftp_upload_server(tftp_ack(0), 512);
     let url = url.replace("/upload.bin", "//");

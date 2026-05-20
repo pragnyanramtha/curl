@@ -3640,6 +3640,7 @@ async fn run_tftp_exchange(
             request_timeout,
         )
     };
+    validate_tftp_initial_request_size(&request)?;
 
     let peer_addr = resolve_tokio_socket_addrs(host, port, transfer.ip_version)
         .await?
@@ -7053,6 +7054,13 @@ fn strip_tftp_mode_suffix(value: &mut Vec<u8>, suffix: &[u8]) -> bool {
     } else {
         false
     }
+}
+
+fn validate_tftp_initial_request_size(packet: &[u8]) -> Result<()> {
+    if packet.len() > usize::from(TFTP_DEFAULT_BLKSIZE) {
+        return Err(CurlError::TftpIllegal);
+    }
+    Ok(())
 }
 
 struct MqttPacket {
