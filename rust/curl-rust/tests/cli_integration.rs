@@ -9747,6 +9747,41 @@ fn dump_header_dash_writes_headers_to_stdout() {
 }
 
 #[test]
+fn dump_header_records_manual_redirect_history() {
+    let (url, rx) = spawn_sequence_server(vec![
+        b"HTTP/1.1 301 Moved Permanently\r\nLocation: /next\r\nX-Hop: one\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+        b"HTTP/1.1 200 OK\r\nX-Hop: two\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok",
+    ]);
+    let temp = tempdir().unwrap();
+    let dump_path = temp.path().join("headers.txt");
+
+    let mut command = Command::cargo_bin("curl").unwrap();
+    command.args([
+        "-q",
+        "-sS",
+        "-L",
+        "--post301",
+        "-d",
+        "moo",
+        "-D",
+        dump_path.to_str().unwrap(),
+        &url,
+    ]);
+    command.assert().success().stdout("ok");
+
+    let first = rx.recv().unwrap();
+    let second = rx.recv().unwrap();
+    assert!(first.start_line.starts_with("POST /resource HTTP/1.1"));
+    assert!(second.start_line.starts_with("POST /next HTTP/1.1"));
+
+    let headers = std::fs::read_to_string(dump_path).unwrap();
+    assert!(headers.contains("HTTP/1.1 301 Moved Permanently\r\n"));
+    assert!(headers.contains("x-hop: one\r\n"));
+    assert!(headers.contains("HTTP/1.1 200 OK\r\n"));
+    assert!(headers.contains("x-hop: two\r\n"));
+}
+
+#[test]
 fn dump_header_missing_parent_exits_write_error() {
     let temp = tempdir().unwrap();
     let dump_path = temp.path().join("missing").join("headers.txt");

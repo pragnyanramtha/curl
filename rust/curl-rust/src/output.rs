@@ -129,6 +129,27 @@ pub fn dump_headers(path: &Path, bytes: &[u8], create_dirs: bool) -> Result<()> 
     Ok(())
 }
 
+pub fn append_dump_headers(path: &Path, bytes: &[u8], create_dirs: bool) -> Result<()> {
+    if path == Path::new("-") {
+        io::stdout().write_all(bytes)?;
+        return Ok(());
+    }
+
+    if create_dirs
+        && let Some(parent) = path
+            .parent()
+            .filter(|parent| !parent.as_os_str().is_empty())
+    {
+        std::fs::create_dir_all(parent)?;
+    }
+    OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)?
+        .write_all(bytes)?;
+    Ok(())
+}
+
 pub fn prepare_dump_header_target(path: &Path, create_dirs: bool) -> Result<()> {
     if path == Path::new("-") {
         return Ok(());

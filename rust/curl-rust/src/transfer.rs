@@ -7948,6 +7948,11 @@ async fn run_http_transfer(
             && is_followed_redirect(status)
             && let Some(next_url) = redirect_location(&final_url, &headers)?
         {
+            if let Some(path) = &transfer.dump_header {
+                let header_bytes = output::render_headers(version, status, &headers);
+                output::append_dump_headers(path, &header_bytes, transfer.create_dirs)?;
+            }
+
             if redirects >= transfer.max_redirs {
                 metrics.url_effective = final_url.to_string();
                 metrics.response_code = Some(status.as_u16());
@@ -8729,7 +8734,7 @@ fn write_http_attempt_output(
             .unwrap_or_default()
     });
     if persist_headers && let Some(path) = &transfer.dump_header {
-        output::dump_headers(path, &header_bytes, transfer.create_dirs)?;
+        output::append_dump_headers(path, &header_bytes, transfer.create_dirs)?;
     }
     if persist_headers && let Some(path) = &transfer.etag_save {
         save_etag(path, &attempt.headers, transfer.create_dirs)?;
