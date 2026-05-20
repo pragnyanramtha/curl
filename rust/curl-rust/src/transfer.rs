@@ -168,9 +168,7 @@ pub async fn run(config: Config) -> Result<i32> {
 
         for expanded in expanded_urls {
             let code = run_expanded_url(transfer, &client, cookie_jar.as_ref(), expanded).await?;
-            if code != 0 {
-                final_code = code;
-            }
+            final_code = code;
         }
 
         if let (Some(path), Some(cookie_jar)) = (&transfer.cookie_jar, &cookie_jar) {

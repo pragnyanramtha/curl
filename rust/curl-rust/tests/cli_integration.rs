@@ -90,6 +90,12 @@ struct TftpUploadRecord {
 }
 
 #[derive(Debug)]
+struct TftpSequenceRecord {
+    requests: Vec<Vec<u8>>,
+    acknowledgements: Vec<Vec<u8>>,
+}
+
+#[derive(Debug)]
 struct FtpRecord {
     commands: Vec<u8>,
     data_connections: usize,
@@ -1094,6 +1100,51 @@ fn spawn_tftp_server_with_oack(
     });
 
     (format!("tftp://{addr}/file.txt"), rx)
+}
+
+fn spawn_tftp_missing_then_success_server(
+    blocks: Vec<Vec<u8>>,
+) -> (String, Receiver<TftpSequenceRecord>) {
+    let socket = UdpSocket::bind("127.0.0.1:0").unwrap();
+    let addr = socket.local_addr().unwrap();
+    let (tx, rx) = mpsc::channel();
+
+    thread::spawn(move || {
+        let mut buffer = vec![0; 70_000];
+        let mut requests = Vec::new();
+        let mut acknowledgements = Vec::new();
+
+        let (read, first_peer) = socket.recv_from(&mut buffer).unwrap();
+        requests.push(buffer[..read].to_vec());
+        let mut error = Vec::from(&5_u16.to_be_bytes()[..]);
+        error.extend_from_slice(&1_u16.to_be_bytes());
+        error.extend_from_slice(b"missing");
+        error.push(0);
+        socket.send_to(&error, first_peer).unwrap();
+
+        let (read, second_peer) = socket.recv_from(&mut buffer).unwrap();
+        requests.push(buffer[..read].to_vec());
+        for (index, block) in blocks.iter().enumerate() {
+            let block_number = u16::try_from(index + 1).unwrap();
+            let mut packet = Vec::with_capacity(block.len() + 4);
+            packet.extend_from_slice(&3_u16.to_be_bytes());
+            packet.extend_from_slice(&block_number.to_be_bytes());
+            packet.extend_from_slice(block);
+            socket.send_to(&packet, second_peer).unwrap();
+
+            let (read, ack_peer) = socket.recv_from(&mut buffer).unwrap();
+            assert_eq!(ack_peer, second_peer);
+            acknowledgements.push(buffer[..read].to_vec());
+        }
+
+        tx.send(TftpSequenceRecord {
+            requests,
+            acknowledgements,
+        })
+        .unwrap();
+    });
+
+    (format!("tftp://{addr}"), rx)
 }
 
 fn tftp_oack(options: &[(&str, &str)]) -> Vec<u8> {
@@ -6050,6 +6101,27 @@ fn tftp_error_packet_maps_not_found() {
             .unwrap()
             .starts_with(b"\0\x01missing.txt\0octet\0")
     );
+}
+
+#[test]
+fn tftp_missing_first_url_does_not_override_later_success() {
+    let (base_url, rx) = spawn_tftp_missing_then_success_server(vec![b"found".to_vec()]);
+    let missing_url = format!("{base_url}/missing.txt");
+    let found_url = format!("{base_url}/found.txt");
+
+    let mut command = Command::cargo_bin("curl").unwrap();
+    command.args(["-q", "-sS", &missing_url, &found_url]);
+    command
+        .assert()
+        .success()
+        .stdout("found")
+        .stderr("curl: (68) TFTP: File Not Found\n");
+
+    let record = rx.recv().unwrap();
+    assert_eq!(record.requests.len(), 2);
+    assert!(record.requests[0].starts_with(b"\0\x01missing.txt\0octet\0"));
+    assert!(record.requests[1].starts_with(b"\0\x01found.txt\0octet\0"));
+    assert_eq!(record.acknowledgements, [b"\0\x04\0\x01".to_vec()]);
 }
 
 #[test]
