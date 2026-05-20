@@ -335,6 +335,19 @@ add_custom_target(curl-rust-test
 )
 
 if(CURL_BUILD_TESTING AND PERL_EXECUTABLE)
+  set(_curl_rust_corpus_deps
+    curl-rust
+    servers
+    libtests
+    build-certs
+  )
+  if(TARGET ${EXE_NAME})
+    list(APPEND _curl_rust_corpus_deps ${EXE_NAME})
+  endif()
+  if(TARGET curlinfo)
+    list(APPEND _curl_rust_corpus_deps curlinfo)
+  endif()
+
   add_custom_target(curl-rust-corpus-test
     COMMAND ${CMAKE_COMMAND} -E env
       "srcdir=${PROJECT_SOURCE_DIR}/tests"
@@ -343,7 +356,7 @@ if(CURL_BUILD_TESTING AND PERL_EXECUTABLE)
         -c "${_curl_rust_sidecar}"
         ${_curl_rust_corpus_tests}
         "\$TFLAGS"
-    DEPENDS curl-rust testdeps
+    DEPENDS ${_curl_rust_corpus_deps}
     WORKING_DIRECTORY "${PROJECT_BINARY_DIR}/tests"
     COMMENT "Running curl corpus smoke tests with Rust sidecar"
     VERBATIM USES_TERMINAL
