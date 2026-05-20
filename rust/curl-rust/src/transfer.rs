@@ -8152,6 +8152,7 @@ async fn run_http_transfer(
         && transfer.follow_location
         && raw_http_direct_redirect_supported(transfer, &url, has_multipart)
         && (transfer.request_target.is_some()
+            || transfer.raw
             || initial_connect_to.is_some()
             || custom_host_header
             || (method != Method::HEAD && max_filesize_limit(transfer).is_some()))
@@ -8337,7 +8338,7 @@ async fn run_http_transfer(
     if let Some(proxy) = explicit_proxy.as_ref()
         && transfer.follow_location
         && raw_http_proxy_redirect_supported(transfer, &url, has_multipart)
-        && transfer.request_target.is_some()
+        && (transfer.request_target.is_some() || transfer.raw)
     {
         let custom_method = transfer.method.is_some();
         let post_redirect_body =
@@ -8481,6 +8482,7 @@ async fn run_http_transfer(
     if explicit_proxy.is_none()
         && raw_http_direct_supported(transfer, &url, has_multipart)
         && (transfer.request_target.is_some()
+            || transfer.raw
             || transfer.compressed
             || raw_custom_header_wire_semantics
             || method == Method::HEAD
@@ -8838,6 +8840,7 @@ async fn run_raw_http_proxy_transfer(context: RawHttpProxyContext<'_>) -> Result
         context.url,
         context.resume_from,
         context.transfer.http09_allowed,
+        context.transfer.raw,
     )
     .await?;
     decode_http_attempt_body(context.transfer, &mut attempt)?;
@@ -8936,6 +8939,7 @@ async fn raw_http_send_direct_request(
         context.url,
         context.resume_from,
         context.transfer.http09_allowed,
+        context.transfer.raw,
     )
     .await
 }
@@ -9276,6 +9280,7 @@ async fn raw_http_read_response(
     final_url: &Url,
     resume_from: u64,
     http09_allowed: bool,
+    raw_transfer_decoding: bool,
 ) -> Result<HttpAttempt> {
     let mut header_bytes = Vec::new();
     let mut byte = [0_u8; 1];
@@ -9316,6 +9321,8 @@ async fn raw_http_read_response(
     let resume_action = http_resume_action(method, resume_from, status, &headers)?;
     let body = if method == Method::HEAD || resume_action == HttpResumeAction::AlreadyComplete {
         Vec::new()
+    } else if raw_transfer_decoding && raw_http_response_is_chunked(&headers) {
+        raw_http_read_chunked_wire_body(stream).await?
     } else if raw_http_response_is_chunked(&headers) {
         raw_http_read_chunked_body(stream).await?
     } else if let Some(length) = headers
@@ -9359,12 +9366,7 @@ async fn raw_http_read_chunked_body(stream: &mut TcpStream) -> Result<Vec<u8>> {
     let mut body = Vec::new();
     loop {
         let line = raw_http_read_line(stream).await?;
-        let size_text = line
-            .trim_end_matches(['\r', '\n'])
-            .split_once(';')
-            .map_or(line.trim_end_matches(['\r', '\n']), |(size, _)| size)
-            .trim();
-        let size = usize::from_str_radix(size_text, 16).map_err(|_| CurlError::WeirdServerReply)?;
+        let size = raw_http_chunk_size(&line)?;
         if size == 0 {
             loop {
                 let trailer = raw_http_read_line(stream).await?;
@@ -9387,6 +9389,47 @@ async fn raw_http_read_chunked_body(stream: &mut TcpStream) -> Result<Vec<u8>> {
             return Err(CurlError::WeirdServerReply);
         }
     }
+}
+
+async fn raw_http_read_chunked_wire_body(stream: &mut TcpStream) -> Result<Vec<u8>> {
+    let mut body = Vec::new();
+    loop {
+        let line = raw_http_read_line(stream).await?;
+        body.extend_from_slice(line.as_bytes());
+        let size = raw_http_chunk_size(&line)?;
+        if size == 0 {
+            loop {
+                let trailer = raw_http_read_line(stream).await?;
+                body.extend_from_slice(trailer.as_bytes());
+                if trailer == "\r\n" || trailer == "\n" || trailer.trim().is_empty() {
+                    return Ok(body);
+                }
+            }
+        }
+
+        let mut chunk = vec![0_u8; size];
+        stream.read_exact(&mut chunk).await.map_err(tcp_io_error)?;
+        body.extend_from_slice(&chunk);
+
+        let mut terminator = [0_u8; 2];
+        stream
+            .read_exact(&mut terminator)
+            .await
+            .map_err(tcp_io_error)?;
+        if terminator != *b"\r\n" {
+            return Err(CurlError::WeirdServerReply);
+        }
+        body.extend_from_slice(&terminator);
+    }
+}
+
+fn raw_http_chunk_size(line: &str) -> Result<usize> {
+    let size_text = line
+        .trim_end_matches(['\r', '\n'])
+        .split_once(';')
+        .map_or(line.trim_end_matches(['\r', '\n']), |(size, _)| size)
+        .trim();
+    usize::from_str_radix(size_text, 16).map_err(|_| CurlError::WeirdServerReply)
 }
 
 async fn raw_http_read_line(stream: &mut TcpStream) -> Result<String> {
@@ -9449,7 +9492,7 @@ fn decode_http_body_if_compressed(
     headers: &HeaderMap,
     body: Vec<u8>,
 ) -> Result<Vec<u8>> {
-    if !transfer.compressed || body.is_empty() {
+    if !transfer.compressed || transfer.raw || body.is_empty() {
         return Ok(body);
     }
 

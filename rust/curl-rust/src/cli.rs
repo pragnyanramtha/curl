@@ -119,6 +119,7 @@ pub struct TransferConfig {
     pub cookie_jar: Option<PathBuf>,
     pub junk_session_cookies: bool,
     pub compressed: bool,
+    pub raw: bool,
     pub verbose: bool,
     pub silent: bool,
     pub show_error: bool,
@@ -505,6 +506,7 @@ impl Default for TransferConfig {
             cookie_jar: None,
             junk_session_cookies: false,
             compressed: false,
+            raw: false,
             verbose: false,
             silent: false,
             show_error: false,
@@ -973,6 +975,7 @@ impl Parser {
             }
             "junk-session-cookies" => self.current().junk_session_cookies = true,
             "compressed" => self.current().compressed = true,
+            "raw" => self.current().raw = true,
             "verbose" => self.current().verbose = true,
             "trace" | "trace-ascii" => {
                 let _ = self.value_for(name, inline_value)?;
@@ -1071,6 +1074,7 @@ impl Parser {
             "proto-default" => self.current().proto_default = None,
             "out-null" => self.set_output_null(),
             "compressed" => self.current().compressed = false,
+            "raw" => self.current().raw = false,
             "verbose" => self.current().verbose = false,
             "progress-meter" => self.current().silent = true,
             "silent" => self.current().silent = false,
@@ -1702,6 +1706,7 @@ impl TransferConfig {
             || self.cookie_jar.is_some()
             || self.junk_session_cookies
             || self.compressed
+            || self.raw
             || self.verbose
             || self.silent
             || self.show_error
@@ -2384,6 +2389,7 @@ fn print_common_help() {
                --expand-* <value>      Expand variables in option value\n\
                --libcurl <file>        Generate libcurl code\n\
                --http0.9              Allow HTTP/0.9 responses\n\
+               --raw                  Do HTTP raw; no transfer decoding\n\
            -X, --request <method>      Specify request method\n\
                --request-target <path> Specify request target\n\
            -u, --user <user:pass>      Server user and password\n\
@@ -2835,6 +2841,15 @@ mod tests {
     }
 
     #[test]
+    fn parses_raw_boolean_option() {
+        let config = parse_args(["-q", "--raw", "https://example.com"]).unwrap();
+        assert!(config.transfers[0].raw);
+
+        let config = parse_args(["-q", "--raw", "--no-raw", "https://example.com"]).unwrap();
+        assert!(!config.transfers[0].raw);
+    }
+
+    #[test]
     fn config_files_parse_request_target_option() {
         let temp = tempdir().unwrap();
         let config_file = temp.path().join("curlrc");
@@ -2860,6 +2875,16 @@ mod tests {
 
         let config = parse_args(["-q", "--config", config_file.to_str().unwrap()]).unwrap();
         assert!(!config.transfers[0].http09_allowed);
+    }
+
+    #[test]
+    fn config_files_parse_raw_boolean_option() {
+        let temp = tempdir().unwrap();
+        let config_file = temp.path().join("curlrc");
+        std::fs::write(&config_file, "raw\nno-raw\nurl = https://example.com\n").unwrap();
+
+        let config = parse_args(["-q", "--config", config_file.to_str().unwrap()]).unwrap();
+        assert!(!config.transfers[0].raw);
     }
 
     #[test]
@@ -4324,11 +4349,13 @@ mod tests {
             "-q",
             "--location",
             "--compressed",
+            "--raw",
             "--post301",
             "--post302",
             "--post303",
             "--no-location",
             "--no-compressed",
+            "--no-raw",
             "--no-post302",
             "https://example.com",
         ])
@@ -4337,6 +4364,7 @@ mod tests {
         let transfer = &config.transfers[0];
         assert!(!transfer.follow_location);
         assert!(!transfer.compressed);
+        assert!(!transfer.raw);
         assert!(transfer.post301);
         assert!(!transfer.post302);
         assert!(transfer.post303);

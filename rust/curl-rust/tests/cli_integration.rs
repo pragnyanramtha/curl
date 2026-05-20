@@ -2699,6 +2699,112 @@ fn raw_http_compressed_request_target_decodes_body_and_preserves_headers() {
 }
 
 #[test]
+fn raw_preserves_unknown_transfer_encoded_body() {
+    let body = b"encoded transfer bytes\n";
+    let response = [
+        format!(
+            "HTTP/1.1 200 OK\r\nTransfer-Encoding: gobbledigook\r\nContent-Length: {}\r\n\r\n",
+            body.len()
+        )
+        .into_bytes(),
+        body.to_vec(),
+    ]
+    .concat();
+    let (url, rx) = spawn_server_bytes(response);
+
+    let output = Command::cargo_bin("curl")
+        .unwrap()
+        .args(["-q", "-sS", "--raw", &url])
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(output.stdout, body);
+
+    let request = rx.recv().unwrap();
+    assert!(request.start_line.starts_with("GET /resource HTTP/1.1"));
+}
+
+#[test]
+fn raw_preserves_chunked_transfer_framing() {
+    let chunked = b"5\r\nhello\r\n0\r\n\r\n";
+    let response = [
+        b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n".to_vec(),
+        chunked.to_vec(),
+    ]
+    .concat();
+    let (url, rx) = spawn_server_bytes(response);
+
+    let output = Command::cargo_bin("curl")
+        .unwrap()
+        .args(["-q", "-sS", "--raw", &url])
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(output.stdout, chunked);
+
+    let request = rx.recv().unwrap();
+    assert!(request.start_line.starts_with("GET /resource HTTP/1.1"));
+}
+
+#[test]
+fn raw_preserves_binary_body() {
+    let body = b"\0binary\0payload\n";
+    let response = [
+        format!(
+            "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+            body.len()
+        )
+        .into_bytes(),
+        body.to_vec(),
+    ]
+    .concat();
+    let (url, _rx) = spawn_server_bytes(response);
+
+    let output = Command::cargo_bin("curl")
+        .unwrap()
+        .args(["-q", "-sS", "--raw", &url])
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(output.stdout, body);
+}
+
+#[test]
+fn raw_with_compressed_keeps_encoded_body() {
+    let (url, rx) = spawn_server_bytes(compressed_response("gzip", GZIP_COMPRESSED_BODY));
+
+    let output = Command::cargo_bin("curl")
+        .unwrap()
+        .args(["-q", "-sS", "--compressed", "--raw", &url])
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(output.stdout, GZIP_COMPRESSED_BODY);
+
+    let request = rx.recv().unwrap();
+    assert_eq!(
+        header(&request, "accept-encoding"),
+        Some("deflate, gzip, br")
+    );
+}
+
+#[test]
 fn compressed_custom_accept_encoding_still_decodes_response_body() {
     let (url, rx) = spawn_server_bytes(compressed_response("gzip", GZIP_COMPRESSED_BODY));
 
