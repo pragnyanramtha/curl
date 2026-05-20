@@ -236,6 +236,9 @@ fn write_request(out: &mut String, render: &RenderTransfer<'_>, url: &str) -> Re
     if let Some(target) = &transfer.request_target {
         emit_string_setopt(out, "CURLOPT_REQUEST_TARGET", target);
     }
+    if transfer.disallow_username_in_url {
+        emit_long_setopt(out, "CURLOPT_DISALLOW_USERNAME_IN_URL", 1);
+    }
     if transfer.head {
         emit_long_setopt(out, "CURLOPT_NOBODY", 1);
     }
@@ -819,6 +822,22 @@ mod tests {
         assert!(source.contains("curl_slist_append(slist1, \"example.com:443:127.0.0.1:8443\");"));
         assert!(source.contains("CURLOPT_CONNECT_TO, slist1"));
         assert!(source.contains("curl_slist_free_all(slist1);"));
+    }
+
+    #[test]
+    fn renders_disallow_username_in_url_option() {
+        let config = parse_args([
+            "-q",
+            "--libcurl",
+            "client.c",
+            "--disallow-username-in-url",
+            "https://example.com",
+        ])
+        .unwrap();
+
+        let source = render_source(&config).unwrap();
+
+        assert!(source.contains("CURLOPT_DISALLOW_USERNAME_IN_URL, 1L"));
     }
 
     #[test]

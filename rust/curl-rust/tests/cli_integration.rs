@@ -8727,6 +8727,7 @@ fn libcurl_writes_source_file_for_supported_options() {
         &resolve_entry,
         "--connect-to",
         connect_to_entry,
+        "--disallow-username-in-url",
         "--max-filesize",
         "2M",
         "--http1.1",
@@ -8764,6 +8765,7 @@ fn libcurl_writes_source_file_for_supported_options() {
         "curl_slist_append(slist3, \"{connect_to_entry}\");"
     )));
     assert!(text.contains("CURLOPT_CONNECT_TO, slist3"));
+    assert!(text.contains("CURLOPT_DISALLOW_USERNAME_IN_URL, 1"));
     assert!(text.contains("CURLOPT_MAXFILESIZE_LARGE, (curl_off_t)2097152"));
     assert!(text.contains("CURLOPT_REFERER, \"firstone.html\""));
     assert!(text.contains("CURLOPT_AUTOREFERER, 1"));
