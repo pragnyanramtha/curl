@@ -652,7 +652,8 @@ fn libcurl_min_tls_expr(
             Some(SslVersionMaxPreference::TlsV1_2 | SslVersionMaxPreference::TlsV1_3) => {
                 Some("CURL_SSLVERSION_TLSv1_2")
             }
-            Some(SslVersionMaxPreference::Default) | None => None,
+            Some(SslVersionMaxPreference::Default) => Some("(long)CURL_SSLVERSION_TLSv1_2"),
+            None => None,
         },
     }
 }
@@ -1047,6 +1048,20 @@ mod tests {
         assert!(source.contains(
             "CURLOPT_SSLVERSION, (long)(CURL_SSLVERSION_TLSv1_2 | CURL_SSLVERSION_MAX_TLSv1_3)"
         ));
+
+        let config = parse_args([
+            "-q",
+            "--libcurl",
+            "client.c",
+            "--tls-max",
+            "default",
+            "https://example.com",
+        ])
+        .unwrap();
+
+        let source = render_source(&config).unwrap();
+
+        assert!(source.contains("CURLOPT_SSLVERSION, (long)CURL_SSLVERSION_TLSv1_2"));
     }
 
     #[test]

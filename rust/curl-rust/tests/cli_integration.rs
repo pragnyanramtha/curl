@@ -2096,6 +2096,21 @@ fn downloads_http_and_renders_writeout() {
 }
 
 #[test]
+fn legacy_tls_max_values_do_not_break_plain_http() {
+    for version in ["1.0", "1.1"] {
+        let (url, rx) =
+            spawn_server(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok");
+
+        let mut command = Command::cargo_bin("curl").unwrap();
+        command.args(["-q", "-sS", "--tls-max", version, &url]);
+        command.assert().success().stdout("ok");
+
+        let request = rx.recv().unwrap();
+        assert!(request.start_line.starts_with("GET /resource HTTP/1.1"));
+    }
+}
+
+#[test]
 fn out_null_discards_one_url_and_keeps_later_output_slot() {
     let (url, rx) = spawn_sequence_server(vec![
         b"HTTP/1.1 200 OK\r\nContent-Length: 3\r\nConnection: close\r\n\r\none",

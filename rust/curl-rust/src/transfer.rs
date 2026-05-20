@@ -419,8 +419,8 @@ fn reqwest_tls_version(version: SslVersionPreference) -> reqwest::tls::Version {
 fn reqwest_tls_max_version(version: SslVersionMaxPreference) -> Option<reqwest::tls::Version> {
     match version {
         SslVersionMaxPreference::Default => None,
-        SslVersionMaxPreference::TlsV1_0 => Some(reqwest::tls::Version::TLS_1_0),
-        SslVersionMaxPreference::TlsV1_1 => Some(reqwest::tls::Version::TLS_1_1),
+        // The locked reqwest/rustls stack cannot build a client capped below TLS 1.2.
+        SslVersionMaxPreference::TlsV1_0 | SslVersionMaxPreference::TlsV1_1 => None,
         SslVersionMaxPreference::TlsV1_2 => Some(reqwest::tls::Version::TLS_1_2),
         SslVersionMaxPreference::TlsV1_3 => Some(reqwest::tls::Version::TLS_1_3),
     }
