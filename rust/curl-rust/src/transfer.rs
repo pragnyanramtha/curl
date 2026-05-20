@@ -8105,7 +8105,10 @@ async fn run_http_transfer(
     if explicit_proxy.is_none()
         && transfer.follow_location
         && raw_http_direct_redirect_supported(transfer, &url, has_multipart)
-        && (transfer.request_target.is_some() || initial_connect_to.is_some() || custom_host_header)
+        && (transfer.request_target.is_some()
+            || initial_connect_to.is_some()
+            || custom_host_header
+            || (method != Method::HEAD && max_filesize_limit(transfer).is_some()))
     {
         let custom_method = transfer.method.is_some();
         let post_redirect_body =
@@ -8425,7 +8428,9 @@ async fn run_http_transfer(
 
     if explicit_proxy.is_none()
         && raw_http_direct_supported(transfer, &url, has_multipart)
-        && (transfer.request_target.is_some() || raw_custom_header_wire_semantics)
+        && (transfer.request_target.is_some()
+            || raw_custom_header_wire_semantics
+            || (method != Method::HEAD && max_filesize_limit(transfer).is_some()))
     {
         let attempt = run_raw_http_direct_transfer(RawHttpDirectContext {
             transfer,
