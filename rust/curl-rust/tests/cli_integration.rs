@@ -3109,6 +3109,22 @@ fn request_target_location_rejects_non_http_redirect_before_plaintext_follow() {
 }
 
 #[test]
+fn location_rejects_gopher_redirect_by_default() {
+    let (url, rx) = spawn_sequence_server(vec![
+        b"HTTP/1.1 302 Found\r\nLocation: gopher://www.example.co.uk\r\nContent-Length: 7\r\nConnection: close\r\n\r\nnomnom\n",
+    ]);
+
+    let mut command = Command::cargo_bin("curl").unwrap();
+    command.args(["-q", "-sS", "-L", "-H", "Host: www.example.com", &url]);
+    command.assert().failure().code(1).stdout("");
+
+    let request = rx.recv().unwrap();
+    assert!(request.start_line.starts_with("GET /resource HTTP/1.1"));
+    assert_eq!(header(&request, "host"), Some("www.example.com"));
+    assert!(rx.recv_timeout(Duration::from_millis(500)).is_err());
+}
+
+#[test]
 fn request_target_location_respects_max_redirs() {
     let (url, rx) = spawn_sequence_server(vec![
         b"HTTP/1.1 302 Found\r\nLocation: /next\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
