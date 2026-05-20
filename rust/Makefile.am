@@ -38,6 +38,13 @@ rust-curl:
 	mkdir -p "$(abs_builddir)/bin"
 	cp "$(RUST_CURL_BINARY)" "$(RUST_CURL_SIDECAR)"
 
+install-exec-local: rust-curl
+	$(MKDIR_P) "$(DESTDIR)$(bindir)"
+	$(INSTALL_PROGRAM) "$(RUST_CURL_SIDECAR)" "$(DESTDIR)$(bindir)/curl-rust$(EXEEXT)"
+
+uninstall-local:
+	rm -f "$(DESTDIR)$(bindir)/curl-rust$(EXEEXT)"
+
 check-local: rust-test rust-corpus-test
 
 rust-test:

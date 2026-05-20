@@ -35,6 +35,11 @@ add_custom_command(
 
 add_custom_target(curl-rust ALL DEPENDS "${_curl_rust_sidecar}")
 
+if(NOT CURL_DISABLE_INSTALL)
+  install(PROGRAMS "${_curl_rust_sidecar}"
+    DESTINATION ${CMAKE_INSTALL_BINDIR})
+endif()
+
 set(_curl_rust_corpus_tests
   21
   23

@@ -112,7 +112,7 @@ companion data before this rewrite can be called complete.
 | Cargo clippy | partial | `cargo clippy -p curl-rust --all-targets --locked -- -D warnings` |
 | CMake sidecar build | partial | `BUILD_RUST_CURL_EXE=ON`, `curl-rust-test`, `curl-rust-corpus-test` |
 | Autotools sidecar build | partial | `--enable-rust-curl`, `make -C rust rust-test`, `make -C rust rust-corpus-test` |
-| Rust sidecar install/package behavior | missing | CMake and Autotools build/test the sidecar but do not install or package the Rust executable alongside C curl yet |
+| Rust sidecar install/package behavior | partial | CMake and Autotools install the sidecar as `curl-rust` when `BUILD_RUST_CURL_EXE=ON` or `--enable-rust-curl` is enabled; broader downstream package metadata and installer coverage still need audit |
 | GitHub Actions sidecar gate | partial | `.github/workflows/linux.yml` `Rust sidecar` job runs locked Cargo fmt/test/clippy/build/version checks plus CMake and Autotools sidecar build/test/corpus targets |
 | Existing curl Perl suite with C binary | verified for C path | Does not prove Rust parity |
 | Existing curl Perl suite with Rust binary | partial | `curl-rust-corpus-test` maps 249 smoke cases across FILE, FTP, DICT, GOPHER, HTTP, IPFS/IPNS, IMAP, MQTT, POP3, SCP/SFTP, SMB, SMTP, TFTP, TELNET, CLI help/config/options, and URL/HTTP preflight/error cases; broader protocol corpus remains required before full parity |
