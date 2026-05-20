@@ -3861,8 +3861,8 @@ fn max_filesize_truncates_telnet_body_then_fails() {
 #[test]
 fn retries_transient_http_status_then_succeeds() {
     let (url, rx) = spawn_sequence_server(vec![
-        b"HTTP/1.1 503 Service Unavailable\r\nContent-Length: 3\r\n\r\nbad",
-        b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok",
+        b"HTTP/1.1 503 Service Unavailable\r\nContent-Length: 3\r\nConnection: close\r\n\r\nbad",
+        b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok",
     ]);
 
     let mut command = Command::cargo_bin("curl").unwrap();
@@ -3886,8 +3886,8 @@ fn retries_transient_http_status_then_succeeds() {
 #[test]
 fn retry_all_errors_retries_failed_http_status() {
     let (url, rx) = spawn_sequence_server(vec![
-        b"HTTP/1.1 404 Not Found\r\nContent-Length: 7\r\n\r\nmissing",
-        b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok",
+        b"HTTP/1.1 404 Not Found\r\nContent-Length: 7\r\nConnection: close\r\n\r\nmissing",
+        b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok",
     ]);
 
     let mut command = Command::cargo_bin("curl").unwrap();
@@ -4031,8 +4031,8 @@ fn fail_writeout_reports_zero_delivered_body_bytes() {
 #[test]
 fn fail_with_body_retry_outputs_failed_and_successful_bodies() {
     let (url, rx) = spawn_sequence_server(vec![
-        b"HTTP/1.1 503 Service Unavailable\r\nContent-Length: 3\r\n\r\nmoo",
-        b"HTTP/1.1 200 OK\r\nContent-Length: 3\r\n\r\nhey",
+        b"HTTP/1.1 503 Service Unavailable\r\nContent-Length: 3\r\nConnection: close\r\n\r\nmoo",
+        b"HTTP/1.1 200 OK\r\nContent-Length: 3\r\nConnection: close\r\n\r\nhey",
     ]);
 
     let mut command = Command::cargo_bin("curl").unwrap();
