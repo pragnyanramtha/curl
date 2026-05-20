@@ -10,6 +10,7 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use assert_cmd::Command;
+use flate2::{Compression, write::GzEncoder};
 use tempfile::{TempDir, tempdir, tempdir_in};
 use url::Url;
 
@@ -2252,6 +2253,22 @@ fn compressed_response(encoding: &str, body: &[u8]) -> Vec<u8> {
     response
 }
 
+fn transfer_encoded_response(encoding: &str, body: &[u8]) -> Vec<u8> {
+    let mut response = format!(
+        "HTTP/1.1 200 OK\r\nTransfer-Encoding: {encoding}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+        body.len()
+    )
+    .into_bytes();
+    response.extend_from_slice(body);
+    response
+}
+
+fn gzip_encoded(body: &[u8]) -> Vec<u8> {
+    let mut encoder = GzEncoder::new(Vec::new(), Compression::default());
+    encoder.write_all(body).unwrap();
+    encoder.finish().unwrap()
+}
+
 #[test]
 fn downloads_http_and_renders_writeout() {
     let (url, rx) = spawn_server(
@@ -2587,6 +2604,126 @@ fn compressed_decodes_supported_response_bodies() {
             "{label}"
         );
     }
+}
+
+#[test]
+fn tr_encoding_decodes_gzip_transfer_encoding_and_sends_te() {
+    let (url, rx) = spawn_server_bytes(transfer_encoded_response("gzip", GZIP_COMPRESSED_BODY));
+
+    let output = Command::cargo_bin("curl")
+        .unwrap()
+        .args(["-q", "-sS", "--tr-encoding", &url])
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(output.stdout, COMPRESSED_BODY);
+
+    let request = rx.recv().unwrap();
+    assert_eq!(header(&request, "te"), Some("gzip"));
+    assert_eq!(header(&request, "connection"), Some("TE"));
+}
+
+#[test]
+fn tr_encoding_folds_te_into_first_custom_connection_header() {
+    let (url, rx) = spawn_server_bytes(transfer_encoded_response("gzip", GZIP_COMPRESSED_BODY));
+
+    let output = Command::cargo_bin("curl")
+        .unwrap()
+        .args([
+            "-q",
+            "-sS",
+            "--tr-encoding",
+            "-H",
+            "Connection: close",
+            &url,
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(output.stdout, COMPRESSED_BODY);
+
+    let request = rx.recv().unwrap();
+    assert_eq!(header(&request, "te"), Some("gzip"));
+    assert_eq!(header(&request, "connection"), Some("close, TE"));
+    assert_eq!(header_count(&request, "connection"), 1);
+}
+
+#[test]
+fn tr_encoding_decodes_lf_only_chunked_transfer_body() {
+    let mut response = b"HTTP/1.1 200 OK\r\nTransfer-Encoding: gzip, chunked\r\n\r\n".to_vec();
+    response.extend_from_slice(format!("{:x}\n", GZIP_COMPRESSED_BODY.len()).as_bytes());
+    response.extend_from_slice(GZIP_COMPRESSED_BODY);
+    response.extend_from_slice(b"\n0\n\n");
+    let (url, rx) = spawn_server_bytes(response);
+
+    let output = Command::cargo_bin("curl")
+        .unwrap()
+        .args(["-q", "-sS", "--tr-encoding", &url])
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(output.stdout, COMPRESSED_BODY);
+
+    let request = rx.recv().unwrap();
+    assert_eq!(header(&request, "te"), Some("gzip"));
+}
+
+#[test]
+fn tr_encoding_with_compressed_decodes_transfer_then_content_encoding() {
+    let transfer_body = gzip_encoded(DEFLATE_COMPRESSED_BODY);
+    let mut response = format!(
+        "HTTP/1.1 200 OK\r\nTransfer-Encoding: gzip\r\nContent-Encoding: deflate\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+        transfer_body.len()
+    )
+    .into_bytes();
+    response.extend_from_slice(&transfer_body);
+    let (url, rx) = spawn_server_bytes(response);
+
+    let output = Command::cargo_bin("curl")
+        .unwrap()
+        .args(["-q", "-sS", "--tr-encoding", "--compressed", &url])
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(output.stdout, COMPRESSED_BODY);
+
+    let request = rx.recv().unwrap();
+    assert_eq!(header(&request, "te"), Some("gzip"));
+    assert_eq!(
+        header(&request, "accept-encoding"),
+        Some("deflate, gzip, br")
+    );
+}
+
+#[test]
+fn tr_encoding_rejects_chunked_not_last() {
+    let (url, _rx) =
+        spawn_server(b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked, gzip\r\n\r\n0\r\n\r\n");
+
+    let output = Command::cargo_bin("curl")
+        .unwrap()
+        .args(["-q", "-sS", "--tr-encoding", &url])
+        .output()
+        .unwrap();
+    assert_eq!(output.status.code(), Some(61));
+    assert_eq!(output.stdout, b"");
+    assert!(String::from_utf8_lossy(&output.stderr).contains("transfer encoding"));
 }
 
 #[test]

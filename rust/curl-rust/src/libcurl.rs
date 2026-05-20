@@ -524,6 +524,9 @@ fn write_request(out: &mut String, render: &RenderTransfer<'_>, url: &str) -> Re
     if transfer.compressed {
         emit_string_setopt(out, "CURLOPT_ACCEPT_ENCODING", "");
     }
+    if transfer.tr_encoding {
+        emit_long_setopt(out, "CURLOPT_TRANSFER_ENCODING", 1);
+    }
     if transfer.raw {
         emit_long_setopt(out, "CURLOPT_HTTP_CONTENT_DECODING", 0);
         emit_long_setopt(out, "CURLOPT_HTTP_TRANSFER_DECODING", 0);
@@ -981,6 +984,7 @@ mod tests {
             "--libcurl",
             "client.c",
             "--compressed",
+            "--tr-encoding",
             "--range",
             "2-5",
             "https://example.com",
@@ -990,6 +994,7 @@ mod tests {
         let source = render_source(&config).unwrap();
 
         assert!(source.contains("CURLOPT_ACCEPT_ENCODING, \"\""));
+        assert!(source.contains("CURLOPT_TRANSFER_ENCODING, 1L"));
         assert!(source.contains("CURLOPT_RANGE, \"2-5\""));
     }
 

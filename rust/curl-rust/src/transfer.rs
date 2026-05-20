@@ -8153,6 +8153,7 @@ async fn run_http_transfer(
         && raw_http_direct_redirect_supported(transfer, &url, has_multipart)
         && (transfer.request_target.is_some()
             || transfer.raw
+            || transfer.tr_encoding
             || initial_connect_to.is_some()
             || custom_host_header
             || (method != Method::HEAD && max_filesize_limit(transfer).is_some()))
@@ -8339,7 +8340,7 @@ async fn run_http_transfer(
     if let Some(proxy) = explicit_proxy.as_ref()
         && transfer.follow_location
         && raw_http_proxy_redirect_supported(transfer, &url, has_multipart)
-        && (transfer.request_target.is_some() || transfer.raw)
+        && (transfer.request_target.is_some() || transfer.raw || transfer.tr_encoding)
     {
         let custom_method = transfer.method.is_some();
         let post_redirect_body =
@@ -8485,6 +8486,7 @@ async fn run_http_transfer(
         && (transfer.request_target.is_some()
             || transfer.raw
             || transfer.compressed
+            || transfer.tr_encoding
             || raw_custom_header_wire_semantics
             || method == Method::HEAD
             || (method != Method::HEAD && max_filesize_limit(transfer).is_some()))
@@ -8532,6 +8534,12 @@ async fn run_http_transfer(
     if transfer.raw {
         return Err(CurlError::Unsupported(
             "--raw is only implemented for plain HTTP requests that can use the Rust sidecar raw reader"
+                .to_string(),
+        ));
+    }
+    if transfer.tr_encoding {
+        return Err(CurlError::Unsupported(
+            "--tr-encoding is only implemented for plain HTTP requests that can use the Rust sidecar raw reader"
                 .to_string(),
         ));
     }
@@ -8696,6 +8704,7 @@ async fn run_http_transfer(
                 .map_err(|error| http_send_error(error, transfer))?
                 .to_vec()
         };
+        let body = decode_http_body_if_transfer_encoded(transfer, &headers, body)?;
         let body = decode_http_body_if_compressed(transfer, &headers, body)?;
         metrics.size_download = body.len() as u64;
         let retry_after = retry_after_delay(&headers);
@@ -8999,6 +9008,7 @@ fn raw_http_direct_request(context: &RawHttpDirectContext<'_>) -> Result<Vec<u8>
             .iter()
             .any(|header| header.name.as_str().eq_ignore_ascii_case(name))
     };
+    let add_transfer_encoding = context.transfer.tr_encoding && !has_header("te");
     let body = raw_http_body(context.transfer, context.prepared_body, context.upload_body);
     let target = context
         .transfer
@@ -9025,6 +9035,9 @@ fn raw_http_direct_request(context: &RawHttpDirectContext<'_>) -> Result<Vec<u8>
         } else {
             request.extend_from_slice(b"Accept: */*\r\n");
         }
+    }
+    if add_transfer_encoding {
+        request.extend_from_slice(b"TE: gzip\r\n");
     }
     if context.transfer.compressed && !has_header("accept-encoding") {
         request.extend_from_slice(b"Accept-Encoding: deflate, gzip, br\r\n");
@@ -9092,18 +9105,22 @@ fn raw_http_direct_request(context: &RawHttpDirectContext<'_>) -> Result<Vec<u8>
         name,
         wire_name,
         value,
-    } in parsed_headers
+    } in &parsed_headers
     {
         if name.as_str().eq_ignore_ascii_case("host") {
+            continue;
+        }
+        if add_transfer_encoding && name.as_str().eq_ignore_ascii_case("connection") {
             continue;
         }
         if !context.sensitive_headers_allowed && is_redirect_sensitive_header(name.as_str()) {
             continue;
         }
         if let Some(value) = value {
-            append_raw_header(&mut request, &wire_name, &value);
+            append_raw_header(&mut request, wire_name, value);
         }
     }
+    append_raw_http_transfer_connection(&mut request, &parsed_headers, add_transfer_encoding);
     request.extend_from_slice(b"\r\n");
     if let Some(body) = body {
         request.extend_from_slice(body);
@@ -9119,6 +9136,7 @@ fn raw_http_proxy_request(context: &RawHttpProxyContext<'_>) -> Result<Vec<u8>> 
         raw_headers_contain(&parsed_headers, name)
             || raw_headers_contain(&parsed_proxy_headers, name)
     };
+    let add_transfer_encoding = context.transfer.tr_encoding && !has_header("te");
     let body = raw_http_body(context.transfer, context.prepared_body, context.upload_body);
     let target = context
         .transfer
@@ -9150,6 +9168,9 @@ fn raw_http_proxy_request(context: &RawHttpProxyContext<'_>) -> Result<Vec<u8>> 
         } else {
             request.extend_from_slice(b"Accept: */*\r\n");
         }
+    }
+    if add_transfer_encoding {
+        request.extend_from_slice(b"TE: gzip\r\n");
     }
     if context.transfer.compressed && !has_header("accept-encoding") {
         request.extend_from_slice(b"Accept-Encoding: deflate, gzip, br\r\n");
@@ -9228,18 +9249,22 @@ fn raw_http_proxy_request(context: &RawHttpProxyContext<'_>) -> Result<Vec<u8>> 
         name,
         wire_name,
         value,
-    } in parsed_headers
+    } in &parsed_headers
     {
         if name.as_str().eq_ignore_ascii_case("host") {
+            continue;
+        }
+        if add_transfer_encoding && name.as_str().eq_ignore_ascii_case("connection") {
             continue;
         }
         if !context.sensitive_headers_allowed && is_redirect_sensitive_header(name.as_str()) {
             continue;
         }
         if let Some(value) = value {
-            append_raw_header(&mut request, &wire_name, &value);
+            append_raw_header(&mut request, wire_name, value);
         }
     }
+    append_raw_http_transfer_connection(&mut request, &parsed_headers, add_transfer_encoding);
     request.extend_from_slice(b"\r\n");
     if let Some(body) = body {
         request.extend_from_slice(body);
@@ -9279,6 +9304,43 @@ fn append_raw_http_host_header(
     }
 
     request.extend_from_slice(format!("Host: {}\r\n", http_host_header(url)).as_bytes());
+}
+
+fn append_raw_http_transfer_connection(
+    request: &mut Vec<u8>,
+    parsed_headers: &[RawHeader],
+    add_transfer_encoding: bool,
+) {
+    if !add_transfer_encoding {
+        return;
+    }
+
+    let mut first = true;
+    for header in parsed_headers
+        .iter()
+        .filter(|header| header.name.as_str().eq_ignore_ascii_case("connection"))
+    {
+        let Some(value) = &header.value else {
+            continue;
+        };
+        if value.as_bytes().is_empty() {
+            continue;
+        }
+
+        if first {
+            request.extend_from_slice(header.wire_name.as_bytes());
+            request.extend_from_slice(b": ");
+            request.extend_from_slice(value.as_bytes());
+            request.extend_from_slice(b", TE\r\n");
+            first = false;
+        } else {
+            append_raw_header(request, &header.wire_name, value);
+        }
+    }
+
+    if first {
+        request.extend_from_slice(b"Connection: TE\r\n");
+    }
 }
 
 async fn raw_http_read_response(
@@ -9387,12 +9449,8 @@ async fn raw_http_read_chunked_body(stream: &mut TcpStream) -> Result<Vec<u8>> {
         stream.read_exact(&mut chunk).await.map_err(tcp_io_error)?;
         body.extend_from_slice(&chunk);
 
-        let mut terminator = [0_u8; 2];
-        stream
-            .read_exact(&mut terminator)
-            .await
-            .map_err(tcp_io_error)?;
-        if terminator != *b"\r\n" {
+        let terminator = raw_http_read_line(stream).await?;
+        if terminator != "\r\n" && terminator != "\n" {
             return Err(CurlError::WeirdServerReply);
         }
     }
@@ -9418,15 +9476,11 @@ async fn raw_http_read_chunked_wire_body(stream: &mut TcpStream) -> Result<Vec<u
         stream.read_exact(&mut chunk).await.map_err(tcp_io_error)?;
         body.extend_from_slice(&chunk);
 
-        let mut terminator = [0_u8; 2];
-        stream
-            .read_exact(&mut terminator)
-            .await
-            .map_err(tcp_io_error)?;
-        if terminator != *b"\r\n" {
+        let terminator = raw_http_read_line(stream).await?;
+        if terminator != "\r\n" && terminator != "\n" {
             return Err(CurlError::WeirdServerReply);
         }
-        body.extend_from_slice(&terminator);
+        body.extend_from_slice(terminator.as_bytes());
     }
 }
 
@@ -9490,8 +9544,44 @@ fn raw_http09_attempt(
 
 fn decode_http_attempt_body(transfer: &TransferConfig, attempt: &mut HttpAttempt) -> Result<()> {
     let body = std::mem::take(&mut attempt.body);
+    let body = decode_http_body_if_transfer_encoded(transfer, &attempt.headers, body)?;
     attempt.body = decode_http_body_if_compressed(transfer, &attempt.headers, body)?;
     Ok(())
+}
+
+fn decode_http_body_if_transfer_encoded(
+    transfer: &TransferConfig,
+    headers: &HeaderMap,
+    body: Vec<u8>,
+) -> Result<Vec<u8>> {
+    if !transfer.tr_encoding || transfer.raw {
+        return Ok(body);
+    }
+
+    let mut encodings = http_coding_values(headers, TRANSFER_ENCODING)?;
+    if encodings.is_empty() {
+        return Ok(body);
+    }
+    if encodings.len() > 5 {
+        return Err(CurlError::BadContentEncoding(
+            "Reject response due to more than 5 content encodings".to_string(),
+        ));
+    }
+
+    if let Some(position) = encodings.iter().position(|encoding| encoding == "chunked") {
+        if position + 1 != encodings.len() {
+            return Err(CurlError::BadContentEncoding(
+                "chunked transfer encoding was not last".to_string(),
+            ));
+        }
+        encodings.pop();
+    }
+
+    let mut decoded = body;
+    for encoding in encodings.iter().rev() {
+        decoded = decode_content_encoding(encoding, decoded)?;
+    }
+    Ok(decoded)
 }
 
 fn decode_http_body_if_compressed(
@@ -9503,8 +9593,18 @@ fn decode_http_body_if_compressed(
         return Ok(body);
     }
 
+    let encodings = http_coding_values(headers, CONTENT_ENCODING)?;
+
+    let mut decoded = body;
+    for encoding in encodings.iter().rev() {
+        decoded = decode_content_encoding(encoding, decoded)?;
+    }
+    Ok(decoded)
+}
+
+fn http_coding_values(headers: &HeaderMap, name: HeaderName) -> Result<Vec<String>> {
     let mut encodings = Vec::new();
-    for value in headers.get_all(CONTENT_ENCODING) {
+    for value in headers.get_all(name) {
         let value = value
             .to_str()
             .map_err(|error| CurlError::BadContentEncoding(error.to_string()))?;
@@ -9516,12 +9616,7 @@ fn decode_http_body_if_compressed(
                 .map(str::to_ascii_lowercase),
         );
     }
-
-    let mut decoded = body;
-    for encoding in encodings.iter().rev() {
-        decoded = decode_content_encoding(encoding, decoded)?;
-    }
-    Ok(decoded)
+    Ok(encodings)
 }
 
 fn decode_content_encoding(encoding: &str, body: Vec<u8>) -> Result<Vec<u8>> {

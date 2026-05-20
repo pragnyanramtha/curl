@@ -119,6 +119,7 @@ pub struct TransferConfig {
     pub cookie_jar: Option<PathBuf>,
     pub junk_session_cookies: bool,
     pub compressed: bool,
+    pub tr_encoding: bool,
     pub raw: bool,
     pub verbose: bool,
     pub silent: bool,
@@ -506,6 +507,7 @@ impl Default for TransferConfig {
             cookie_jar: None,
             junk_session_cookies: false,
             compressed: false,
+            tr_encoding: false,
             raw: false,
             verbose: false,
             silent: false,
@@ -978,6 +980,7 @@ impl Parser {
             }
             "junk-session-cookies" => self.current().junk_session_cookies = true,
             "compressed" => self.current().compressed = true,
+            "tr-encoding" => self.current().tr_encoding = true,
             "raw" => self.current().raw = true,
             "verbose" => self.current().verbose = true,
             "trace" | "trace-ascii" => {
@@ -1077,6 +1080,7 @@ impl Parser {
             "proto-default" => self.current().proto_default = None,
             "out-null" => self.set_output_null(),
             "compressed" => self.current().compressed = false,
+            "tr-encoding" => self.current().tr_encoding = false,
             "raw" => self.current().raw = false,
             "verbose" => self.current().verbose = false,
             "progress-meter" => self.current().silent = true,
@@ -1709,6 +1713,7 @@ impl TransferConfig {
             || self.cookie_jar.is_some()
             || self.junk_session_cookies
             || self.compressed
+            || self.tr_encoding
             || self.raw
             || self.verbose
             || self.silent
@@ -2444,6 +2449,7 @@ fn print_common_help() {
            -H, --header <header>       Pass custom header\n\
            -I, --head                  Show document information only\n\
            -l, --list-only             List only mode\n\
+               --tr-encoding           Request compressed transfer encoding\n\
            -L, --location              Follow redirects\n\
                --post301               Keep POST after 301 redirect\n\
                --post302               Keep POST after 302 redirect\n\
@@ -2927,6 +2933,21 @@ mod tests {
     }
 
     #[test]
+    fn parses_tr_encoding_boolean_option() {
+        let config = parse_args(["-q", "--tr-encoding", "https://example.com"]).unwrap();
+        assert!(config.transfers[0].tr_encoding);
+
+        let config = parse_args([
+            "-q",
+            "--tr-encoding",
+            "--no-tr-encoding",
+            "https://example.com",
+        ])
+        .unwrap();
+        assert!(!config.transfers[0].tr_encoding);
+    }
+
+    #[test]
     fn parses_stderr_option() {
         parse_args(["-q", "--stderr", "errors.txt", "https://example.com"]).unwrap();
         parse_args(["-q", "--stderr=errors.txt", "https://example.com"]).unwrap();
@@ -2996,6 +3017,20 @@ mod tests {
 
         let config = parse_args(["-q", "--config", config_file.to_str().unwrap()]).unwrap();
         assert!(!config.transfers[0].raw);
+    }
+
+    #[test]
+    fn config_files_parse_tr_encoding_boolean_option() {
+        let temp = tempdir().unwrap();
+        let config_file = temp.path().join("curlrc");
+        std::fs::write(
+            &config_file,
+            "tr-encoding\nno-tr-encoding\nurl = https://example.com\n",
+        )
+        .unwrap();
+
+        let config = parse_args(["-q", "--config", config_file.to_str().unwrap()]).unwrap();
+        assert!(!config.transfers[0].tr_encoding);
     }
 
     #[test]
@@ -4460,12 +4495,14 @@ mod tests {
             "-q",
             "--location",
             "--compressed",
+            "--tr-encoding",
             "--raw",
             "--post301",
             "--post302",
             "--post303",
             "--no-location",
             "--no-compressed",
+            "--no-tr-encoding",
             "--no-raw",
             "--no-post302",
             "https://example.com",
@@ -4475,6 +4512,7 @@ mod tests {
         let transfer = &config.transfers[0];
         assert!(!transfer.follow_location);
         assert!(!transfer.compressed);
+        assert!(!transfer.tr_encoding);
         assert!(!transfer.raw);
         assert!(transfer.post301);
         assert!(!transfer.post302);
