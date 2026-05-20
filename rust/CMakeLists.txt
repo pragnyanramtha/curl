@@ -307,6 +307,7 @@ set(_curl_rust_corpus_tests
   1847
   1848
   1850
+  1851
   2004
   2007
   2008
@@ -368,7 +369,7 @@ if(CURL_BUILD_TESTING AND PERL_EXECUTABLE)
     COMMAND ${CMAKE_COMMAND} -E env
       "srcdir=${PROJECT_SOURCE_DIR}/tests"
       "${PERL_EXECUTABLE}" "${PROJECT_SOURCE_DIR}/tests/runtests.pl"
-        -n -a -s
+        -n -a -s -p
         -c "${_curl_rust_sidecar}"
         ${_curl_rust_corpus_tests}
         "\$TFLAGS"
