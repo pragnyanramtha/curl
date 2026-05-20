@@ -8504,6 +8504,7 @@ async fn run_http_transfer(
             || transfer.tr_encoding
             || raw_custom_header_wire_semantics
             || raw_http_output_slot_wire_semantics(transfer)
+            || raw_http_default_get_version_wire_semantics(transfer, &method)
             || method == Method::HEAD
             || (method != Method::HEAD && max_filesize_limit(transfer).is_some()))
     {
@@ -8761,6 +8762,26 @@ fn raw_http_output_slot_wire_semantics(transfer: &TransferConfig) -> bool {
         && transfer.resolve.is_empty()
         && transfer.proxy.is_none()
         && transfer.http_version == HttpVersionPreference::Any
+}
+
+fn raw_http_default_get_version_wire_semantics(transfer: &TransferConfig, method: &Method) -> bool {
+    transfer.http_version == HttpVersionPreference::Http10
+        && *method == Method::GET
+        && !transfer.verbose
+        && transfer.headers.is_empty()
+        && transfer.resolve.is_empty()
+        && transfer.proxy.is_none()
+        && transfer.data.is_empty()
+        && transfer.forms.is_empty()
+        && transfer.upload_file.is_none()
+        && transfer.user.is_none()
+        && transfer.oauth2_bearer.is_none()
+        && transfer.aws_sigv4.is_none()
+        && transfer.cookie.is_none()
+        && transfer.referer.is_none()
+        && transfer.range.is_none()
+        && transfer.time_cond.is_none()
+        && transfer.etag_compare.is_none()
 }
 
 fn raw_http_direct_endpoint(transfer: &TransferConfig, url: &Url) -> Result<(String, u16)> {
@@ -9039,9 +9060,11 @@ fn raw_http_direct_request(context: &RawHttpDirectContext<'_>) -> Result<Vec<u8>
         .request_target
         .clone()
         .unwrap_or_else(|| http_request_target(context.url));
+    let version = raw_http_request_version(context.transfer);
     let mut request = Vec::new();
-    request
-        .extend_from_slice(format!("{} {target} HTTP/1.1\r\n", context.method.as_str()).as_bytes());
+    request.extend_from_slice(
+        format!("{} {target} {version}\r\n", context.method.as_str()).as_bytes(),
+    );
     append_raw_http_host_header(
         &mut request,
         context.url,
@@ -9152,6 +9175,13 @@ fn raw_http_direct_request(context: &RawHttpDirectContext<'_>) -> Result<Vec<u8>
     Ok(request)
 }
 
+fn raw_http_request_version(transfer: &TransferConfig) -> &'static str {
+    match transfer.http_version {
+        HttpVersionPreference::Http10 => "HTTP/1.0",
+        _ => "HTTP/1.1",
+    }
+}
+
 fn raw_http_proxy_request(context: &RawHttpProxyContext<'_>) -> Result<Vec<u8>> {
     let parsed_headers = parse_raw_headers(&context.transfer.headers)?;
     let parsed_proxy_headers = parse_raw_headers(&context.transfer.proxy_headers)?;
@@ -9167,9 +9197,11 @@ fn raw_http_proxy_request(context: &RawHttpProxyContext<'_>) -> Result<Vec<u8>> 
         .request_target
         .clone()
         .unwrap_or_else(|| context.url.to_string());
+    let version = raw_http_request_version(context.transfer);
     let mut request = Vec::new();
-    request
-        .extend_from_slice(format!("{} {target} HTTP/1.1\r\n", context.method.as_str()).as_bytes());
+    request.extend_from_slice(
+        format!("{} {target} {version}\r\n", context.method.as_str()).as_bytes(),
+    );
     append_raw_http_host_header(
         &mut request,
         context.url,

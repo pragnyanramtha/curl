@@ -3553,6 +3553,43 @@ fn request_target_sets_direct_http_request_line() {
 }
 
 #[test]
+fn request_target_http10_sets_direct_http_request_line() {
+    let (url, rx) = spawn_server(b"HTTP/1.0 200 OK\r\nContent-Length: 2\r\n\r\nok");
+
+    let mut command = Command::cargo_bin("curl").unwrap();
+    command.args([
+        "-q",
+        "-sS",
+        "--http1.0",
+        "--request-target",
+        "*",
+        "-X",
+        "OPTIONS",
+        &url,
+    ]);
+    command.assert().success().stdout("ok");
+
+    let request = rx.recv().unwrap();
+    assert_eq!(request.start_line, "OPTIONS * HTTP/1.0");
+}
+
+#[test]
+fn http10_simple_get_preserves_raw_response_header_casing() {
+    let (url, rx) =
+        spawn_server(b"HTTP/1.0 200 OK\r\nDate: Tue, 09 Nov 2010 14:49:00 GMT\r\n\r\nok");
+
+    let mut command = Command::cargo_bin("curl").unwrap();
+    command.args(["-q", "-sS", "--http1.0", "-i", &url]);
+    command
+        .assert()
+        .success()
+        .stdout("HTTP/1.0 200 OK\r\nDate: Tue, 09 Nov 2010 14:49:00 GMT\r\n\r\nok");
+
+    let request = rx.recv().unwrap();
+    assert_eq!(request.start_line, "GET /resource HTTP/1.0");
+}
+
+#[test]
 fn request_target_location_follows_redirect_with_same_target() {
     let (url, rx) = spawn_sequence_server(vec![
         b"HTTP/1.1 302 Found\r\nLocation: /next\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
@@ -10120,6 +10157,26 @@ fn request_target_sets_http_proxy_request_line() {
     assert_eq!(request.start_line, "OPTIONS * HTTP/1.1");
     assert_eq!(header(&request, "host"), Some("www.example.org"));
     assert_eq!(header(&request, "proxy-connection"), Some("Keep-Alive"));
+}
+
+#[test]
+fn http10_sets_http_proxy_request_line() {
+    let (proxy_url, rx) = spawn_server(b"HTTP/1.0 200 OK\r\nContent-Length: 2\r\n\r\nok");
+
+    let mut command = Command::cargo_bin("curl").unwrap();
+    command.args([
+        "-q",
+        "-sS",
+        "--http1.0",
+        "-x",
+        &proxy_url,
+        "http://www.example.org/",
+    ]);
+    command.assert().success().stdout("ok");
+
+    let request = rx.recv().unwrap();
+    assert_eq!(request.start_line, "GET http://www.example.org/ HTTP/1.0");
+    assert_eq!(header(&request, "host"), Some("www.example.org"));
 }
 
 #[test]
