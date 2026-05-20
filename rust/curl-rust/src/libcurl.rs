@@ -407,14 +407,17 @@ fn write_request(out: &mut String, render: &RenderTransfer<'_>, url: &str) -> Re
         emit_long_setopt(out, "CURLOPT_SSL_VERIFYPEER", 0);
         emit_long_setopt(out, "CURLOPT_SSL_VERIFYHOST", 0);
     }
-    if let Some(timeout) = transfer.connect_timeout {
+    if let Some(timeout) = transfer
+        .connect_timeout
+        .filter(|timeout| !timeout.is_zero())
+    {
         emit_raw_setopt(
             out,
             "CURLOPT_CONNECTTIMEOUT_MS",
             &format!("{}L", timeout.as_millis()),
         );
     }
-    if let Some(timeout) = transfer.max_time {
+    if let Some(timeout) = transfer.max_time.filter(|timeout| !timeout.is_zero()) {
         emit_raw_setopt(
             out,
             "CURLOPT_TIMEOUT_MS",
@@ -1064,6 +1067,21 @@ mod tests {
         let source = render_source(&config).unwrap();
         assert!(!source.contains("CURLOPT_LOCALPORT"));
         assert!(!source.contains("CURLOPT_LOCALPORTRANGE"));
+
+        let config = parse_args([
+            "-q",
+            "--libcurl",
+            "client.c",
+            "--connect-timeout",
+            "0.0001",
+            "--max-time",
+            "0",
+            "https://example.com",
+        ])
+        .unwrap();
+        let source = render_source(&config).unwrap();
+        assert!(!source.contains("CURLOPT_CONNECTTIMEOUT_MS"));
+        assert!(!source.contains("CURLOPT_TIMEOUT_MS"));
 
         let config =
             parse_args(["-q", "--libcurl", "client.c", "-Y0", "https://example.com"]).unwrap();

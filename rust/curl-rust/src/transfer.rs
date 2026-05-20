@@ -283,6 +283,10 @@ fn cookie_engine_active(transfer: &TransferConfig) -> bool {
     transfer.cookie_jar.is_some() || !transfer.cookie_files.is_empty()
 }
 
+fn active_timeout(timeout: Option<Duration>) -> Option<Duration> {
+    timeout.filter(|timeout| !timeout.is_zero())
+}
+
 fn spawn_parallel_job(active: &mut JoinSet<Result<(usize, i32)>>, job: ParallelJob) {
     active.spawn(async move {
         let code = run_expanded_url(
@@ -362,11 +366,11 @@ fn build_client(transfer: &TransferConfig, cookie_jar: Option<Arc<CookieJar>>) -
         builder = builder.cookie_provider(cookie_jar);
     }
 
-    if let Some(timeout) = transfer.max_time {
+    if let Some(timeout) = active_timeout(transfer.max_time) {
         builder = builder.timeout(timeout);
     }
 
-    if let Some(timeout) = transfer.connect_timeout {
+    if let Some(timeout) = active_timeout(transfer.connect_timeout) {
         builder = builder.connect_timeout(timeout);
     }
 
@@ -964,7 +968,7 @@ async fn run_ftp_transfer(
         ));
     }
 
-    if let Some(timeout) = transfer.max_time {
+    if let Some(timeout) = active_timeout(transfer.max_time) {
         tokio::time::timeout(
             timeout,
             run_ftp_exchange(transfer, expanded, method, metrics),
@@ -1906,7 +1910,7 @@ async fn run_ssh_transfer(
             resume_from,
         )
     });
-    let download = if let Some(timeout) = transfer.max_time {
+    let download = if let Some(timeout) = active_timeout(transfer.max_time) {
         tokio::time::timeout(timeout, task)
             .await
             .map_err(|_| CurlError::Timeout)?
@@ -3099,14 +3103,14 @@ fn ssh_tcp_connect(host: &str, port: u16, transfer: &TransferConfig) -> Result<S
     let addresses = resolve_std_socket_addrs(host, port, transfer.ip_version)?;
     let mut last_error = None;
     for address in addresses {
-        let stream = if let Some(timeout) = transfer.connect_timeout {
+        let stream = if let Some(timeout) = active_timeout(transfer.connect_timeout) {
             StdTcpStream::connect_timeout(&address, timeout)
         } else {
             StdTcpStream::connect(address)
         };
         match stream {
             Ok(stream) => {
-                if let Some(timeout) = transfer.max_time {
+                if let Some(timeout) = active_timeout(transfer.max_time) {
                     let _ = stream.set_read_timeout(Some(timeout));
                     let _ = stream.set_write_timeout(Some(timeout));
                 }
@@ -3271,7 +3275,7 @@ fn ssh_known_hosts_file(transfer: &TransferConfig) -> Result<PathBuf> {
 }
 
 fn ssh_timeout_ms(transfer: &TransferConfig) -> Option<u32> {
-    transfer.max_time.map(|timeout| {
+    active_timeout(transfer.max_time).map(|timeout| {
         u32::try_from(timeout.as_millis())
             .unwrap_or(u32::MAX)
             .max(1)
@@ -3406,7 +3410,7 @@ async fn run_pop3_transfer(
         ));
     }
 
-    if let Some(timeout) = transfer.max_time {
+    if let Some(timeout) = active_timeout(transfer.max_time) {
         tokio::time::timeout(
             timeout,
             run_pop3_exchange(transfer, expanded, method, metrics),
@@ -3520,7 +3524,7 @@ async fn run_smtp_transfer(
         ));
     }
 
-    if let Some(timeout) = transfer.max_time {
+    if let Some(timeout) = active_timeout(transfer.max_time) {
         tokio::time::timeout(
             timeout,
             run_smtp_exchange(transfer, expanded, method, metrics),
@@ -3631,7 +3635,7 @@ async fn run_tftp_transfer(
         )));
     }
 
-    if let Some(timeout) = transfer.max_time {
+    if let Some(timeout) = active_timeout(transfer.max_time) {
         tokio::time::timeout(
             timeout,
             run_tftp_exchange(transfer, expanded, method, metrics),
@@ -4436,7 +4440,7 @@ async fn run_telnet_transfer(
         ));
     }
 
-    if let Some(timeout) = transfer.max_time {
+    if let Some(timeout) = active_timeout(transfer.max_time) {
         tokio::time::timeout(
             timeout,
             run_telnet_exchange(transfer, expanded, method, metrics),
@@ -4554,7 +4558,7 @@ async fn run_ws_transfer(
         ));
     }
 
-    if let Some(timeout) = transfer.max_time {
+    if let Some(timeout) = active_timeout(transfer.max_time) {
         tokio::time::timeout(
             timeout,
             run_ws_exchange(transfer, expanded, method, metrics),
@@ -4936,7 +4940,7 @@ async fn run_smb_transfer(
         ));
     }
 
-    if let Some(timeout) = transfer.max_time {
+    if let Some(timeout) = active_timeout(transfer.max_time) {
         tokio::time::timeout(
             timeout,
             run_smb_exchange(transfer, expanded, method, metrics),
@@ -5496,7 +5500,7 @@ async fn run_ldap_transfer(
         ));
     }
 
-    if let Some(timeout) = transfer.max_time {
+    if let Some(timeout) = active_timeout(transfer.max_time) {
         tokio::time::timeout(
             timeout,
             run_ldap_exchange(transfer, expanded, method, metrics),
@@ -6095,10 +6099,10 @@ async fn connect_tcp(host: &str, port: u16, transfer: &TransferConfig) -> Result
             .map(tcp_io_error)
             .unwrap_or_else(|| CurlError::Transfer("could not resolve host".to_string())))
     };
-    if let Some(timeout) = transfer.connect_timeout {
+    if let Some(timeout) = active_timeout(transfer.connect_timeout) {
         tokio::time::timeout(timeout, connect)
             .await
-            .map_err(|_| CurlError::Transfer("connection timed out".to_string()))?
+            .map_err(|_| CurlError::Timeout)?
     } else {
         connect.await
     }
@@ -6351,7 +6355,7 @@ async fn run_imap_transfer(
         ));
     }
 
-    if let Some(timeout) = transfer.max_time {
+    if let Some(timeout) = active_timeout(transfer.max_time) {
         tokio::time::timeout(
             timeout,
             run_imap_exchange(transfer, expanded, method, metrics),
@@ -7514,7 +7518,10 @@ fn tftp_request_packet(
 }
 
 fn tftp_request_timeout_secs(transfer: &TransferConfig) -> u64 {
-    let deadline = match (transfer.connect_timeout, transfer.max_time) {
+    let deadline = match (
+        active_timeout(transfer.connect_timeout),
+        active_timeout(transfer.max_time),
+    ) {
         (Some(connect), Some(total)) => Some(connect.min(total)),
         (Some(connect), None) => Some(connect),
         (None, Some(total)) => Some(total),
@@ -8559,7 +8566,10 @@ async fn run_http_transfer(
                 ));
             }
 
-            response.bytes().await.transfer_err()?;
+            response
+                .bytes()
+                .await
+                .map_err(|error| http_send_error(error, transfer))?;
             if transfer.auto_referer && custom_referer.is_none() {
                 current_referer = Some(auto_referer_value(&final_url));
             }
@@ -8600,7 +8610,11 @@ async fn run_http_transfer(
         {
             Vec::new()
         } else {
-            response.bytes().await.transfer_err()?.to_vec()
+            response
+                .bytes()
+                .await
+                .map_err(|error| http_send_error(error, transfer))?
+                .to_vec()
         };
         let body = decode_http_body_if_compressed(transfer, &headers, body)?;
         metrics.size_download = body.len() as u64;
@@ -9329,7 +9343,9 @@ fn parse_raw_http_headers(
 }
 
 fn http_send_error(error: reqwest::Error, transfer: &TransferConfig) -> CurlError {
-    if !transfer.http09_allowed && reqwest_error_is_http09_denial(&error) {
+    if error.is_timeout() {
+        CurlError::Timeout
+    } else if !transfer.http09_allowed && reqwest_error_is_http09_denial(&error) {
         CurlError::UnsupportedProtocol("HTTP/0.9".to_string())
     } else {
         CurlError::Transfer(error.to_string())

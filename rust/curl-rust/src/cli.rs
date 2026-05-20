@@ -2185,15 +2185,50 @@ fn append_cookie_header(cookie: &mut Option<String>, value: String) -> Result<()
 }
 
 fn parse_duration(name: &str, value: &str) -> Result<Duration> {
-    let seconds: f64 = value
-        .parse()
-        .map_err(|_| CurlError::Usage(format!("option --{name} expects seconds")))?;
-    if seconds.is_sign_negative() || !seconds.is_finite() || seconds > u64::MAX as f64 {
+    const MAX_SECONDS: u128 = i64::MAX as u128 / 1000 - 1;
+
+    let bytes = value.as_bytes();
+    let mut index = 0;
+    let mut seconds = 0_u128;
+    while bytes.get(index).is_some_and(u8::is_ascii_digit) {
+        seconds = seconds
+            .checked_mul(10)
+            .and_then(|seconds| seconds.checked_add(u128::from(bytes[index] - b'0')))
+            .filter(|seconds| *seconds <= MAX_SECONDS)
+            .ok_or_else(|| CurlError::Usage(format!("option --{name} value is too large")))?;
+        index += 1;
+    }
+    if index == 0 {
         return Err(CurlError::Usage(format!(
             "option --{name} expects a non-negative duration"
         )));
     }
-    Ok(Duration::from_secs_f64(seconds))
+
+    let mut millis = 0_u128;
+    if bytes.get(index) == Some(&b'.') {
+        let start = index + 1;
+        let mut end = start;
+        while bytes.get(end).is_some_and(u8::is_ascii_digit) {
+            if end < start + 3 {
+                millis = millis * 10 + u128::from(bytes[end] - b'0');
+            }
+            end += 1;
+        }
+        if end == start {
+            return Err(CurlError::Usage(format!(
+                "option --{name} expects digits after the decimal point"
+            )));
+        }
+        for _ in (end - start)..3 {
+            millis *= 10;
+        }
+    }
+
+    let total_millis = seconds
+        .checked_mul(1000)
+        .and_then(|seconds| seconds.checked_add(millis))
+        .ok_or_else(|| CurlError::Usage(format!("option --{name} value is too large")))?;
+    Ok(Duration::from_millis(total_millis as u64))
 }
 
 fn parse_retry_delay(name: &str, value: &str) -> Result<Duration> {
@@ -3665,6 +3700,49 @@ mod tests {
         );
 
         assert!(parse_args(["-q", "--interface", "", "tftp://example.com/file"]).is_err());
+    }
+
+    #[test]
+    fn parses_timeout_options_like_curl_secs2ms() {
+        let config = parse_args([
+            "-q",
+            "--connect-timeout",
+            "1.5e1",
+            "--max-time",
+            "0.0001",
+            "https://example.com",
+        ])
+        .unwrap();
+        let transfer = &config.transfers[0];
+        assert_eq!(transfer.connect_timeout, Some(Duration::from_millis(1500)));
+        assert_eq!(transfer.max_time, Some(Duration::ZERO));
+
+        let config = parse_args([
+            "-q",
+            "-m",
+            "1e2",
+            "--connect-timeout",
+            "1abc",
+            "https://example.com",
+        ])
+        .unwrap();
+        let transfer = &config.transfers[0];
+        assert_eq!(transfer.max_time, Some(Duration::from_secs(1)));
+        assert_eq!(transfer.connect_timeout, Some(Duration::from_secs(1)));
+    }
+
+    #[test]
+    fn rejects_bad_timeout_values_like_curl() {
+        for value in [".5", "1.", "+1", "-4", "184467440737095510"] {
+            assert!(
+                parse_args(["-q", "--max-time", value, "https://example.com"]).is_err(),
+                "--max-time {value:?} should be rejected"
+            );
+            assert!(
+                parse_args(["-q", "--connect-timeout", value, "https://example.com"]).is_err(),
+                "--connect-timeout {value:?} should be rejected"
+            );
+        }
     }
 
     #[test]

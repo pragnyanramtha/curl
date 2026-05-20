@@ -2220,6 +2220,40 @@ fn downloads_http_and_renders_writeout() {
 }
 
 #[test]
+fn max_time_zero_and_submillisecond_are_disabled() {
+    for value in ["0", "0.0001"] {
+        let (url, rx) =
+            spawn_server(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok");
+
+        let mut command = Command::cargo_bin("curl").unwrap();
+        command.args(["-q", "-sS", "--max-time", value, &url]);
+        command.assert().success().stdout("ok");
+
+        let request = rx.recv().unwrap();
+        assert!(request.start_line.starts_with("GET /resource HTTP/1.1"));
+    }
+}
+
+#[test]
+fn http_max_time_timeout_returns_28() {
+    let (url, rx) = spawn_timed_server(
+        b"HTTP/1.1 200 OK\r\nContent-Length: 4\r\nConnection: close\r\n\r\nslow",
+        Duration::from_millis(250),
+    );
+
+    let mut command = Command::cargo_bin("curl").unwrap();
+    command.args(["-q", "-sS", "--max-time", "0.1", &url]);
+    command
+        .assert()
+        .failure()
+        .code(28)
+        .stdout("")
+        .stderr("curl: (28) Operation timed out\n");
+
+    let _ = rx.recv().unwrap();
+}
+
+#[test]
 fn legacy_tls_max_values_do_not_break_plain_http() {
     for version in ["1.0", "1.1"] {
         let (url, rx) =
