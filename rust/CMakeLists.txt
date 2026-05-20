@@ -393,6 +393,7 @@ set(_curl_rust_corpus_tests
   3020
   3021
   3022
+  3035
   3036
   3206
 )

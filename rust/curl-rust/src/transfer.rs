@@ -9447,6 +9447,12 @@ fn raw_http_direct_request(context: &RawHttpDirectContext<'_>) -> Result<Vec<u8>
         &parsed_headers,
         context.custom_host_allowed,
     );
+    append_raw_http_range_header(
+        &mut request,
+        context.transfer,
+        context.resume_from,
+        has_header("range"),
+    );
     if !has_header("user-agent")
         && let Some(user_agent) = effective_user_agent(context.transfer)
     {
@@ -9509,11 +9515,6 @@ fn raw_http_direct_request(context: &RawHttpDirectContext<'_>) -> Result<Vec<u8>
         && !has_header("referer")
     {
         request.extend_from_slice(format!("Referer: {referer}\r\n").as_bytes());
-    }
-    if let Some(range) = effective_range(context.transfer, context.resume_from)
-        && !has_header("range")
-    {
-        request.extend_from_slice(format!("Range: {}\r\n", range_header_value(&range)).as_bytes());
     }
     if let Some(body) = body
         && !body.is_empty()
@@ -9587,6 +9588,12 @@ fn raw_http_proxy_request(context: &RawHttpProxyContext<'_>) -> Result<Vec<u8>> 
         &parsed_headers,
         context.custom_host_allowed,
     );
+    append_raw_http_range_header(
+        &mut request,
+        context.transfer,
+        context.resume_from,
+        has_header("range"),
+    );
     if let Some(authorization) = &context.proxy.authorization
         && !has_proxy_header("proxy-authorization")
     {
@@ -9655,11 +9662,6 @@ fn raw_http_proxy_request(context: &RawHttpProxyContext<'_>) -> Result<Vec<u8>> 
     {
         request.extend_from_slice(format!("Referer: {referer}\r\n").as_bytes());
     }
-    if let Some(range) = effective_range(context.transfer, context.resume_from)
-        && !has_header("range")
-    {
-        request.extend_from_slice(format!("Range: {}\r\n", range_header_value(&range)).as_bytes());
-    }
     if let Some(body) = body
         && !body.is_empty()
         && !has_header("content-length")
@@ -9708,6 +9710,20 @@ fn raw_http_proxy_request(context: &RawHttpProxyContext<'_>) -> Result<Vec<u8>> 
         request.extend_from_slice(body);
     }
     Ok(request)
+}
+
+fn append_raw_http_range_header(
+    request: &mut Vec<u8>,
+    transfer: &TransferConfig,
+    resume_from: u64,
+    has_range_header: bool,
+) {
+    if has_range_header {
+        return;
+    }
+    if let Some(range) = effective_range(transfer, resume_from) {
+        request.extend_from_slice(format!("Range: {}\r\n", range_header_value(&range)).as_bytes());
+    }
 }
 
 fn raw_http_body<'a>(
