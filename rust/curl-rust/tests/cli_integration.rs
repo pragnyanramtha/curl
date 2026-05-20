@@ -8609,6 +8609,32 @@ fn username_only_basic_auth_encodes_empty_password() {
 }
 
 #[test]
+fn basic_auth_selector_keeps_basic_http_auth() {
+    let (url, rx) = spawn_server(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok");
+
+    let mut command = Command::cargo_bin("curl").unwrap();
+    command.args(["-q", "-sS", "--basic", "-u", "alice:secret", &url]);
+    command.assert().success().stdout("ok");
+
+    let request = rx.recv().unwrap();
+    assert_eq!(
+        header(&request, "authorization"),
+        Some("Basic YWxpY2U6c2VjcmV0")
+    );
+}
+
+#[test]
+fn unsupported_http_auth_selector_fails_before_basic_fallback() {
+    let (url, rx) = spawn_server(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok");
+
+    let mut command = Command::cargo_bin("curl").unwrap();
+    command.args(["-q", "-sS", "--digest", "-u", "alice:secret", &url]);
+    command.assert().failure().code(2).stdout("");
+
+    assert!(rx.try_recv().is_err());
+}
+
+#[test]
 fn sends_oauth2_bearer_authorization_header() {
     let (url, rx) = spawn_server(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok");
 
@@ -8649,6 +8675,45 @@ fn proxy_user_sets_proxy_authorization_header() {
         header(&request, "proxy-authorization"),
         Some("Basic YWxhZGRpbjpvcGVuc2VzYW1l")
     );
+}
+
+#[test]
+fn unsupported_proxy_auth_selector_fails_before_basic_fallback() {
+    let (proxy_url, rx) = spawn_server(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok");
+
+    let mut command = Command::cargo_bin("curl").unwrap();
+    command.args([
+        "-q",
+        "-sS",
+        "-x",
+        &proxy_url,
+        "--proxy-digest",
+        "-U",
+        "aladdin:opensesame",
+        "http://example.test/resource",
+    ]);
+    command.assert().failure().code(2).stdout("");
+
+    assert!(rx.try_recv().is_err());
+}
+
+#[test]
+fn unsupported_proxy_auth_selector_rejects_proxy_url_credentials() {
+    let (proxy_url, rx) = spawn_server(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok");
+    let proxy = proxy_url.replacen("http://", "http://aladdin:opensesame@", 1);
+
+    let mut command = Command::cargo_bin("curl").unwrap();
+    command.args([
+        "-q",
+        "-sS",
+        "-x",
+        &proxy,
+        "--proxy-digest",
+        "http://example.test/resource",
+    ]);
+    command.assert().failure().code(2).stdout("");
+
+    assert!(rx.try_recv().is_err());
 }
 
 #[test]

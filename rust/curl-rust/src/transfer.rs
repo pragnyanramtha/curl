@@ -7741,6 +7741,7 @@ async fn run_http_transfer(
     }
     let mut url = Url::parse(&expanded.url).map_err(|error| CurlError::Url(error.to_string()))?;
     data::append_upload_filename_to_url(&mut url, transfer.upload_file.as_deref());
+    reject_unsupported_http_auth(transfer)?;
     output::validate_output_target(transfer, &url)?;
     if let Some(path) = &transfer.dump_header {
         output::prepare_dump_header_target(path, transfer.create_dirs)?;
@@ -9467,6 +9468,40 @@ fn apply_headers(
 
 fn is_followed_redirect(status: StatusCode) -> bool {
     status.is_redirection()
+}
+
+fn reject_unsupported_http_auth(transfer: &TransferConfig) -> Result<()> {
+    if transfer.aws_sigv4.is_some() {
+        return Err(CurlError::Unsupported(
+            "--aws-sigv4 runtime signing is not implemented in the Rust sidecar".to_string(),
+        ));
+    }
+    if transfer.user.is_some() && transfer.http_auth.requires_unsupported_http_runtime() {
+        return Err(CurlError::Unsupported(
+            "selected HTTP authentication method is not implemented in the Rust sidecar"
+                .to_string(),
+        ));
+    }
+    if proxy_auth_credentials_configured(transfer)?
+        && transfer.proxy_auth.requires_unsupported_proxy_runtime()
+    {
+        return Err(CurlError::Unsupported(
+            "selected proxy authentication method is not implemented in the Rust sidecar"
+                .to_string(),
+        ));
+    }
+    Ok(())
+}
+
+fn proxy_auth_credentials_configured(transfer: &TransferConfig) -> Result<bool> {
+    if transfer.proxy_user.is_some() {
+        return Ok(true);
+    }
+    let Some(proxy) = &transfer.proxy else {
+        return Ok(false);
+    };
+    let proxy = Url::parse(proxy).map_err(|error| CurlError::Url(error.to_string()))?;
+    Ok(proxy_url_credentials(&proxy).is_some())
 }
 
 fn manual_http_redirects(transfer: &TransferConfig) -> bool {

@@ -87,12 +87,15 @@ pub struct TransferConfig {
     pub fail: bool,
     pub fail_with_body: bool,
     pub user: Option<String>,
+    pub http_auth: AuthMethods,
     pub oauth2_bearer: Option<String>,
+    pub aws_sigv4: Option<String>,
     pub resolve: Vec<String>,
     pub connect_to: Vec<String>,
     pub disallow_username_in_url: bool,
     pub proxy: Option<String>,
     pub proxy_user: Option<String>,
+    pub proxy_auth: ProxyAuthMethods,
     pub noproxy: Option<String>,
     pub insecure: bool,
     pub connect_timeout: Option<Duration>,
@@ -147,6 +150,190 @@ pub enum IpVersionPreference {
     Any,
     Ipv4,
     Ipv6,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct AuthMethods {
+    bits: u32,
+}
+
+impl AuthMethods {
+    const BASIC_BITS: u32 = 1 << 0;
+    const DIGEST_BITS: u32 = 1 << 1;
+    const NEGOTIATE_BITS: u32 = 1 << 2;
+    const NTLM_BITS: u32 = 1 << 3;
+    const DIGEST_IE_BITS: u32 = 1 << 4;
+    const BEARER_BITS: u32 = 1 << 6;
+    const AWS_SIGV4_BITS: u32 = 1 << 7;
+    const KNOWN_BITS: u32 = Self::BASIC_BITS
+        | Self::DIGEST_BITS
+        | Self::NEGOTIATE_BITS
+        | Self::NTLM_BITS
+        | Self::BEARER_BITS
+        | Self::AWS_SIGV4_BITS;
+
+    pub const BASIC: Self = Self {
+        bits: Self::BASIC_BITS,
+    };
+    pub const DIGEST: Self = Self {
+        bits: Self::DIGEST_BITS,
+    };
+    pub const NEGOTIATE: Self = Self {
+        bits: Self::NEGOTIATE_BITS,
+    };
+    pub const NTLM: Self = Self {
+        bits: Self::NTLM_BITS,
+    };
+    pub const BEARER: Self = Self {
+        bits: Self::BEARER_BITS,
+    };
+    pub const AWS_SIGV4: Self = Self {
+        bits: Self::AWS_SIGV4_BITS,
+    };
+    pub const ANY: Self = Self {
+        bits: !Self::DIGEST_IE_BITS,
+    };
+    pub const ANYSAFE: Self = Self {
+        bits: !(Self::BASIC_BITS | Self::DIGEST_IE_BITS),
+    };
+
+    pub fn is_empty(self) -> bool {
+        self.bits == 0
+    }
+
+    pub fn contains(self, method: Self) -> bool {
+        self.bits & method.bits == method.bits
+    }
+
+    pub fn insert(&mut self, method: Self) {
+        self.bits |= method.bits;
+    }
+
+    pub fn remove(&mut self, method: Self) {
+        self.bits &= !method.bits;
+    }
+
+    pub fn set_any(&mut self) {
+        self.bits = Self::ANY.bits;
+    }
+
+    pub fn requires_unsupported_http_runtime(self) -> bool {
+        self.bits & !(Self::BASIC_BITS | Self::BEARER_BITS) != 0
+    }
+
+    pub fn to_curlauth_expr(self) -> Option<String> {
+        let bits = self.bits;
+        if bits == 0 {
+            return None;
+        }
+        if bits == Self::ANY.bits {
+            return Some("CURLAUTH_ANY".to_string());
+        }
+        if bits == Self::ANYSAFE.bits {
+            return Some("CURLAUTH_ANYSAFE".to_string());
+        }
+
+        let known = [
+            (Self::BASIC_BITS, "CURLAUTH_BASIC"),
+            (Self::DIGEST_BITS, "CURLAUTH_DIGEST"),
+            (Self::NEGOTIATE_BITS, "CURLAUTH_NEGOTIATE"),
+            (Self::NTLM_BITS, "CURLAUTH_NTLM"),
+            (Self::BEARER_BITS, "CURLAUTH_BEARER"),
+            (Self::AWS_SIGV4_BITS, "CURLAUTH_AWS_SIGV4"),
+        ];
+        if bits & !Self::KNOWN_BITS != 0 {
+            let removed = known
+                .iter()
+                .filter_map(|(bit, name)| (bits & bit == 0).then_some(*name))
+                .collect::<Vec<_>>();
+            if removed.is_empty() {
+                Some("CURLAUTH_ANY".to_string())
+            } else {
+                Some(format!("(CURLAUTH_ANY & ~({}))", removed.join(" | ")))
+            }
+        } else {
+            let names = known
+                .iter()
+                .filter_map(|(bit, name)| (bits & bit != 0).then_some(*name))
+                .collect::<Vec<_>>();
+            Some(names.join(" | "))
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct ProxyAuthMethods {
+    anyauth: bool,
+    basic: bool,
+    digest: bool,
+    negotiate: bool,
+    ntlm: bool,
+}
+
+impl ProxyAuthMethods {
+    pub fn is_empty(self) -> bool {
+        !self.anyauth && !self.basic && !self.digest && !self.negotiate && !self.ntlm
+    }
+
+    pub fn anyauth(self) -> bool {
+        self.anyauth
+    }
+
+    pub fn basic(self) -> bool {
+        self.basic
+    }
+
+    pub fn digest(self) -> bool {
+        self.digest
+    }
+
+    pub fn negotiate(self) -> bool {
+        self.negotiate
+    }
+
+    pub fn ntlm(self) -> bool {
+        self.ntlm
+    }
+
+    pub fn set_anyauth(&mut self, enabled: bool) {
+        self.anyauth = enabled;
+    }
+
+    pub fn set_basic(&mut self, enabled: bool) {
+        self.basic = enabled;
+    }
+
+    pub fn set_digest(&mut self, enabled: bool) {
+        self.digest = enabled;
+    }
+
+    pub fn set_negotiate(&mut self, enabled: bool) {
+        self.negotiate = enabled;
+    }
+
+    pub fn set_ntlm(&mut self, enabled: bool) {
+        self.ntlm = enabled;
+    }
+
+    pub fn requires_unsupported_proxy_runtime(self) -> bool {
+        self.anyauth || self.digest || self.negotiate || self.ntlm
+    }
+
+    pub fn to_curlauth_expr(self) -> Option<&'static str> {
+        if self.anyauth {
+            Some("CURLAUTH_ANY")
+        } else if self.negotiate {
+            Some("CURLAUTH_GSSNEGOTIATE")
+        } else if self.ntlm {
+            Some("CURLAUTH_NTLM")
+        } else if self.digest {
+            Some("CURLAUTH_DIGEST")
+        } else if self.basic {
+            Some("CURLAUTH_BASIC")
+        } else {
+            None
+        }
+    }
 }
 
 impl Default for Config {
@@ -226,12 +413,15 @@ impl Default for TransferConfig {
             fail: false,
             fail_with_body: false,
             user: None,
+            http_auth: AuthMethods::default(),
             oauth2_bearer: None,
+            aws_sigv4: None,
             resolve: Vec::new(),
             connect_to: Vec::new(),
             disallow_username_in_url: false,
             proxy: None,
             proxy_user: None,
+            proxy_auth: ProxyAuthMethods::default(),
             noproxy: None,
             insecure: false,
             connect_timeout: None,
@@ -623,9 +813,21 @@ impl Parser {
                 let value = self.value_for(name, inline_value)?;
                 self.current().user = Some(value);
             }
+            "anyauth" => self.current().http_auth.set_any(),
+            "basic" => self.current().http_auth.insert(AuthMethods::BASIC),
+            "digest" => self.current().http_auth.insert(AuthMethods::DIGEST),
+            "negotiate" => self.current().http_auth.insert(AuthMethods::NEGOTIATE),
+            "ntlm" => self.current().http_auth.insert(AuthMethods::NTLM),
             "oauth2-bearer" => {
                 let value = self.value_for(name, inline_value)?;
+                self.current().http_auth.insert(AuthMethods::BEARER);
                 self.current().oauth2_bearer = Some(value);
+            }
+            "aws-sigv4" => {
+                let value = self.value_for(name, inline_value)?;
+                let transfer = self.current();
+                transfer.http_auth.insert(AuthMethods::AWS_SIGV4);
+                transfer.aws_sigv4 = Some(value);
             }
             "resolve" => {
                 let value = self.value_for(name, inline_value)?;
@@ -644,6 +846,11 @@ impl Parser {
                 let value = self.value_for(name, inline_value)?;
                 self.current().proxy_user = Some(value);
             }
+            "proxy-anyauth" => self.current().proxy_auth.set_anyauth(true),
+            "proxy-basic" => self.current().proxy_auth.set_basic(true),
+            "proxy-digest" => self.current().proxy_auth.set_digest(true),
+            "proxy-negotiate" => self.current().proxy_auth.set_negotiate(true),
+            "proxy-ntlm" => self.current().proxy_auth.set_ntlm(true),
             "noproxy" => {
                 let value = self.value_for(name, inline_value)?;
                 self.current().noproxy = Some(value);
@@ -750,7 +957,16 @@ impl Parser {
                 self.current().fail = false;
                 self.current().fail_with_body = false;
             }
+            "basic" => self.current().http_auth.remove(AuthMethods::BASIC),
+            "digest" => self.current().http_auth.remove(AuthMethods::DIGEST),
+            "negotiate" => self.current().http_auth.remove(AuthMethods::NEGOTIATE),
+            "ntlm" => self.current().http_auth.remove(AuthMethods::NTLM),
             "disallow-username-in-url" => self.current().disallow_username_in_url = false,
+            "proxy-anyauth" => self.current().proxy_auth.set_anyauth(false),
+            "proxy-basic" => self.current().proxy_auth.set_basic(false),
+            "proxy-digest" => self.current().proxy_auth.set_digest(false),
+            "proxy-negotiate" => self.current().proxy_auth.set_negotiate(false),
+            "proxy-ntlm" => self.current().proxy_auth.set_ntlm(false),
             "insecure" => self.current().insecure = false,
             "junk-session-cookies" => self.current().junk_session_cookies = false,
             "mail-rcpt-allowfails" => self.current().mail_rcpt_allowfails = false,
@@ -1282,12 +1498,15 @@ impl TransferConfig {
             || self.fail
             || self.fail_with_body
             || self.user.is_some()
+            || !self.http_auth.is_empty()
             || self.oauth2_bearer.is_some()
+            || self.aws_sigv4.is_some()
             || !self.resolve.is_empty()
             || !self.connect_to.is_empty()
             || self.disallow_username_in_url
             || self.proxy.is_some()
             || self.proxy_user.is_some()
+            || !self.proxy_auth.is_empty()
             || self.noproxy.is_some()
             || self.insecure
             || self.connect_timeout.is_some()
@@ -1364,6 +1583,7 @@ fn option_takes_value(name: &str) -> bool {
             | "retry-delay"
             | "retry-max-time"
             | "user"
+            | "aws-sigv4"
             | "oauth2-bearer"
             | "resolve"
             | "connect-to"
@@ -1859,6 +2079,12 @@ fn print_common_help() {
            -X, --request <method>      Specify request method\n\
                --request-target <path> Specify request target\n\
            -u, --user <user:pass>      Server user and password\n\
+               --basic                 Use HTTP Basic Authentication\n\
+               --digest                Use HTTP Digest Authentication\n\
+               --negotiate             Use HTTP Negotiate Authentication\n\
+               --ntlm                  Use HTTP NTLM Authentication\n\
+               --anyauth               Pick any authentication method\n\
+               --aws-sigv4 <provider>  Use AWS V4 signature authentication\n\
                --disallow-username-in-url Reject URL user names\n\
                --resolve <host:port:addr> Resolve host to address\n\
                --connect-to <rule>     Connect to alternate host\n\
@@ -1867,6 +2093,11 @@ fn print_common_help() {
            -j, --junk-session-cookies  Ignore session cookies from file\n\
                --oauth2-bearer <token> OAuth 2 Bearer token\n\
            -U, --proxy-user <user:pass> Proxy user and password\n\
+               --proxy-basic           Use Basic proxy authentication\n\
+               --proxy-digest          Use Digest proxy authentication\n\
+               --proxy-negotiate       Use Negotiate proxy authentication\n\
+               --proxy-ntlm            Use NTLM proxy authentication\n\
+               --proxy-anyauth         Pick any proxy authentication method\n\
                --noproxy <list>        List hosts that do not use proxy\n\
            -k, --insecure              Allow insecure TLS/SSH\n\
            -s, --silent                Silent mode\n\
@@ -2980,6 +3211,73 @@ mod tests {
         assert_eq!(transfer.proxy.as_deref(), Some("http://proxy.example:8080"));
         assert_eq!(transfer.proxy_user.as_deref(), Some("proxy-user:secret"));
         assert_eq!(transfer.noproxy.as_deref(), Some("example.com"));
+    }
+
+    #[test]
+    fn parses_auth_selector_options() {
+        let config = parse_args([
+            "-q",
+            "--basic",
+            "--digest",
+            "--negotiate",
+            "--ntlm",
+            "--aws-sigv4",
+            "aws:amz:us-east-1:service",
+            "--proxy-basic",
+            "--proxy-digest",
+            "--proxy-negotiate",
+            "--proxy-ntlm",
+            "--proxy-anyauth",
+            "https://example.com",
+        ])
+        .unwrap();
+
+        let transfer = &config.transfers[0];
+        assert!(transfer.http_auth.contains(AuthMethods::BASIC));
+        assert!(transfer.http_auth.contains(AuthMethods::DIGEST));
+        assert!(transfer.http_auth.contains(AuthMethods::NEGOTIATE));
+        assert!(transfer.http_auth.contains(AuthMethods::NTLM));
+        assert!(transfer.http_auth.contains(AuthMethods::AWS_SIGV4));
+        assert_eq!(
+            transfer.aws_sigv4.as_deref(),
+            Some("aws:amz:us-east-1:service")
+        );
+        assert!(transfer.proxy_auth.anyauth());
+        assert!(transfer.proxy_auth.basic());
+        assert!(transfer.proxy_auth.digest());
+        assert!(transfer.proxy_auth.negotiate());
+        assert!(transfer.proxy_auth.ntlm());
+    }
+
+    #[test]
+    fn no_prefixed_auth_selectors_disable_previous_values() {
+        let config = parse_args([
+            "-q",
+            "--basic",
+            "--digest",
+            "--no-basic",
+            "--proxy-anyauth",
+            "--proxy-basic",
+            "--no-proxy-anyauth",
+            "--no-proxy-basic",
+            "https://example.com",
+        ])
+        .unwrap();
+
+        let transfer = &config.transfers[0];
+        assert!(!transfer.http_auth.contains(AuthMethods::BASIC));
+        assert!(transfer.http_auth.contains(AuthMethods::DIGEST));
+        assert!(!transfer.proxy_auth.anyauth());
+        assert!(!transfer.proxy_auth.basic());
+    }
+
+    #[test]
+    fn rejects_no_prefix_for_non_boolean_auth_selectors() {
+        let error = parse_args(["-q", "--no-anyauth", "https://example.com"]).unwrap_err();
+        assert!(error.to_string().contains("no-anyauth"));
+
+        let error = parse_args(["-q", "--no-aws-sigv4", "https://example.com"]).unwrap_err();
+        assert!(error.to_string().contains("no-aws-sigv4"));
     }
 
     #[test]

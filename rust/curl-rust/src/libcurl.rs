@@ -348,7 +348,9 @@ fn write_request(out: &mut String, render: &RenderTransfer<'_>, url: &str) -> Re
     }
     if let Some(user) = &transfer.user {
         emit_string_setopt(out, "CURLOPT_USERPWD", user);
-        emit_raw_setopt(out, "CURLOPT_HTTPAUTH", "(long)CURLAUTH_BASIC");
+    }
+    if let Some(expr) = transfer.http_auth.to_curlauth_expr() {
+        emit_raw_setopt(out, "CURLOPT_HTTPAUTH", &curlauth_setopt_value(&expr));
     }
     if let Some(private_key) = &transfer.ssh_private_key {
         emit_path_setopt(out, "CURLOPT_SSH_PRIVATE_KEYFILE", private_key);
@@ -371,11 +373,17 @@ fn write_request(out: &mut String, render: &RenderTransfer<'_>, url: &str) -> Re
     if let Some(token) = &transfer.oauth2_bearer {
         emit_string_setopt(out, "CURLOPT_XOAUTH2_BEARER", token);
     }
+    if let Some(aws_sigv4) = &transfer.aws_sigv4 {
+        emit_string_setopt(out, "CURLOPT_AWS_SIGV4", aws_sigv4);
+    }
     if let Some(proxy) = &transfer.proxy {
         emit_string_setopt(out, "CURLOPT_PROXY", proxy);
     }
     if let Some(proxy_user) = &transfer.proxy_user {
         emit_string_setopt(out, "CURLOPT_PROXYUSERPWD", proxy_user);
+    }
+    if let Some(expr) = transfer.proxy_auth.to_curlauth_expr() {
+        emit_raw_setopt(out, "CURLOPT_PROXYAUTH", &curlauth_setopt_value(expr));
     }
     if let Some(noproxy) = &transfer.noproxy {
         emit_string_setopt(out, "CURLOPT_NOPROXY", noproxy);
@@ -692,6 +700,14 @@ fn emit_long_setopt(out: &mut String, option: &str, value: i64) {
 
 fn emit_raw_setopt(out: &mut String, option: &str, value: &str) {
     writeln!(out, "  curl_easy_setopt(curl, {option}, {value});").unwrap();
+}
+
+fn curlauth_setopt_value(expr: &str) -> String {
+    if expr.contains('|') || expr.contains('&') || expr.contains('~') {
+        format!("(long)({expr})")
+    } else {
+        format!("(long){expr}")
+    }
 }
 
 fn c_escape(bytes: &[u8]) -> String {
@@ -1060,6 +1076,51 @@ mod tests {
         let source = render_source(&config).unwrap();
 
         assert!(source.contains("CURLOPT_XOAUTH2_BEARER, \"token123\""));
+        assert!(source.contains("CURLOPT_HTTPAUTH, (long)CURLAUTH_BEARER"));
+    }
+
+    #[test]
+    fn renders_auth_selector_options() {
+        let config = parse_args([
+            "-q",
+            "--libcurl",
+            "client.c",
+            "--basic",
+            "--digest",
+            "--aws-sigv4",
+            "aws:amz:us-east-1:service",
+            "--proxy-negotiate",
+            "https://example.com",
+        ])
+        .unwrap();
+
+        let source = render_source(&config).unwrap();
+
+        assert!(source.contains(
+            "CURLOPT_HTTPAUTH, (long)(CURLAUTH_BASIC | CURLAUTH_DIGEST | CURLAUTH_AWS_SIGV4)"
+        ));
+        assert!(source.contains("CURLOPT_AWS_SIGV4, \"aws:amz:us-east-1:service\""));
+        assert!(source.contains("CURLOPT_PROXYAUTH, (long)CURLAUTH_GSSNEGOTIATE"));
+    }
+
+    #[test]
+    fn renders_anyauth_and_proxy_auth_priority() {
+        let config = parse_args([
+            "-q",
+            "--libcurl",
+            "client.c",
+            "--anyauth",
+            "--no-basic",
+            "--proxy-basic",
+            "--proxy-digest",
+            "https://example.com",
+        ])
+        .unwrap();
+
+        let source = render_source(&config).unwrap();
+
+        assert!(source.contains("CURLOPT_HTTPAUTH, (long)CURLAUTH_ANYSAFE"));
+        assert!(source.contains("CURLOPT_PROXYAUTH, (long)CURLAUTH_DIGEST"));
     }
 
     #[test]
