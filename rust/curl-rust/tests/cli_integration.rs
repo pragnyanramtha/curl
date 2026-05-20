@@ -304,6 +304,24 @@ fn spawn_server_bytes(response: Vec<u8>) -> (String, Receiver<RequestRecord>) {
     spawn_sequence_server_bytes(vec![response])
 }
 
+fn spawn_holding_server(
+    response: &'static [u8],
+    hold_open: Duration,
+) -> (String, Receiver<RequestRecord>) {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = listener.local_addr().unwrap();
+    let (tx, rx) = mpsc::channel();
+
+    thread::spawn(move || {
+        let (mut stream, _) = listener.accept().unwrap();
+        tx.send(read_request(&mut stream)).unwrap();
+        stream.write_all(response).unwrap();
+        thread::sleep(hold_open);
+    });
+
+    (format!("http://{addr}/resource"), rx)
+}
+
 fn spawn_cross_origin_redirect(
     final_response: &'static [u8],
 ) -> (String, Receiver<RequestRecord>, Receiver<RequestRecord>) {
@@ -11163,6 +11181,39 @@ fn etag_compare_missing_file_sends_empty_etag() {
 }
 
 #[test]
+fn etag_compare_open_error_sends_empty_etag() {
+    let temp = tempdir().unwrap();
+    let etag = temp.path();
+    let (url, rx) = spawn_server(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok");
+
+    let mut command = Command::cargo_bin("curl").unwrap();
+    command.args(["-q", "-sS", "--etag-compare", etag.to_str().unwrap(), &url]);
+    command
+        .assert()
+        .success()
+        .stdout("ok")
+        .stderr(predicates::str::contains("Warning: Failed to open"));
+
+    let request = rx.recv().unwrap();
+    assert_eq!(header(&request, "if-none-match"), Some("\"\""));
+}
+
+#[test]
+fn etag_compare_strips_crlf_across_file() {
+    let temp = tempdir().unwrap();
+    let etag = temp.path().join("etag.txt");
+    std::fs::write(&etag, b"\"one\"\r\n\"two\"\n").unwrap();
+    let (url, rx) = spawn_server(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok");
+
+    let mut command = Command::cargo_bin("curl").unwrap();
+    command.args(["-q", "-sS", "--etag-compare", etag.to_str().unwrap(), &url]);
+    command.assert().success().stdout("ok");
+
+    let request = rx.recv().unwrap();
+    assert_eq!(header(&request, "if-none-match"), Some("\"one\"\"two\""));
+}
+
+#[test]
 fn etag_save_writes_response_etag() {
     let temp = tempdir().unwrap();
     let etag = temp.path().join("nested").join("etag.txt");
@@ -11185,6 +11236,32 @@ fn etag_save_writes_response_etag() {
 }
 
 #[test]
+fn etag_save_dash_writes_response_etag_to_stdout() {
+    let temp = tempdir().unwrap();
+    let (url, rx) =
+        spawn_server(b"HTTP/1.1 200 OK\r\nETag: W/\"heyheyhey\"\r\nContent-Length: 4\r\n\r\nyes\n");
+
+    let mut command = Command::cargo_bin("curl").unwrap();
+    command.args([
+        "-q",
+        "-sS",
+        "-O",
+        "--output-dir",
+        temp.path().to_str().unwrap(),
+        "--etag-save",
+        "-",
+        &url,
+    ]);
+    command.assert().success().stdout("W/\"heyheyhey\"\n");
+
+    rx.recv().unwrap();
+    assert_eq!(
+        std::fs::read_to_string(temp.path().join("resource")).unwrap(),
+        "yes\n"
+    );
+}
+
+#[test]
 fn etag_save_creates_empty_file_when_header_missing() {
     let temp = tempdir().unwrap();
     let etag = temp.path().join("etag.txt");
@@ -11196,6 +11273,99 @@ fn etag_save_creates_empty_file_when_header_missing() {
 
     rx.recv().unwrap();
     assert_eq!(std::fs::read_to_string(etag).unwrap(), "");
+}
+
+#[test]
+fn etag_save_ignores_http_error_status_etag() {
+    let temp = tempdir().unwrap();
+    let etag = temp.path().join("etag.txt");
+    std::fs::write(&etag, "\"old\"\n").unwrap();
+    let (url, rx) = spawn_server(
+        b"HTTP/1.1 404 Not Found\r\nETag: \"bad\"\r\nContent-Length: 7\r\n\r\nmissing",
+    );
+
+    let mut command = Command::cargo_bin("curl").unwrap();
+    command.args(["-q", "-sS", "--etag-save", etag.to_str().unwrap(), &url]);
+    command.assert().success().stdout("missing");
+
+    rx.recv().unwrap();
+    assert_eq!(std::fs::read_to_string(etag).unwrap(), "\"old\"\n");
+}
+
+#[test]
+fn etag_save_bad_path_fails_before_transfer() {
+    let temp = tempdir().unwrap();
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = listener.local_addr().unwrap();
+    drop(listener);
+    let etag = temp.path().join("missing").join("etag.txt");
+    let mut command = Command::cargo_bin("curl").unwrap();
+
+    command.args([
+        "-q",
+        "-sS",
+        "--etag-save",
+        etag.to_str().unwrap(),
+        &format!("http://{addr}/resource"),
+    ]);
+    command.assert().code(26).stderr(predicates::str::contains(
+        "Failed creating file for saving etags",
+    ));
+}
+
+#[test]
+fn etag_304_without_length_does_not_wait_for_close() {
+    let temp = tempdir().unwrap();
+    let etag = temp.path().join("etag.txt");
+    let output = temp.path().join("output.txt");
+    std::fs::write(&etag, "\"old\"\n").unwrap();
+    std::fs::write(&output, "downloaded already").unwrap();
+    let (url, rx) = spawn_holding_server(
+        b"HTTP/1.1 304 Not Modified\r\nETag: \"old\"\r\n\r\n",
+        Duration::from_secs(2),
+    );
+
+    let mut command = Command::cargo_bin("curl").unwrap();
+    command.args([
+        "-q",
+        "-sS",
+        "--max-time",
+        "1",
+        "-o",
+        output.to_str().unwrap(),
+        "--etag-compare",
+        etag.to_str().unwrap(),
+        "--etag-save",
+        etag.to_str().unwrap(),
+        &url,
+    ]);
+    command.assert().success().stdout("");
+
+    let request = rx.recv().unwrap();
+    assert_eq!(header(&request, "if-none-match"), Some("\"old\""));
+    assert_eq!(std::fs::read_to_string(etag).unwrap(), "\"old\"\n");
+    assert_eq!(
+        std::fs::read_to_string(output).unwrap(),
+        "downloaded already"
+    );
+}
+
+#[test]
+fn etag_options_reject_multiple_urls() {
+    let temp = tempdir().unwrap();
+    let etag = temp.path().join("etag.txt");
+    let mut command = Command::cargo_bin("curl").unwrap();
+    command.args([
+        "-q",
+        "-sS",
+        "--etag-save",
+        etag.to_str().unwrap(),
+        "http://example.com/one",
+        "http://example.com/two",
+    ]);
+    command.assert().code(2).stderr(predicates::str::contains(
+        "The etag options only work on a single URL",
+    ));
 }
 
 #[test]

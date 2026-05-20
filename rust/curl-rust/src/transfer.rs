@@ -8542,6 +8542,9 @@ async fn run_http_transfer(
     if let Some(path) = &transfer.dump_header {
         output::prepare_dump_header_target(path, transfer.create_dirs)?;
     }
+    if let Some(path) = &transfer.etag_save {
+        prepare_etag_save_target(path, transfer.create_dirs)?;
+    }
     let resume_from = resume_offset(
         transfer,
         &url,
@@ -9975,6 +9978,7 @@ async fn raw_http_read_response(
     let mut deferred_error = None;
     let body = if method == Method::HEAD
         || resume_action == HttpResumeAction::AlreadyComplete
+        || raw_http_status_has_no_body(status)
         || unbounded_redirect_body
     {
         Vec::new()
@@ -10024,6 +10028,12 @@ fn raw_http_response_is_chunked(headers: &HeaderMap) -> bool {
                 .any(|coding| coding.trim().eq_ignore_ascii_case("chunked"))
         })
     })
+}
+
+fn raw_http_status_has_no_body(status: StatusCode) -> bool {
+    status.is_informational()
+        || status == StatusCode::NO_CONTENT
+        || status == StatusCode::NOT_MODIFIED
 }
 
 async fn raw_http_read_chunked_body(stream: &mut TcpStream) -> Result<Vec<u8>> {
@@ -10698,13 +10708,16 @@ fn write_http_attempt_output(
         output::append_dump_headers(path, &header_bytes, transfer.create_dirs)?;
     }
     if persist_headers && let Some(path) = &transfer.etag_save {
-        save_etag(path, &attempt.headers, transfer.create_dirs)?;
+        save_etag(path, attempt.status, &attempt.headers, transfer.create_dirs)?;
     }
 
     let is_error = attempt.status.is_some_and(is_http_error_status);
+    let etag_not_modified =
+        transfer.etag_compare.is_some() && attempt.status == Some(StatusCode::NOT_MODIFIED);
     let write_headers = transfer.include_headers || transfer.head;
-    let write_body =
-        method.as_str() != "HEAD" && (!is_error || !transfer.fail || transfer.fail_with_body);
+    let write_body = method.as_str() != "HEAD"
+        && !etag_not_modified
+        && (!is_error || !transfer.fail || transfer.fail_with_body);
     let (body_bytes, max_filesize_exceeded) = if write_body {
         limit_body_for_max_filesize(transfer, &attempt.body)
     } else {
@@ -11403,12 +11416,19 @@ fn split_user_password(value: &str) -> (&str, &str) {
 }
 
 fn load_etag_compare(path: &Path) -> Result<String> {
-    let text = match std::fs::read_to_string(path) {
-        Ok(text) => text,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => String::new(),
-        Err(error) => return Err(error.into()),
+    let bytes = match std::fs::read(path) {
+        Ok(bytes) => bytes,
+        Err(error) => {
+            eprintln!("Warning: Failed to open {}: {error}", path.display());
+            Vec::new()
+        }
     };
-    let etag = text.lines().next().unwrap_or("").trim();
+    let bytes = bytes
+        .into_iter()
+        .take_while(|byte| *byte != 0)
+        .filter(|byte| !matches!(*byte, b'\r' | b'\n'))
+        .collect::<Vec<_>>();
+    let etag = String::from_utf8_lossy(&bytes);
     if etag.is_empty() {
         Ok("\"\"".to_string())
     } else {
@@ -11424,7 +11444,59 @@ fn time_condition_header(value: &str) -> (HeaderName, &str) {
         })
 }
 
-fn save_etag(path: &Path, headers: &reqwest::header::HeaderMap, create_dirs: bool) -> Result<()> {
+fn save_etag(
+    path: &Path,
+    status: Option<StatusCode>,
+    headers: &reqwest::header::HeaderMap,
+    create_dirs: bool,
+) -> Result<()> {
+    let writes_stdout = path == Path::new("-");
+    if create_dirs
+        && !writes_stdout
+        && let Some(parent) = path
+            .parent()
+            .filter(|parent| !parent.as_os_str().is_empty())
+    {
+        std::fs::create_dir_all(parent)?;
+    }
+
+    let text = headers
+        .get(ETAG)
+        .and_then(|value| value.to_str().ok())
+        .unwrap_or("")
+        .trim()
+        .to_string();
+    let can_save = status.is_some_and(|status| matches!(status.as_u16() / 100, 2 | 3));
+
+    if writes_stdout {
+        if can_save && !text.is_empty() {
+            let mut stdout = io::stdout().lock();
+            stdout.write_all(text.as_bytes())?;
+            stdout.write_all(b"\n")?;
+            stdout.flush()?;
+        }
+        return Ok(());
+    }
+
+    let mut file = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)?;
+    if can_save && !text.is_empty() {
+        file.set_len(0)?;
+        file.seek(SeekFrom::Start(0))?;
+        file.write_all(text.as_bytes())?;
+        file.write_all(b"\n")?;
+        file.flush()?;
+    }
+    Ok(())
+}
+
+fn prepare_etag_save_target(path: &Path, create_dirs: bool) -> Result<()> {
+    if path == Path::new("-") {
+        return Ok(());
+    }
+
     if create_dirs
         && let Some(parent) = path
             .parent()
@@ -11433,17 +11505,17 @@ fn save_etag(path: &Path, headers: &reqwest::header::HeaderMap, create_dirs: boo
         std::fs::create_dir_all(parent)?;
     }
 
-    let mut text = headers
-        .get(ETAG)
-        .and_then(|value| value.to_str().ok())
-        .unwrap_or("")
-        .trim()
-        .to_string();
-    if !text.is_empty() {
-        text.push('\n');
-    }
-    std::fs::write(path, text)?;
-    Ok(())
+    std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)
+        .map(|_| ())
+        .map_err(|error| {
+            CurlError::ReadError(format!(
+                "Failed creating file for saving etags: \"{}\": {error}",
+                path.display()
+            ))
+        })
 }
 
 fn append_query_body(url: &mut Url, body: &[u8]) {

@@ -896,11 +896,13 @@ impl Parser {
             }
             "etag-compare" => {
                 let value = self.value_for(name, inline_value)?;
-                self.current().etag_compare = Some(PathBuf::from(value));
+                self.reject_etag_option_after_multi_url("--etag-compare")?;
+                self.current().etag_compare = Some(parse_nonempty_path(name, &value)?);
             }
             "etag-save" => {
                 let value = self.value_for(name, inline_value)?;
-                self.current().etag_save = Some(PathBuf::from(value));
+                self.reject_etag_option_after_multi_url("--etag-save")?;
+                self.current().etag_save = Some(parse_nonempty_path(name, &value)?);
             }
             "time-cond" => {
                 let value = self.value_for(name, inline_value)?;
@@ -1526,10 +1528,44 @@ impl Parser {
         if let Some(lines) = read_at_lines_argument(&value)? {
             for line in lines {
                 self.push_url(line, true, true);
+                self.reject_url_after_etag_option("--url")?;
             }
         } else {
             let remote_name = self.current().remote_name_all;
             self.push_url(value, remote_name, false);
+            self.reject_url_after_etag_option("--url")?;
+        }
+        Ok(())
+    }
+
+    fn reject_etag_option_after_multi_url(&self, option: &str) -> Result<()> {
+        let transfer = self
+            .config
+            .transfers
+            .last()
+            .expect("parser always has a current transfer");
+        if transfer.urls.len() > 1 {
+            return Err(bad_option_usage(
+                "The etag options only work on a single URL",
+                option,
+            ));
+        }
+        Ok(())
+    }
+
+    fn reject_url_after_etag_option(&self, option: &str) -> Result<()> {
+        let transfer = self
+            .config
+            .transfers
+            .last()
+            .expect("parser always has a current transfer");
+        if transfer.urls.len() > 1
+            && (transfer.etag_save.is_some() || transfer.etag_compare.is_some())
+        {
+            return Err(bad_option_usage(
+                "The etag options only work on a single URL",
+                option,
+            ));
         }
         Ok(())
     }
@@ -4279,6 +4315,37 @@ mod tests {
         assert_eq!(transfer.proxy.as_deref(), Some("http://proxy.example:8080"));
         assert_eq!(transfer.proxy_user.as_deref(), Some("proxy-user:secret"));
         assert_eq!(transfer.noproxy.as_deref(), Some("example.com"));
+    }
+
+    #[test]
+    fn rejects_etag_options_with_multiple_urls() {
+        let error = parse_args([
+            "-q",
+            "--etag-save",
+            "etag.out",
+            "https://example.com/one",
+            "https://example.com/two",
+        ])
+        .unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("The etag options only work on a single URL")
+        );
+
+        let error = parse_args([
+            "-q",
+            "https://example.com/one",
+            "https://example.com/two",
+            "--etag-compare",
+            "etag.in",
+        ])
+        .unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("The etag options only work on a single URL")
+        );
     }
 
     #[test]
