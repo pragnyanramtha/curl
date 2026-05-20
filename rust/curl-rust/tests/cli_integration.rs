@@ -2081,6 +2081,34 @@ fn downloads_http_and_renders_writeout() {
 }
 
 #[test]
+fn duplicate_location_headers_accept_exact_repeat() {
+    let (url, rx) = spawn_server(
+        b"HTTP/1.1 200 OK\r\nLocation: this\r\nLocation: this\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok",
+    );
+
+    let mut command = Command::cargo_bin("curl").unwrap();
+    command.args(["-q", "-sS", &url]);
+    command.assert().success().stdout("ok");
+
+    let request = rx.recv().unwrap();
+    assert!(request.start_line.starts_with("GET /resource HTTP/1.1"));
+}
+
+#[test]
+fn conflicting_location_headers_return_weird_reply() {
+    let (url, rx) = spawn_server(
+        b"HTTP/1.1 302 Found\r\nLocation: /one\r\nLocation: /two\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+    );
+
+    let mut command = Command::cargo_bin("curl").unwrap();
+    command.args(["-q", "-sS", &url]);
+    command.assert().failure().code(8).stdout("");
+
+    let request = rx.recv().unwrap();
+    assert!(request.start_line.starts_with("GET /resource HTTP/1.1"));
+}
+
+#[test]
 fn compressed_decodes_supported_response_bodies() {
     for (label, encoding, compressed_body) in [
         ("gzip", "gzip", GZIP_COMPRESSED_BODY),
@@ -2669,6 +2697,38 @@ fn request_target_location_follows_redirect_with_same_target() {
     let second = rx.recv().unwrap();
     assert_eq!(first.start_line, "GET /raw HTTP/1.1");
     assert_eq!(second.start_line, "GET /raw HTTP/1.1");
+}
+
+#[test]
+fn request_target_location_allows_duplicate_location_repeat() {
+    let (url, rx) = spawn_sequence_server(vec![
+        b"HTTP/1.1 302 Found\r\nLocation: /next\r\nLocation: /next\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+        b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok",
+    ]);
+
+    let mut command = Command::cargo_bin("curl").unwrap();
+    command.args(["-q", "-sS", "-L", "--request-target", "/raw", &url]);
+    command.assert().success().stdout("ok");
+
+    let first = rx.recv().unwrap();
+    let second = rx.recv().unwrap();
+    assert_eq!(first.start_line, "GET /raw HTTP/1.1");
+    assert_eq!(second.start_line, "GET /raw HTTP/1.1");
+}
+
+#[test]
+fn request_target_location_rejects_conflicting_location_headers() {
+    let (url, rx) = spawn_sequence_server(vec![
+        b"HTTP/1.1 302 Found\r\nLocation: /one\r\nLocation: /two\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+    ]);
+
+    let mut command = Command::cargo_bin("curl").unwrap();
+    command.args(["-q", "-sS", "-L", "--request-target", "/raw", &url]);
+    command.assert().failure().code(8).stdout("");
+
+    let first = rx.recv().unwrap();
+    assert_eq!(first.start_line, "GET /raw HTTP/1.1");
+    assert!(rx.try_recv().is_err());
 }
 
 #[test]

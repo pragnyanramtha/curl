@@ -32,6 +32,8 @@ pub enum CurlError {
     PartialFile,
     #[error("weird server reply")]
     WeirdServerReply,
+    #[error("Multiple Location headers")]
+    MultipleLocationHeaders,
     #[error("server returned nothing")]
     GotNothing,
     #[error("failure when receiving data from the peer")]
@@ -115,7 +117,7 @@ impl CurlError {
             Self::OptionSyntax(_) | Self::ResolveParse(_) | Self::ConnectToPortSyntax(_) => 49,
             Self::Transfer(_) => 7,
             Self::PartialFile => 18,
-            Self::WeirdServerReply => 8,
+            Self::WeirdServerReply | Self::MultipleLocationHeaders => 8,
             Self::GotNothing => 52,
             Self::RecvError => 56,
             Self::RemoteAccessDenied => 9,

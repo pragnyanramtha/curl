@@ -7890,11 +7890,7 @@ async fn run_http_transfer(
                 .get(CONTENT_TYPE)
                 .and_then(|value| value.to_str().ok())
                 .map(ToString::to_string);
-            metrics.redirect_url = attempt
-                .headers
-                .get(LOCATION)
-                .and_then(|value| value.to_str().ok())
-                .map(ToString::to_string);
+            metrics.redirect_url = redirect_location_string(&attempt.headers)?;
             metrics.headers = attempt.headers.clone();
             check_http_content_length_max_filesize(
                 transfer,
@@ -7935,11 +7931,7 @@ async fn run_http_transfer(
             .get(CONTENT_TYPE)
             .and_then(|value| value.to_str().ok())
             .map(ToString::to_string);
-        metrics.redirect_url = attempt
-            .headers
-            .get(LOCATION)
-            .and_then(|value| value.to_str().ok())
-            .map(ToString::to_string);
+        metrics.redirect_url = redirect_location_string(&attempt.headers)?;
         metrics.headers = attempt.headers.clone();
         check_http_content_length_max_filesize(transfer, &attempt.headers, method == Method::HEAD)?;
         metrics.size_download = attempt.body.len() as u64;
@@ -8046,11 +8038,7 @@ async fn run_http_transfer(
                 .get(CONTENT_TYPE)
                 .and_then(|value| value.to_str().ok())
                 .map(ToString::to_string);
-            metrics.redirect_url = attempt
-                .headers
-                .get(LOCATION)
-                .and_then(|value| value.to_str().ok())
-                .map(ToString::to_string);
+            metrics.redirect_url = redirect_location_string(&attempt.headers)?;
             metrics.headers = attempt.headers.clone();
             check_http_content_length_max_filesize(
                 transfer,
@@ -8086,11 +8074,7 @@ async fn run_http_transfer(
             .get(CONTENT_TYPE)
             .and_then(|value| value.to_str().ok())
             .map(ToString::to_string);
-        metrics.redirect_url = attempt
-            .headers
-            .get(LOCATION)
-            .and_then(|value| value.to_str().ok())
-            .map(ToString::to_string);
+        metrics.redirect_url = redirect_location_string(&attempt.headers)?;
         metrics.headers = attempt.headers.clone();
         check_http_content_length_max_filesize(transfer, &attempt.headers, method == Method::HEAD)?;
         metrics.size_download = attempt.body.len() as u64;
@@ -8125,11 +8109,7 @@ async fn run_http_transfer(
             .get(CONTENT_TYPE)
             .and_then(|value| value.to_str().ok())
             .map(ToString::to_string);
-        metrics.redirect_url = attempt
-            .headers
-            .get(LOCATION)
-            .and_then(|value| value.to_str().ok())
-            .map(ToString::to_string);
+        metrics.redirect_url = redirect_location_string(&attempt.headers)?;
         metrics.headers = attempt.headers.clone();
         check_http_content_length_max_filesize(transfer, &attempt.headers, method == Method::HEAD)?;
         metrics.size_download = attempt.body.len() as u64;
@@ -8212,6 +8192,7 @@ async fn run_http_transfer(
         if version == Version::HTTP_09 && current_method == Method::HEAD {
             return Err(CurlError::WeirdServerReply);
         }
+        validate_redirect_location_headers(&headers)?;
 
         if transfer.verbose {
             eprintln!("< {}", status_line(version, status));
@@ -8271,10 +8252,7 @@ async fn run_http_transfer(
             .get(CONTENT_TYPE)
             .and_then(|value| value.to_str().ok())
             .map(ToString::to_string);
-        metrics.redirect_url = headers
-            .get(LOCATION)
-            .and_then(|value| value.to_str().ok())
-            .map(ToString::to_string);
+        metrics.redirect_url = redirect_location_string(&headers)?;
         metrics.headers = headers.clone();
 
         check_http_content_length_max_filesize(transfer, &headers, current_method == Method::HEAD)?;
@@ -8730,6 +8708,7 @@ async fn raw_http_read_response(
     }
 
     let (version, status, headers) = parse_raw_http_headers(&header_bytes)?;
+    validate_redirect_location_headers(&headers)?;
     let retry_after = retry_after_delay(&headers);
     let resume_action = http_resume_action(method, resume_from, status, &headers)?;
     let body = if method == Method::HEAD || resume_action == HttpResumeAction::AlreadyComplete {
@@ -9564,16 +9543,61 @@ fn redirect_location(
     current_url: &Url,
     headers: &reqwest::header::HeaderMap,
 ) -> Result<Option<Url>> {
-    let Some(location) = headers.get(LOCATION) else {
+    let Some(location) = redirect_location_value(headers)? else {
         return Ok(None);
     };
-    let location = location
-        .to_str()
+    let location = std::str::from_utf8(&location)
         .map_err(|error| CurlError::Transfer(format!("redirect Location is not UTF-8: {error}")))?;
     current_url
         .join(location)
         .map(Some)
         .map_err(|error| CurlError::Url(error.to_string()))
+}
+
+fn validate_redirect_location_headers(headers: &reqwest::header::HeaderMap) -> Result<()> {
+    redirect_location_value(headers).map(|_| ())
+}
+
+fn redirect_location_string(headers: &reqwest::header::HeaderMap) -> Result<Option<String>> {
+    let Some(location) = redirect_location_value(headers)? else {
+        return Ok(None);
+    };
+    String::from_utf8(location)
+        .map(Some)
+        .map_err(|error| CurlError::Transfer(format!("redirect Location is not UTF-8: {error}")))
+}
+
+fn redirect_location_value(headers: &reqwest::header::HeaderMap) -> Result<Option<Vec<u8>>> {
+    let mut selected = None;
+    for location in headers.get_all(LOCATION) {
+        let location = trim_http_header_value(location.as_bytes());
+        if location.is_empty() {
+            continue;
+        }
+        let Some(previous) = selected.as_ref() else {
+            selected = Some(location.to_vec());
+            continue;
+        };
+        if previous.as_slice() != location {
+            return Err(CurlError::MultipleLocationHeaders);
+        }
+    }
+    Ok(selected)
+}
+
+fn trim_http_header_value(value: &[u8]) -> &[u8] {
+    let mut start = 0;
+    while value
+        .get(start)
+        .is_some_and(|byte| matches!(byte, b' ' | b'\t'))
+    {
+        start += 1;
+    }
+    let mut end = value.len();
+    while end > start && matches!(value[end - 1], b' ' | b'\t') {
+        end -= 1;
+    }
+    &value[start..end]
 }
 
 fn auto_referer_value(previous: &Url) -> String {
