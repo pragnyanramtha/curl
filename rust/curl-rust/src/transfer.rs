@@ -103,11 +103,25 @@ struct RawHttpProxyContext<'a> {
 struct RawHttpDirectContext<'a> {
     transfer: &'a TransferConfig,
     url: &'a Url,
+    connect_host: &'a str,
+    connect_port: u16,
     method: &'a Method,
     prepared_body: Option<&'a PreparedBody>,
     upload_body: Option<&'a [u8]>,
     resume_from: u64,
     referer: Option<&'a str>,
+}
+
+struct ConnectToRule<'a> {
+    match_host: &'a str,
+    match_port: Option<u16>,
+    connect_host: &'a str,
+    connect_port: Option<u16>,
+}
+
+struct ConnectToTarget {
+    host: String,
+    port: u16,
 }
 
 struct HttpAttempt {
@@ -336,12 +350,7 @@ fn build_client(transfer: &TransferConfig, cookie_jar: Option<Arc<CookieJar>>) -
     }
 
     for rule in &transfer.connect_to {
-        validate_connect_to_rule(rule)?;
-    }
-    if !transfer.connect_to.is_empty() {
-        return Err(CurlError::Unsupported(
-            "--connect-to remapping is not implemented in the Rust sidecar".to_string(),
-        ));
+        parse_connect_to_rule(rule)?;
     }
 
     if let Some(proxy) = &transfer.proxy
@@ -431,18 +440,27 @@ fn parse_resolve_entry(entry: &str) -> Result<Option<(String, Vec<SocketAddr>)>>
     Ok(Some((trim_ip_brackets(host).to_string(), addrs)))
 }
 
-fn validate_connect_to_rule(rule: &str) -> Result<()> {
+fn parse_connect_to_rule(rule: &str) -> Result<ConnectToRule<'_>> {
     let fields: Vec<_> = rule.split(':').collect();
     if fields.len() != 4 {
         return Err(connect_to_syntax_error(rule));
     }
-    if !fields[1].is_empty() {
-        parse_connect_to_port(fields[0], fields[1])?;
-    }
-    if !fields[3].is_empty() {
-        parse_connect_to_port(fields[2], fields[3])?;
-    }
-    Ok(())
+    let match_port = if fields[1].is_empty() {
+        None
+    } else {
+        Some(parse_connect_to_port(fields[0], fields[1])?)
+    };
+    let connect_port = if fields[3].is_empty() {
+        None
+    } else {
+        Some(parse_connect_to_port(fields[2], fields[3])?)
+    };
+    Ok(ConnectToRule {
+        match_host: fields[0],
+        match_port,
+        connect_host: fields[2],
+        connect_port,
+    })
 }
 
 fn parse_resolve_port(entry: &str, port: &str) -> Result<u16> {
@@ -471,6 +489,38 @@ fn resolve_syntax_error(value: &str) -> CurlError {
 
 fn connect_to_syntax_error(value: &str) -> CurlError {
     CurlError::OptionSyntax(format!("--connect-to {value:?}"))
+}
+
+fn connect_to_target(transfer: &TransferConfig, url: &Url) -> Result<Option<ConnectToTarget>> {
+    if transfer.connect_to.is_empty() {
+        return Ok(None);
+    }
+
+    let origin_host = url
+        .host_str()
+        .ok_or_else(|| CurlError::Url("URL is missing a host".to_string()))?;
+    let origin_port = url
+        .port_or_known_default()
+        .ok_or_else(|| CurlError::Url("URL is missing a port".to_string()))?;
+
+    for rule in &transfer.connect_to {
+        let rule = parse_connect_to_rule(rule)?;
+        let host_matches =
+            rule.match_host.is_empty() || rule.match_host.eq_ignore_ascii_case(origin_host);
+        let port_matches = rule.match_port.is_none_or(|port| port == origin_port);
+        if host_matches && port_matches {
+            return Ok(Some(ConnectToTarget {
+                host: if rule.connect_host.is_empty() {
+                    origin_host.to_string()
+                } else {
+                    rule.connect_host.to_string()
+                },
+                port: rule.connect_port.unwrap_or(origin_port),
+            }));
+        }
+    }
+
+    Ok(None)
 }
 
 fn reject_url_userinfo(raw_url: &str) -> Result<()> {
@@ -7701,6 +7751,55 @@ async fn run_http_transfer(
     let mut redirects = 0usize;
 
     let explicit_proxy = explicit_http_proxy(transfer)?;
+    if let Some(connect_to) = connect_to_target(transfer, &url)? {
+        if url.scheme() != "http" {
+            return Err(CurlError::Unsupported(
+                "--connect-to is only implemented for plain http:// URLs in the Rust sidecar"
+                    .to_string(),
+            ));
+        }
+        if explicit_proxy.is_some() {
+            return Err(CurlError::Unsupported(
+                "--connect-to with HTTP proxy is not implemented in the Rust sidecar".to_string(),
+            ));
+        }
+        if !raw_http_direct_supported(transfer, &url, has_multipart) {
+            return Err(CurlError::Unsupported(
+                "--connect-to is not implemented for this HTTP request shape in the Rust sidecar"
+                    .to_string(),
+            ));
+        }
+        let attempt = run_raw_http_direct_transfer(RawHttpDirectContext {
+            transfer,
+            url: &url,
+            connect_host: &connect_to.host,
+            connect_port: connect_to.port,
+            method: &method,
+            prepared_body: prepared_body.as_ref(),
+            upload_body: upload_body.as_deref(),
+            resume_from,
+            referer: custom_referer.as_deref().or(current_referer.as_deref()),
+        })
+        .await?;
+        metrics.url_effective = attempt.final_url.to_string();
+        metrics.response_code = attempt.status.map(|status| status.as_u16());
+        metrics.referer = custom_referer.clone().or_else(|| current_referer.clone());
+        metrics.content_type = attempt
+            .headers
+            .get(CONTENT_TYPE)
+            .and_then(|value| value.to_str().ok())
+            .map(ToString::to_string);
+        metrics.redirect_url = attempt
+            .headers
+            .get(LOCATION)
+            .and_then(|value| value.to_str().ok())
+            .map(ToString::to_string);
+        metrics.headers = attempt.headers.clone();
+        check_http_content_length_max_filesize(transfer, &attempt.headers, method == Method::HEAD)?;
+        metrics.size_download = attempt.body.len() as u64;
+        return Ok(attempt);
+    }
+
     if let Some(proxy) = explicit_proxy.as_ref()
         && raw_http_proxy_supported(transfer, &url, has_multipart)
     {
@@ -7741,6 +7840,10 @@ async fn run_http_transfer(
         let attempt = run_raw_http_direct_transfer(RawHttpDirectContext {
             transfer,
             url: &url,
+            connect_host: url
+                .host_str()
+                .ok_or_else(|| CurlError::Url("URL is missing a host".to_string()))?,
+            connect_port: url.port_or_known_default().unwrap_or(80),
             method: &method,
             prepared_body: prepared_body.as_ref(),
             upload_body: upload_body.as_deref(),
@@ -7997,12 +8100,8 @@ async fn run_raw_http_proxy_transfer(context: RawHttpProxyContext<'_>) -> Result
 
 async fn run_raw_http_direct_transfer(context: RawHttpDirectContext<'_>) -> Result<HttpAttempt> {
     let request = raw_http_direct_request(&context)?;
-    let host = context
-        .url
-        .host_str()
-        .ok_or_else(|| CurlError::Url("URL is missing a host".to_string()))?;
-    let port = context.url.port_or_known_default().unwrap_or(80);
-    let mut stream = connect_tcp(host, port, context.transfer).await?;
+    let mut stream =
+        connect_tcp(context.connect_host, context.connect_port, context.transfer).await?;
     stream.write_all(&request).await.map_err(tcp_io_error)?;
     let mut attempt = raw_http_read_response(
         &mut stream,

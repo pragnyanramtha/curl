@@ -2803,6 +2803,46 @@ fn connect_to_invalid_syntax_exits_option_syntax_error() {
 }
 
 #[test]
+fn connect_to_remaps_plain_http_destination() {
+    let (backend_url, rx) = spawn_server(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok");
+    let backend_port = Url::parse(&backend_url).unwrap().port().unwrap();
+    let rule = format!("example.test:80:127.0.0.1:{backend_port}");
+
+    let mut command = Command::cargo_bin("curl").unwrap();
+    command.args([
+        "-q",
+        "-sS",
+        "--connect-to",
+        &rule,
+        "http://example.test/resource",
+    ]);
+    command.assert().success().stdout("ok");
+
+    let request = rx.recv().unwrap();
+    assert_eq!(request.start_line, "GET /resource HTTP/1.1");
+    assert_eq!(header(&request, "host"), Some("example.test"));
+}
+
+#[test]
+fn connect_to_nonmatching_rule_does_not_remap_or_fail() {
+    let (url, rx) = spawn_server(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok");
+
+    let mut command = Command::cargo_bin("curl").unwrap();
+    command.args([
+        "-q",
+        "-sS",
+        "--connect-to",
+        "example.test:80:127.0.0.1:9",
+        &url,
+    ]);
+    command.assert().success().stdout("ok");
+
+    let request = rx.recv().unwrap();
+    assert!(request.start_line.starts_with("GET /resource HTTP/1.1"));
+    assert_ne!(header(&request, "host"), Some("example.test"));
+}
+
+#[test]
 fn disallow_username_in_url_rejects_url_userinfo() {
     let mut command = Command::cargo_bin("curl").unwrap();
     command.args([
