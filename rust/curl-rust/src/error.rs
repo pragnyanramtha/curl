@@ -88,19 +88,19 @@ pub enum CurlError {
     RemoteFileNotFound,
     #[error("failed sending data to the peer")]
     SendError,
-    #[error("TFTP file not found")]
+    #[error("TFTP: File Not Found")]
     TftpNotFound,
-    #[error("TFTP permission problem")]
+    #[error("TFTP: Access Violation")]
     TftpPermission,
-    #[error("TFTP disk full")]
+    #[error("Disk full or allocation exceeded")]
     TftpDiskFull,
-    #[error("TFTP illegal operation")]
+    #[error("TFTP: Illegal operation")]
     TftpIllegal,
-    #[error("TFTP unknown transfer ID")]
+    #[error("TFTP: Unknown transfer ID")]
     TftpUnknownId,
-    #[error("TFTP file already exists")]
+    #[error("Remote file already exists")]
     TftpFileExists,
-    #[error("TFTP no such user")]
+    #[error("TFTP: No such user")]
     TftpNoSuchUser,
     #[error("RTSP CSeq mismatch or invalid CSeq")]
     RtspCseqError,

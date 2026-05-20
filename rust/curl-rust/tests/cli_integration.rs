@@ -6112,7 +6112,12 @@ fn tftp_upload_error_packet_maps_permission() {
 
     let mut command = Command::cargo_bin("curl").unwrap();
     command.args(["-q", "-sS", "-T", upload.to_str().unwrap(), &url]);
-    command.assert().failure().code(69).stdout("");
+    command
+        .assert()
+        .failure()
+        .code(69)
+        .stdout("")
+        .stderr("curl: (69) TFTP: Access Violation\n");
 
     assert!(rx.recv().unwrap().starts_with(b"\0\x02upload.bin\0octet\0"));
 }
