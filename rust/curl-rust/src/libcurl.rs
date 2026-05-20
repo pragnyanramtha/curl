@@ -5,8 +5,8 @@ use std::path::Path;
 use url::Url;
 
 use crate::cli::{
-    Config, ContinueAt, HttpVersionPreference, IpVersionPreference, SslVersionPreference,
-    TransferConfig,
+    Config, ContinueAt, HttpVersionPreference, IpVersionPreference, SslVersionMaxPreference,
+    SslVersionPreference, TransferConfig,
 };
 use crate::data::{self, PreparedBody};
 use crate::error::{CurlError, Result};
@@ -478,7 +478,7 @@ fn write_request(out: &mut String, render: &RenderTransfer<'_>, url: &str) -> Re
         emit_string_setopt(out, "CURLOPT_USERAGENT", &transfer::default_user_agent());
     }
     emit_http_version(out, transfer.http_version);
-    emit_ssl_version(out, transfer.ssl_version);
+    emit_ssl_version(out, transfer.ssl_version, transfer.ssl_version_max);
     emit_ip_version(out, transfer.ip_version);
     emit_long_setopt(out, "CURLOPT_TCP_KEEPALIVE", 1);
     out.push('\n');
@@ -618,15 +618,53 @@ fn emit_http_version(out: &mut String, version: HttpVersionPreference) {
     emit_raw_setopt(out, "CURLOPT_HTTP_VERSION", value);
 }
 
-fn emit_ssl_version(out: &mut String, version: Option<SslVersionPreference>) {
-    let value = match version {
-        Some(SslVersionPreference::TlsV1_0) => "CURL_SSLVERSION_TLSv1_0",
-        Some(SslVersionPreference::TlsV1_1) => "CURL_SSLVERSION_TLSv1_1",
-        Some(SslVersionPreference::TlsV1_2) => "CURL_SSLVERSION_TLSv1_2",
-        Some(SslVersionPreference::TlsV1_3) => "CURL_SSLVERSION_TLSv1_3",
-        None => return,
+fn emit_ssl_version(
+    out: &mut String,
+    min: Option<SslVersionPreference>,
+    max: Option<SslVersionMaxPreference>,
+) {
+    let Some(min_expr) = libcurl_min_tls_expr(min, max) else {
+        return;
     };
-    emit_raw_setopt(out, "CURLOPT_SSLVERSION", value);
+    let Some(max_expr) = max.and_then(libcurl_max_tls_expr) else {
+        emit_raw_setopt(out, "CURLOPT_SSLVERSION", min_expr);
+        return;
+    };
+    emit_raw_setopt(
+        out,
+        "CURLOPT_SSLVERSION",
+        &format!("(long)({min_expr} | {max_expr})"),
+    );
+}
+
+fn libcurl_min_tls_expr(
+    min: Option<SslVersionPreference>,
+    max: Option<SslVersionMaxPreference>,
+) -> Option<&'static str> {
+    match min {
+        Some(SslVersionPreference::TlsV1_0) => Some("CURL_SSLVERSION_TLSv1_0"),
+        Some(SslVersionPreference::TlsV1_1) => Some("CURL_SSLVERSION_TLSv1_1"),
+        Some(SslVersionPreference::TlsV1_2) => Some("CURL_SSLVERSION_TLSv1_2"),
+        Some(SslVersionPreference::TlsV1_3) => Some("CURL_SSLVERSION_TLSv1_3"),
+        None => match max {
+            Some(SslVersionMaxPreference::TlsV1_0) => Some("CURL_SSLVERSION_TLSv1_0"),
+            Some(SslVersionMaxPreference::TlsV1_1) => Some("CURL_SSLVERSION_TLSv1_1"),
+            Some(SslVersionMaxPreference::TlsV1_2 | SslVersionMaxPreference::TlsV1_3) => {
+                Some("CURL_SSLVERSION_TLSv1_2")
+            }
+            Some(SslVersionMaxPreference::Default) | None => None,
+        },
+    }
+}
+
+fn libcurl_max_tls_expr(max: SslVersionMaxPreference) -> Option<&'static str> {
+    match max {
+        SslVersionMaxPreference::Default => None,
+        SslVersionMaxPreference::TlsV1_0 => Some("CURL_SSLVERSION_MAX_TLSv1_0"),
+        SslVersionMaxPreference::TlsV1_1 => Some("CURL_SSLVERSION_MAX_TLSv1_1"),
+        SslVersionMaxPreference::TlsV1_2 => Some("CURL_SSLVERSION_MAX_TLSv1_2"),
+        SslVersionMaxPreference::TlsV1_3 => Some("CURL_SSLVERSION_MAX_TLSv1_3"),
+    }
 }
 
 fn emit_ip_version(out: &mut String, version: IpVersionPreference) {
@@ -973,6 +1011,42 @@ mod tests {
         assert!(source.contains("CURLOPT_SSL_VERIFYHOST, 0L"));
         assert!(source.contains("CURLOPT_CONNECTTIMEOUT_MS, 2000L"));
         assert!(source.contains("CURLOPT_TIMEOUT_MS, 3000L"));
+    }
+
+    #[test]
+    fn renders_tls_max_options() {
+        let config = parse_args([
+            "-q",
+            "--libcurl",
+            "client.c",
+            "--tls-max",
+            "1.0",
+            "https://example.com",
+        ])
+        .unwrap();
+
+        let source = render_source(&config).unwrap();
+
+        assert!(source.contains(
+            "CURLOPT_SSLVERSION, (long)(CURL_SSLVERSION_TLSv1_0 | CURL_SSLVERSION_MAX_TLSv1_0)"
+        ));
+
+        let config = parse_args([
+            "-q",
+            "--libcurl",
+            "client.c",
+            "--tls-max",
+            "1.3",
+            "--tlsv1.2",
+            "https://example.com",
+        ])
+        .unwrap();
+
+        let source = render_source(&config).unwrap();
+
+        assert!(source.contains(
+            "CURLOPT_SSLVERSION, (long)(CURL_SSLVERSION_TLSv1_2 | CURL_SSLVERSION_MAX_TLSv1_3)"
+        ));
     }
 
     #[test]

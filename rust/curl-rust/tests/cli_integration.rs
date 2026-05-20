@@ -9509,6 +9509,8 @@ fn libcurl_writes_source_file_for_supported_options() {
         "2M",
         "--http1.1",
         "--tlsv1.2",
+        "--tls-max",
+        "1.3",
         "--ipv4",
         "-e",
         "firstone.html;auto",
@@ -9548,7 +9550,9 @@ fn libcurl_writes_source_file_for_supported_options() {
     assert!(text.contains("CURLOPT_REFERER, \"firstone.html\""));
     assert!(text.contains("CURLOPT_AUTOREFERER, 1"));
     assert!(text.contains("CURLOPT_HTTP_VERSION, CURL_HTTP_VERSION_1_1"));
-    assert!(text.contains("CURLOPT_SSLVERSION, CURL_SSLVERSION_TLSv1_2"));
+    assert!(text.contains(
+        "CURLOPT_SSLVERSION, (long)(CURL_SSLVERSION_TLSv1_2 | CURL_SSLVERSION_MAX_TLSv1_3)"
+    ));
     assert!(text.contains("CURLOPT_IPRESOLVE, CURL_IPRESOLVE_V4"));
     assert!(text.contains(&format!(
         "CURLOPT_COOKIEFILE, \"{}\"",

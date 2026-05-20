@@ -26,7 +26,7 @@ use reqwest::{Client, Method, StatusCode, Url, Version};
 
 use crate::cli::{
     Config, ContinueAt, HttpVersionPreference, IpVersionPreference, OutputTarget,
-    SslVersionPreference, TransferConfig,
+    SslVersionMaxPreference, SslVersionPreference, TransferConfig,
 };
 use crate::cookie::CookieJar;
 use crate::data::{self, PreparedBody};
@@ -348,6 +348,9 @@ fn build_client(transfer: &TransferConfig, cookie_jar: Option<Arc<CookieJar>>) -
     if let Some(version) = transfer.ssl_version {
         builder = builder.min_tls_version(reqwest_tls_version(version));
     }
+    if let Some(version) = transfer.ssl_version_max.and_then(reqwest_tls_max_version) {
+        builder = builder.max_tls_version(version);
+    }
 
     if transfer.ip_version != IpVersionPreference::Any {
         builder = builder.dns_resolver(Arc::new(IpFamilyResolver {
@@ -408,6 +411,16 @@ fn reqwest_tls_version(version: SslVersionPreference) -> reqwest::tls::Version {
         SslVersionPreference::TlsV1_1 => reqwest::tls::Version::TLS_1_1,
         SslVersionPreference::TlsV1_2 => reqwest::tls::Version::TLS_1_2,
         SslVersionPreference::TlsV1_3 => reqwest::tls::Version::TLS_1_3,
+    }
+}
+
+fn reqwest_tls_max_version(version: SslVersionMaxPreference) -> Option<reqwest::tls::Version> {
+    match version {
+        SslVersionMaxPreference::Default => None,
+        SslVersionMaxPreference::TlsV1_0 => Some(reqwest::tls::Version::TLS_1_0),
+        SslVersionMaxPreference::TlsV1_1 => Some(reqwest::tls::Version::TLS_1_1),
+        SslVersionMaxPreference::TlsV1_2 => Some(reqwest::tls::Version::TLS_1_2),
+        SslVersionMaxPreference::TlsV1_3 => Some(reqwest::tls::Version::TLS_1_3),
     }
 }
 

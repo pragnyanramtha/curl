@@ -122,6 +122,7 @@ pub struct TransferConfig {
     pub http09_allowed: bool,
     pub http_version: HttpVersionPreference,
     pub ssl_version: Option<SslVersionPreference>,
+    pub ssl_version_max: Option<SslVersionMaxPreference>,
     pub ip_version: IpVersionPreference,
 }
 
@@ -153,6 +154,38 @@ pub enum SslVersionPreference {
     TlsV1_1,
     TlsV1_2,
     TlsV1_3,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SslVersionMaxPreference {
+    Default,
+    TlsV1_0,
+    TlsV1_1,
+    TlsV1_2,
+    TlsV1_3,
+}
+
+impl SslVersionPreference {
+    fn order(self) -> u8 {
+        match self {
+            Self::TlsV1_0 => 1,
+            Self::TlsV1_1 => 2,
+            Self::TlsV1_2 => 3,
+            Self::TlsV1_3 => 4,
+        }
+    }
+}
+
+impl SslVersionMaxPreference {
+    fn order(self) -> u8 {
+        match self {
+            Self::Default => 0,
+            Self::TlsV1_0 => 1,
+            Self::TlsV1_1 => 2,
+            Self::TlsV1_2 => 3,
+            Self::TlsV1_3 => 4,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -458,6 +491,7 @@ impl Default for TransferConfig {
             http09_allowed: false,
             http_version: HttpVersionPreference::Any,
             ssl_version: None,
+            ssl_version_max: None,
             ip_version: IpVersionPreference::Any,
         }
     }
@@ -926,10 +960,14 @@ impl Parser {
             }
             "ipv4" => self.current().ip_version = IpVersionPreference::Ipv4,
             "ipv6" => self.current().ip_version = IpVersionPreference::Ipv6,
-            "tlsv1" | "tlsv1.0" => self.current().ssl_version = Some(SslVersionPreference::TlsV1_0),
-            "tlsv1.1" => self.current().ssl_version = Some(SslVersionPreference::TlsV1_1),
-            "tlsv1.2" => self.current().ssl_version = Some(SslVersionPreference::TlsV1_2),
-            "tlsv1.3" => self.current().ssl_version = Some(SslVersionPreference::TlsV1_3),
+            "tls-max" => {
+                let value = self.value_for(name, inline_value)?;
+                self.set_ssl_version_max(parse_tls_max(name, &value)?)?;
+            }
+            "tlsv1" | "tlsv1.0" => self.set_ssl_version_min(SslVersionPreference::TlsV1_0)?,
+            "tlsv1.1" => self.set_ssl_version_min(SslVersionPreference::TlsV1_1)?,
+            "tlsv1.2" => self.set_ssl_version_min(SslVersionPreference::TlsV1_2)?,
+            "tlsv1.3" => self.set_ssl_version_min(SslVersionPreference::TlsV1_3)?,
             "proxy-tlsv1" => return Err(CurlError::Unsupported(format!("--{name}"))),
             "sslv2" | "sslv3" => warn_deprecated_ssl_option(name),
             other => return Err(CurlError::Usage(format!("unknown option --{other}"))),
@@ -1162,7 +1200,7 @@ impl Parser {
                 'v' => self.current().verbose = true,
                 'g' => self.current().globoff = true,
                 '0' => self.current().http_version = HttpVersionPreference::Http10,
-                '1' => self.current().ssl_version = Some(SslVersionPreference::TlsV1_0),
+                '1' => self.set_ssl_version_min(SslVersionPreference::TlsV1_0)?,
                 '2' => warn_deprecated_ssl_option("sslv2"),
                 '3' => warn_deprecated_ssl_option("sslv3"),
                 '4' => self.current().ip_version = IpVersionPreference::Ipv4,
@@ -1266,6 +1304,33 @@ impl Parser {
             transfer.auto_referer = false;
             transfer.referer = (!value.is_empty()).then_some(value);
         }
+    }
+
+    fn set_ssl_version_min(&mut self, version: SslVersionPreference) -> Result<()> {
+        let transfer = self.current();
+        if let Some(max) = transfer.ssl_version_max
+            && max != SslVersionMaxPreference::Default
+            && max.order() < version.order()
+        {
+            return Err(CurlError::Usage(
+                "Minimum TLS version set higher than max".to_string(),
+            ));
+        }
+        transfer.ssl_version = Some(version);
+        Ok(())
+    }
+
+    fn set_ssl_version_max(&mut self, version: SslVersionMaxPreference) -> Result<()> {
+        let transfer = self.current();
+        if let Some(min) = transfer.ssl_version
+            && version.order() < min.order()
+        {
+            return Err(CurlError::Usage(
+                "--tls-max set lower than minimum accepted version".to_string(),
+            ));
+        }
+        transfer.ssl_version_max = Some(version);
+        Ok(())
     }
 
     fn set_output_file(&mut self, value: String) {
@@ -1573,6 +1638,7 @@ impl TransferConfig {
             || self.http09_allowed
             || self.http_version != HttpVersionPreference::Any
             || self.ssl_version.is_some()
+            || self.ssl_version_max.is_some()
             || self.ip_version != IpVersionPreference::Any
     }
 }
@@ -1641,6 +1707,7 @@ fn option_takes_value(name: &str) -> bool {
             | "cookie-jar"
             | "trace"
             | "trace-ascii"
+            | "tls-max"
     )
 }
 
@@ -1905,6 +1972,19 @@ fn parse_tftp_blksize(name: &str, value: &str) -> Result<u16> {
         )));
     }
     Ok(value as u16)
+}
+
+fn parse_tls_max(name: &str, value: &str) -> Result<SslVersionMaxPreference> {
+    match value {
+        "default" => Ok(SslVersionMaxPreference::Default),
+        "1.0" => Ok(SslVersionMaxPreference::TlsV1_0),
+        "1.1" => Ok(SslVersionMaxPreference::TlsV1_1),
+        "1.2" => Ok(SslVersionMaxPreference::TlsV1_2),
+        "1.3" => Ok(SslVersionMaxPreference::TlsV1_3),
+        _ => Err(CurlError::Usage(format!(
+            "option --{name}: is badly used here"
+        ))),
+    }
 }
 
 fn parse_nonempty_path(name: &str, value: &str) -> Result<PathBuf> {
@@ -3253,6 +3333,91 @@ mod tests {
         .unwrap();
         assert_eq!(config.transfers[0].http_version, HttpVersionPreference::Any);
         assert_eq!(config.transfers[0].ssl_version, None);
+    }
+
+    #[test]
+    fn parses_tls_max_options() {
+        let config = parse_args(["-q", "--tls-max", "default", "https://example.com"]).unwrap();
+        assert_eq!(
+            config.transfers[0].ssl_version_max,
+            Some(SslVersionMaxPreference::Default)
+        );
+
+        let config = parse_args(["-q", "--tls-max", "1.0", "https://example.com"]).unwrap();
+        assert_eq!(
+            config.transfers[0].ssl_version_max,
+            Some(SslVersionMaxPreference::TlsV1_0)
+        );
+
+        let config = parse_args(["-q", "--tls-max", "1.1", "https://example.com"]).unwrap();
+        assert_eq!(
+            config.transfers[0].ssl_version_max,
+            Some(SslVersionMaxPreference::TlsV1_1)
+        );
+
+        let config = parse_args(["-q", "--tls-max", "1.2", "https://example.com"]).unwrap();
+        assert_eq!(
+            config.transfers[0].ssl_version_max,
+            Some(SslVersionMaxPreference::TlsV1_2)
+        );
+
+        let config = parse_args(["-q", "--tls-max", "1.3", "https://example.com"]).unwrap();
+        assert_eq!(
+            config.transfers[0].ssl_version_max,
+            Some(SslVersionMaxPreference::TlsV1_3)
+        );
+    }
+
+    #[test]
+    fn rejects_bad_tls_max_combinations() {
+        let error = parse_args(["-q", "--tls-max", "1.4", "https://example.com"]).unwrap_err();
+        assert!(error.to_string().contains("option --tls-max"));
+
+        let error = parse_args(["-q", "--tls-max"]).unwrap_err();
+        assert!(error.to_string().contains("requires a value"));
+
+        let error =
+            parse_args(["-q", "--tls-max", "1.1", "--tlsv1.2", "https://example.com"]).unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("Minimum TLS version set higher than max")
+        );
+
+        let error =
+            parse_args(["-q", "--tlsv1.2", "--tls-max", "1.1", "https://example.com"]).unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("--tls-max set lower than minimum accepted version")
+        );
+
+        let error = parse_args([
+            "-q",
+            "--tlsv1.2",
+            "--tls-max",
+            "default",
+            "https://example.com",
+        ])
+        .unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("--tls-max set lower than minimum accepted version")
+        );
+
+        let config = parse_args([
+            "-q",
+            "--tls-max",
+            "default",
+            "--tlsv1.2",
+            "https://example.com",
+        ])
+        .unwrap();
+        assert_eq!(
+            config.transfers[0].ssl_version,
+            Some(SslVersionPreference::TlsV1_2)
+        );
     }
 
     #[test]
