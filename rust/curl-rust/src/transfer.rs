@@ -9102,10 +9102,11 @@ fn raw_http_direct_request(context: &RawHttpDirectContext<'_>) -> Result<Vec<u8>
 
 fn raw_http_proxy_request(context: &RawHttpProxyContext<'_>) -> Result<Vec<u8>> {
     let parsed_headers = parse_raw_headers(&context.transfer.headers)?;
-    let has_header = |name: &str| {
-        parsed_headers
-            .iter()
-            .any(|header| header.name.as_str().eq_ignore_ascii_case(name))
+    let parsed_proxy_headers = parse_raw_headers(&context.transfer.proxy_headers)?;
+    let has_header = |name: &str| raw_headers_contain(&parsed_headers, name);
+    let has_proxy_header = |name: &str| {
+        raw_headers_contain(&parsed_headers, name)
+            || raw_headers_contain(&parsed_proxy_headers, name)
     };
     let body = raw_http_body(context.transfer, context.prepared_body, context.upload_body);
     let target = context
@@ -9123,7 +9124,7 @@ fn raw_http_proxy_request(context: &RawHttpProxyContext<'_>) -> Result<Vec<u8>> 
         context.custom_host_allowed,
     );
     if let Some(authorization) = &context.proxy.authorization
-        && !has_header("proxy-authorization")
+        && !has_proxy_header("proxy-authorization")
     {
         request.extend_from_slice(format!("Proxy-Authorization: {authorization}\r\n").as_bytes());
     }
@@ -9201,8 +9202,16 @@ fn raw_http_proxy_request(context: &RawHttpProxyContext<'_>) -> Result<Vec<u8>> 
     {
         request.extend_from_slice(format!("Content-Length: {}\r\n", body.len()).as_bytes());
     }
-    if !has_header("proxy-connection") {
+    if !has_proxy_header("proxy-connection") {
         request.extend_from_slice(b"Proxy-Connection: Keep-Alive\r\n");
+    }
+    for RawHeader {
+        wire_name, value, ..
+    } in parsed_proxy_headers
+    {
+        if let Some(value) = value {
+            append_raw_header(&mut request, &wire_name, &value);
+        }
     }
     for RawHeader {
         name,
@@ -10267,6 +10276,12 @@ struct RawHeader {
     name: HeaderName,
     wire_name: String,
     value: Option<HeaderValue>,
+}
+
+fn raw_headers_contain(headers: &[RawHeader], name: &str) -> bool {
+    headers
+        .iter()
+        .any(|header| header.name.as_str().eq_ignore_ascii_case(name))
 }
 
 fn parse_raw_headers(headers: &[String]) -> Result<Vec<RawHeader>> {

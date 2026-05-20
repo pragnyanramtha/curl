@@ -63,6 +63,8 @@ struct RenderTransfer<'a> {
     body: Option<PreparedBody>,
     headers: Vec<String>,
     slist: Option<String>,
+    proxy_headers: Vec<String>,
+    proxy_slist: Option<String>,
     resolve_slist: Option<String>,
     connect_to_slist: Option<String>,
     mail_rcpt_slist: Option<String>,
@@ -81,6 +83,14 @@ fn prepare_transfers(config: &Config) -> Result<Vec<RenderTransfer<'_>>> {
         let urls = effective_urls(transfer, query.as_ref(), body.as_ref())?;
         let headers = effective_headers(transfer, body.as_ref())?;
         let slist = if headers.is_empty() {
+            None
+        } else {
+            let name = format!("slist{slist_index}");
+            slist_index += 1;
+            Some(name)
+        };
+        let proxy_headers = transfer.proxy_headers.clone();
+        let proxy_slist = if proxy_headers.is_empty() {
             None
         } else {
             let name = format!("slist{slist_index}");
@@ -136,6 +146,8 @@ fn prepare_transfers(config: &Config) -> Result<Vec<RenderTransfer<'_>>> {
             body,
             headers,
             slist,
+            proxy_headers,
+            proxy_slist,
             resolve_slist,
             connect_to_slist,
             mail_rcpt_slist,
@@ -167,6 +179,9 @@ fn write_declarations(out: &mut String, transfers: &[RenderTransfer<'_>]) {
         if let Some(slist) = &transfer.slist {
             writeln!(out, "  struct curl_slist *{slist};").unwrap();
         }
+        if let Some(slist) = &transfer.proxy_slist {
+            writeln!(out, "  struct curl_slist *{slist};").unwrap();
+        }
         if let Some(slist) = &transfer.resolve_slist {
             writeln!(out, "  struct curl_slist *{slist};").unwrap();
         }
@@ -192,6 +207,11 @@ fn write_declarations(out: &mut String, transfers: &[RenderTransfer<'_>]) {
 fn write_slist_initializers(out: &mut String, transfers: &[RenderTransfer<'_>]) {
     for transfer in transfers {
         write_slist_initializer(out, transfer.slist.as_deref(), &transfer.headers);
+        write_slist_initializer(
+            out,
+            transfer.proxy_slist.as_deref(),
+            &transfer.proxy_headers,
+        );
         write_slist_initializer(
             out,
             transfer.resolve_slist.as_deref(),
@@ -287,6 +307,9 @@ fn write_request(out: &mut String, render: &RenderTransfer<'_>, url: &str) -> Re
     }
     if let Some(slist) = &render.slist {
         emit_raw_setopt(out, "CURLOPT_HTTPHEADER", slist);
+    }
+    if let Some(slist) = &render.proxy_slist {
+        emit_raw_setopt(out, "CURLOPT_PROXYHEADER", slist);
     }
     if let Some(mail_from) = &transfer.mail_from {
         emit_string_setopt(out, "CURLOPT_MAIL_FROM", mail_from);
@@ -533,6 +556,10 @@ fn write_unrepresentable_comment(out: &mut String) {
 fn write_cleanup(out: &mut String, transfers: &[RenderTransfer<'_>]) {
     for transfer in transfers {
         if let Some(slist) = &transfer.slist {
+            writeln!(out, "  curl_slist_free_all({slist});").unwrap();
+            writeln!(out, "  {slist} = NULL;").unwrap();
+        }
+        if let Some(slist) = &transfer.proxy_slist {
             writeln!(out, "  curl_slist_free_all({slist});").unwrap();
             writeln!(out, "  {slist} = NULL;").unwrap();
         }
@@ -837,6 +864,8 @@ mod tests {
             "alice:secret",
             "-x",
             "http://proxy.example:8080",
+            "--proxy-header",
+            "Proxy-Connection: close",
             "--noproxy",
             "localhost",
             "-A",
@@ -848,8 +877,11 @@ mod tests {
         let source = render_source(&config).unwrap();
 
         assert!(source.contains("struct curl_slist *slist1;"));
+        assert!(source.contains("struct curl_slist *slist2;"));
         assert!(source.contains("curl_slist_append(slist1, \"X-Test: yes\");"));
+        assert!(source.contains("curl_slist_append(slist2, \"Proxy-Connection: close\");"));
         assert!(source.contains("CURLOPT_HTTPHEADER, slist1"));
+        assert!(source.contains("CURLOPT_PROXYHEADER, slist2"));
         assert!(source.contains("CURLOPT_POSTFIELDS, \"a=b\""));
         assert!(source.contains("CURLOPT_POSTFIELDSIZE_LARGE, (curl_off_t)3"));
         assert!(source.contains("CURLOPT_USERPWD, \"alice:secret\""));

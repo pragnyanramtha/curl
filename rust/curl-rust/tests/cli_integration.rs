@@ -9781,6 +9781,37 @@ fn raw_proxy_empty_custom_headers_suppress_defaults_and_semicolon_sends_blank() 
 }
 
 #[test]
+fn raw_proxy_sends_proxy_headers_and_suppresses_proxy_connection_default() {
+    let (proxy_url, rx) = spawn_server(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok");
+
+    let mut command = Command::cargo_bin("curl").unwrap();
+    command.args([
+        "-q",
+        "-sS",
+        "-x",
+        &proxy_url,
+        "--proxy-header",
+        "Proxy-Connection: close",
+        "--proxy-header",
+        "X-Proxy-Only: yes",
+        "http://example.test/resource",
+    ]);
+    command.assert().success().stdout("ok");
+
+    let request = rx.recv().unwrap();
+    assert!(
+        request
+            .start_line
+            .starts_with("GET http://example.test/resource HTTP/1.1")
+    );
+    assert_eq!(header(&request, "proxy-connection"), Some("close"));
+    assert_eq!(header_count(&request, "proxy-connection"), 1);
+    assert_eq!(header(&request, "x-proxy-only"), Some("yes"));
+    assert!(header(&request, "user-agent").unwrap().starts_with("curl/"));
+    assert_eq!(header(&request, "accept"), Some("*/*"));
+}
+
+#[test]
 fn noproxy_bypasses_configured_proxy() {
     let (target_url, target_rx) =
         spawn_server(b"HTTP/1.1 200 OK\r\nContent-Length: 6\r\n\r\ntarget");

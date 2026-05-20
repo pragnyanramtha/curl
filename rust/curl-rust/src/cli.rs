@@ -47,6 +47,7 @@ pub struct TransferConfig {
     pub ftp_postquote: Vec<String>,
     pub include_headers: bool,
     pub headers: Vec<String>,
+    pub proxy_headers: Vec<String>,
     pub data: Vec<DataSpec>,
     pub url_query: Vec<DataSpec>,
     pub forms: Vec<FormSpec>,
@@ -432,6 +433,7 @@ impl Default for TransferConfig {
             ftp_postquote: Vec::new(),
             include_headers: false,
             headers: Vec::new(),
+            proxy_headers: Vec::new(),
             data: Vec::new(),
             url_query: Vec::new(),
             forms: Vec::new(),
@@ -910,6 +912,10 @@ impl Parser {
             "proxy" => {
                 let value = self.value_for(name, inline_value)?;
                 self.current().proxy = Some(value);
+            }
+            "proxy-header" => {
+                let value = self.value_for(name, inline_value)?;
+                self.append_proxy_header_value(value)?;
             }
             "proxy-user" => {
                 let value = self.value_for(name, inline_value)?;
@@ -1436,12 +1442,11 @@ impl Parser {
     }
 
     fn append_header_value(&mut self, value: String) -> Result<()> {
-        if let Some(lines) = read_at_lines_argument(&value)? {
-            self.current().headers.extend(lines);
-        } else {
-            self.current().headers.push(value);
-        }
-        Ok(())
+        append_header_values(&mut self.current().headers, value)
+    }
+
+    fn append_proxy_header_value(&mut self, value: String) -> Result<()> {
+        append_header_values(&mut self.current().proxy_headers, value)
     }
 
     fn read_write_out_value(&mut self, value: &str) -> Result<String> {
@@ -1626,6 +1631,7 @@ impl TransferConfig {
             || !self.ftp_postquote.is_empty()
             || self.include_headers
             || !self.headers.is_empty()
+            || !self.proxy_headers.is_empty()
             || !self.data.is_empty()
             || !self.url_query.is_empty()
             || !self.forms.is_empty()
@@ -1709,6 +1715,15 @@ impl TransferConfig {
     }
 }
 
+fn append_header_values(headers: &mut Vec<String>, value: String) -> Result<()> {
+    if let Some(lines) = read_at_lines_argument(&value)? {
+        headers.extend(lines);
+    } else {
+        headers.push(value);
+    }
+    Ok(())
+}
+
 fn option_takes_value(name: &str) -> bool {
     matches!(
         name,
@@ -1722,6 +1737,7 @@ fn option_takes_value(name: &str) -> bool {
             | "request-target"
             | "quote"
             | "header"
+            | "proxy-header"
             | "referer"
             | "range"
             | "continue-at"
@@ -2385,6 +2401,7 @@ fn print_common_help() {
            -j, --junk-session-cookies  Ignore session cookies from file\n\
                --oauth2-bearer <token> OAuth 2 Bearer token\n\
            -U, --proxy-user <user:pass> Proxy user and password\n\
+               --proxy-header <header> Pass custom proxy header\n\
                --proxy-basic           Use Basic proxy authentication\n\
                --proxy-digest          Use Digest proxy authentication\n\
                --proxy-negotiate       Use Negotiate proxy authentication\n\
@@ -3944,6 +3961,33 @@ mod tests {
         ])
         .unwrap();
         assert!(!config.transfers[0].disallow_username_in_url);
+    }
+
+    #[test]
+    fn parses_proxy_headers_from_args_and_files() {
+        let temp = tempdir().unwrap();
+        let headers = temp.path().join("proxy-headers.txt");
+        std::fs::write(
+            &headers,
+            "# comment\nProxy-Connection: close\n\nX-Proxy-Blank;\n",
+        )
+        .unwrap();
+        let header_file = format!("@{}", headers.display());
+
+        let config = parse_args([
+            "-q",
+            "--proxy-header",
+            "X-One: 1",
+            "--proxy-header",
+            &header_file,
+            "https://example.com",
+        ])
+        .unwrap();
+
+        assert_eq!(
+            config.transfers[0].proxy_headers,
+            ["X-One: 1", "Proxy-Connection: close", "X-Proxy-Blank;"]
+        );
     }
 
     #[test]
