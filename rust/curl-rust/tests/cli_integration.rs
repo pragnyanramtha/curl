@@ -10809,6 +10809,20 @@ fn dump_header_dash_writes_headers_to_stdout() {
 }
 
 #[test]
+fn dump_header_percent_writes_headers_to_stderr() {
+    let (url, rx) = spawn_server(b"HTTP/1.1 200 OK\r\nX-Test: yes\r\nContent-Length: 2\r\n\r\nok");
+
+    let mut command = Command::cargo_bin("curl").unwrap();
+    command.args(["-q", "-sS", "-D", "%", &url]);
+    command
+        .assert()
+        .success()
+        .stdout("ok")
+        .stderr("HTTP/1.1 200 OK\r\nx-test: yes\r\ncontent-length: 2\r\n\r\n");
+    rx.recv().unwrap();
+}
+
+#[test]
 fn dump_header_records_manual_redirect_history() {
     let (url, rx) = spawn_sequence_server(vec![
         b"HTTP/1.1 301 Moved Permanently\r\nLocation: /next\r\nX-Hop: one\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",

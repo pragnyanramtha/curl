@@ -117,6 +117,10 @@ pub fn dump_headers(path: &Path, bytes: &[u8], create_dirs: bool) -> Result<()> 
         io::stdout().write_all(bytes)?;
         return Ok(());
     }
+    if path == Path::new("%") {
+        io::stderr().write_all(bytes)?;
+        return Ok(());
+    }
 
     if create_dirs
         && let Some(parent) = path
@@ -132,6 +136,10 @@ pub fn dump_headers(path: &Path, bytes: &[u8], create_dirs: bool) -> Result<()> 
 pub fn append_dump_headers(path: &Path, bytes: &[u8], create_dirs: bool) -> Result<()> {
     if path == Path::new("-") {
         io::stdout().write_all(bytes)?;
+        return Ok(());
+    }
+    if path == Path::new("%") {
+        io::stderr().write_all(bytes)?;
         return Ok(());
     }
 
@@ -152,6 +160,9 @@ pub fn append_dump_headers(path: &Path, bytes: &[u8], create_dirs: bool) -> Resu
 
 pub fn prepare_dump_header_target(path: &Path, create_dirs: bool) -> Result<()> {
     if path == Path::new("-") {
+        return Ok(());
+    }
+    if path == Path::new("%") {
         return Ok(());
     }
 
