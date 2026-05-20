@@ -274,8 +274,15 @@ fn write_request(out: &mut String, render: &RenderTransfer<'_>, url: &str) -> Re
     if let Some(slist) = &render.prequote_slist {
         emit_raw_setopt(out, "CURLOPT_PREQUOTE", slist);
     }
-    if transfer.fail {
+    if transfer.fail && !transfer.fail_with_body {
         emit_long_setopt(out, "CURLOPT_FAILONERROR", 1);
+    }
+    if transfer.fail_with_body {
+        writeln!(
+            out,
+            "  /* --fail-with-body: inspect the HTTP response code after curl_easy_perform(). */"
+        )
+        .unwrap();
     }
     if let Some(slist) = &render.slist {
         emit_raw_setopt(out, "CURLOPT_HTTPHEADER", slist);
@@ -802,6 +809,39 @@ mod tests {
 
         assert!(source.contains("CURLOPT_FOLLOWLOCATION, 1L"));
         assert!(source.contains("CURLOPT_UNRESTRICTED_AUTH, 1L"));
+    }
+
+    #[test]
+    fn renders_fail_without_body_as_failonerror() {
+        let config = parse_args([
+            "-q",
+            "--libcurl",
+            "client.c",
+            "--fail",
+            "https://example.com",
+        ])
+        .unwrap();
+
+        let source = render_source(&config).unwrap();
+
+        assert!(source.contains("CURLOPT_FAILONERROR, 1L"));
+    }
+
+    #[test]
+    fn does_not_render_failonerror_for_fail_with_body() {
+        let config = parse_args([
+            "-q",
+            "--libcurl",
+            "client.c",
+            "--fail-with-body",
+            "https://example.com",
+        ])
+        .unwrap();
+
+        let source = render_source(&config).unwrap();
+
+        assert!(!source.contains("CURLOPT_FAILONERROR"));
+        assert!(source.contains("--fail-with-body: inspect the HTTP response code"));
     }
 
     #[test]
