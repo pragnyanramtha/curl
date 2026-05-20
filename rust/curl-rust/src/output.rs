@@ -1,5 +1,5 @@
 use std::fs::OpenOptions;
-use std::io::{self, ErrorKind, Write};
+use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 
 use reqwest::header::{
@@ -233,16 +233,15 @@ fn apply_output_dir(transfer: &TransferConfig, path: PathBuf) -> PathBuf {
 }
 
 fn remote_url_filename(url: &Url) -> Result<String> {
-    let Some(filename) = url
+    let filename = url
         .path_segments()
-        .and_then(|mut segments| segments.next_back())
-        .filter(|segment| !segment.is_empty())
-        .map(ToString::to_string)
-    else {
-        return Err(
-            io::Error::new(ErrorKind::InvalidInput, "remote filename has no length").into(),
-        );
-    };
+        .and_then(|segments| {
+            segments
+                .rev()
+                .find(|segment| !segment.is_empty())
+                .map(ToString::to_string)
+        })
+        .unwrap_or_else(|| "curl_response".to_string());
     Ok(filename)
 }
 
@@ -309,14 +308,21 @@ mod tests {
     }
 
     #[test]
-    fn rejects_empty_remote_filename_for_remote_name() {
+    fn root_remote_filename_uses_curl_response() {
         let transfer = TransferConfig {
             remote_name: true,
             ..TransferConfig::default()
         };
         let url = Url::parse("http://example.com/").unwrap();
 
-        let error = validate_output_target(&transfer, &url).unwrap_err();
-        assert!(error.to_string().contains("remote filename has no length"));
+        validate_output_target(&transfer, &url).unwrap();
+        assert_eq!(remote_url_filename(&url).unwrap(), "curl_response");
+    }
+
+    #[test]
+    fn trailing_slash_remote_filename_uses_previous_segment() {
+        let url = Url::parse("http://example.com/path/to/here/").unwrap();
+
+        assert_eq!(remote_url_filename(&url).unwrap(), "here");
     }
 }

@@ -12343,6 +12343,83 @@ fn dump_header_missing_parent_exits_write_error() {
 }
 
 #[test]
+fn remote_name_root_path_uses_curl_response_filename() {
+    let temp = tempdir().unwrap();
+    let (url, rx) = spawn_server(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok");
+    let target = format!("{}/", gateway_origin(&url));
+
+    let mut command = Command::cargo_bin("curl").unwrap();
+    command.args([
+        "-q",
+        "-sS",
+        "-i",
+        "-O",
+        "--output-dir",
+        temp.path().to_str().unwrap(),
+        &target,
+    ]);
+    command.assert().success().stdout("");
+
+    let request = rx.recv().unwrap();
+    assert_eq!(request.start_line, "GET / HTTP/1.1");
+    assert_eq!(
+        std::fs::read_to_string(temp.path().join("curl_response")).unwrap(),
+        "HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok"
+    );
+}
+
+#[test]
+fn remote_name_trailing_slash_uses_previous_path_segment() {
+    let temp = tempdir().unwrap();
+    let (url, rx) = spawn_server(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok");
+    let target = format!("{}/path/to/here/", gateway_origin(&url));
+
+    let mut command = Command::cargo_bin("curl").unwrap();
+    command.args([
+        "-q",
+        "-sS",
+        "-O",
+        "--output-dir",
+        temp.path().to_str().unwrap(),
+        &target,
+    ]);
+    command.assert().success().stdout("");
+
+    let request = rx.recv().unwrap();
+    assert_eq!(request.start_line, "GET /path/to/here/ HTTP/1.1");
+    assert_eq!(
+        std::fs::read_to_string(temp.path().join("here")).unwrap(),
+        "ok"
+    );
+}
+
+#[test]
+fn remote_header_name_without_header_uses_curl_response_filename() {
+    let temp = tempdir().unwrap();
+    let (url, rx) = spawn_server(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok");
+    let target = format!("{}/", gateway_origin(&url));
+
+    let mut command = Command::cargo_bin("curl").unwrap();
+    command.args([
+        "-q",
+        "-sS",
+        "-J",
+        "-O",
+        "--output-dir",
+        temp.path().to_str().unwrap(),
+        &target,
+    ]);
+    command.assert().success().stdout("");
+
+    let request = rx.recv().unwrap();
+    assert_eq!(request.start_line, "GET / HTTP/1.1");
+    assert_eq!(
+        std::fs::read_to_string(temp.path().join("curl_response")).unwrap(),
+        "ok"
+    );
+}
+
+#[test]
 fn remote_header_name_requires_remote_name() {
     let (url, rx) = spawn_server(
         b"HTTP/1.1 200 OK\r\nContent-Disposition: attachment; filename=\"server.bin\"\r\nContent-Length: 2\r\n\r\nok",
