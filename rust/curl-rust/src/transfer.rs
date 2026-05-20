@@ -8218,6 +8218,7 @@ async fn run_http_transfer(
 
                 if next_url.scheme() != "http" {
                     if next_url.scheme() == "https"
+                        && !transfer.raw
                         && transfer.request_target.is_none()
                         && initial_connect_to.is_none()
                     {
@@ -8525,6 +8526,12 @@ async fn run_http_transfer(
     if transfer.request_target.is_some() {
         return Err(CurlError::Unsupported(
             "--request-target is only implemented for plain HTTP raw requests in the Rust sidecar"
+                .to_string(),
+        ));
+    }
+    if transfer.raw {
+        return Err(CurlError::Unsupported(
+            "--raw is only implemented for plain HTTP requests that can use the Rust sidecar raw reader"
                 .to_string(),
         ));
     }
