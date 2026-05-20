@@ -98,6 +98,8 @@ struct RawHttpProxyContext<'a> {
     resume_from: u64,
     referer: Option<&'a str>,
     proxy: &'a ExplicitHttpProxy,
+    sensitive_headers_allowed: bool,
+    custom_host_allowed: bool,
 }
 
 struct RawHttpDirectContext<'a> {
@@ -7944,6 +7946,122 @@ async fn run_http_transfer(
     }
 
     if let Some(proxy) = explicit_proxy.as_ref()
+        && transfer.follow_location
+        && raw_http_proxy_redirect_supported(transfer, &url, has_multipart)
+        && transfer.request_target.is_some()
+    {
+        let custom_method = transfer.method.is_some();
+        let post_redirect_body =
+            !transfer.get && (!transfer.data.is_empty() || !transfer.forms.is_empty());
+        let mut current_method = method.clone();
+        let mut send_request_body = true;
+
+        loop {
+            metrics.method = current_method.as_str().to_string();
+            let request_body = send_request_body
+                .then_some(prepared_body.as_ref())
+                .flatten();
+            let upload = if send_request_body {
+                upload_body.as_deref()
+            } else {
+                None
+            };
+            let sensitive_headers_allowed =
+                transfer.location_trusted || same_redirect_origin(&initial_url, &url);
+            let custom_host_allowed = same_redirect_origin(&initial_url, &url);
+            let attempt = run_raw_http_proxy_transfer(RawHttpProxyContext {
+                transfer,
+                url: &url,
+                method: &current_method,
+                prepared_body: request_body,
+                upload_body: upload,
+                resume_from,
+                referer: custom_referer.as_deref().or(current_referer.as_deref()),
+                proxy,
+                sensitive_headers_allowed,
+                custom_host_allowed,
+            })
+            .await?;
+
+            if attempt.status.is_some_and(is_followed_redirect)
+                && let Some(next_url) = redirect_location(&attempt.final_url, &attempt.headers)?
+            {
+                let status = attempt.status.expect("checked redirect status");
+                if let Some(path) = &transfer.dump_header {
+                    let header_bytes =
+                        output::render_headers(attempt.version, status, &attempt.headers);
+                    output::append_dump_headers(path, &header_bytes, transfer.create_dirs)?;
+                }
+
+                if redirects >= transfer.max_redirs {
+                    metrics.url_effective = attempt.final_url.to_string();
+                    metrics.response_code = Some(status.as_u16());
+                    metrics.referer = custom_referer.clone().or_else(|| current_referer.clone());
+                    metrics.redirect_url = Some(next_url.to_string());
+                    metrics.headers = attempt.headers;
+                    return Err(CurlError::TooManyRedirects {
+                        max: transfer.max_redirs,
+                    });
+                }
+
+                if next_url.scheme() != "http" {
+                    metrics.url_effective = attempt.final_url.to_string();
+                    metrics.response_code = Some(status.as_u16());
+                    metrics.referer = custom_referer.clone().or_else(|| current_referer.clone());
+                    metrics.redirect_url = Some(next_url.to_string());
+                    metrics.headers = attempt.headers;
+                    return Err(CurlError::Unsupported(
+                        "raw HTTP proxy redirects outside plain http:// are not implemented in the Rust sidecar"
+                            .to_string(),
+                    ));
+                }
+
+                if transfer.auto_referer && custom_referer.is_none() {
+                    current_referer = Some(auto_referer_value(&attempt.final_url));
+                }
+                let followup = redirect_followup(
+                    transfer,
+                    status,
+                    &current_method,
+                    custom_method,
+                    post_redirect_body,
+                );
+                if let Some(next_method) = followup.method {
+                    current_method = next_method;
+                }
+                if followup.drop_body {
+                    send_request_body = false;
+                }
+                url = next_url;
+                redirects += 1;
+                continue;
+            }
+
+            metrics.url_effective = attempt.final_url.to_string();
+            metrics.response_code = attempt.status.map(|status| status.as_u16());
+            metrics.referer = custom_referer.clone().or_else(|| current_referer.clone());
+            metrics.content_type = attempt
+                .headers
+                .get(CONTENT_TYPE)
+                .and_then(|value| value.to_str().ok())
+                .map(ToString::to_string);
+            metrics.redirect_url = attempt
+                .headers
+                .get(LOCATION)
+                .and_then(|value| value.to_str().ok())
+                .map(ToString::to_string);
+            metrics.headers = attempt.headers.clone();
+            check_http_content_length_max_filesize(
+                transfer,
+                &attempt.headers,
+                current_method == Method::HEAD,
+            )?;
+            metrics.size_download = attempt.body.len() as u64;
+            return Ok(attempt);
+        }
+    }
+
+    if let Some(proxy) = explicit_proxy.as_ref()
         && raw_http_proxy_supported(transfer, &url, has_multipart)
     {
         let attempt = run_raw_http_proxy_transfer(RawHttpProxyContext {
@@ -7955,6 +8073,8 @@ async fn run_http_transfer(
             resume_from,
             referer: custom_referer.as_deref().or(current_referer.as_deref()),
             proxy,
+            sensitive_headers_allowed: true,
+            custom_host_allowed: true,
         })
         .await?;
         metrics.url_effective = attempt.final_url.to_string();
@@ -8229,6 +8349,14 @@ fn raw_http_direct_redirect_supported(
         )
 }
 
+fn raw_http_proxy_redirect_supported(
+    transfer: &TransferConfig,
+    url: &Url,
+    has_multipart: bool,
+) -> bool {
+    raw_http_direct_redirect_supported(transfer, url, has_multipart)
+}
+
 fn needs_raw_custom_header_wire_semantics(transfer: &TransferConfig) -> Result<bool> {
     Ok(parse_headers(&transfer.headers)?.iter().any(|(_, value)| {
         value
@@ -8442,7 +8570,7 @@ fn raw_http_proxy_request(context: &RawHttpProxyContext<'_>) -> Result<Vec<u8>> 
     let mut request = Vec::new();
     request
         .extend_from_slice(format!("{} {target} HTTP/1.1\r\n", context.method.as_str()).as_bytes());
-    if !has_header("host") {
+    if !context.custom_host_allowed || !has_header("host") {
         request
             .extend_from_slice(format!("Host: {}\r\n", http_host_header(context.url)).as_bytes());
     }
@@ -8466,16 +8594,19 @@ fn raw_http_proxy_request(context: &RawHttpProxyContext<'_>) -> Result<Vec<u8>> 
     if context.transfer.compressed && !has_header("accept-encoding") {
         request.extend_from_slice(b"Accept-Encoding: deflate, gzip, br\r\n");
     }
-    if let Some(cookie) = &context.transfer.cookie
+    if context.sensitive_headers_allowed
+        && let Some(cookie) = &context.transfer.cookie
         && !has_header("cookie")
     {
         request.extend_from_slice(format!("Cookie: {cookie}\r\n").as_bytes());
     }
-    if let Some(token) = &context.transfer.oauth2_bearer
+    if context.sensitive_headers_allowed
+        && let Some(token) = &context.transfer.oauth2_bearer
         && !has_header("authorization")
     {
         request.extend_from_slice(format!("Authorization: Bearer {token}\r\n").as_bytes());
-    } else if let Some(user) = &context.transfer.user
+    } else if context.sensitive_headers_allowed
+        && let Some(user) = &context.transfer.user
         && context.transfer.oauth2_bearer.is_none()
         && !has_header("authorization")
     {
@@ -8526,6 +8657,12 @@ fn raw_http_proxy_request(context: &RawHttpProxyContext<'_>) -> Result<Vec<u8>> 
         request.extend_from_slice(b"Proxy-Connection: Keep-Alive\r\n");
     }
     for (name, value) in parsed_headers {
+        if !context.custom_host_allowed && name.as_str().eq_ignore_ascii_case("host") {
+            continue;
+        }
+        if !context.sensitive_headers_allowed && is_redirect_sensitive_header(name.as_str()) {
+            continue;
+        }
         if let Some(value) = value {
             append_raw_header(&mut request, &name, &value);
         }

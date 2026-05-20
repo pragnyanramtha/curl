@@ -2761,6 +2761,138 @@ fn request_target_location_respects_max_redirs() {
 }
 
 #[test]
+fn request_target_proxy_location_follows_redirect_with_same_target() {
+    let (proxy_url, rx) = spawn_sequence_server(vec![
+        b"HTTP/1.1 302 Found\r\nLocation: http://second.example/next\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+        b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok",
+    ]);
+
+    let mut command = Command::cargo_bin("curl").unwrap();
+    command.args([
+        "-q",
+        "-sS",
+        "-L",
+        "--request-target",
+        "/raw",
+        "-x",
+        &proxy_url,
+        "http://first.example/path",
+    ]);
+    command.assert().success().stdout("ok");
+
+    let first = rx.recv().unwrap();
+    let second = rx.recv().unwrap();
+    assert_eq!(first.start_line, "GET /raw HTTP/1.1");
+    assert_eq!(second.start_line, "GET /raw HTTP/1.1");
+    assert_eq!(header(&first, "host"), Some("first.example"));
+    assert_eq!(header(&second, "host"), Some("second.example"));
+    assert_eq!(header(&second, "proxy-connection"), Some("Keep-Alive"));
+}
+
+#[test]
+fn request_target_proxy_location_strips_cross_origin_target_headers() {
+    let (proxy_url, rx) = spawn_sequence_server(vec![
+        b"HTTP/1.1 302 Found\r\nLocation: http://second.example/next\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+        b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok",
+    ]);
+
+    let mut command = Command::cargo_bin("curl").unwrap();
+    command.args([
+        "-q",
+        "-sS",
+        "-L",
+        "--request-target",
+        "/raw",
+        "-x",
+        &proxy_url,
+        "-H",
+        "Host: first.example",
+        "-H",
+        "Authorization: Bearer secret",
+        "-H",
+        "Cookie: a=b",
+        "-U",
+        "proxy:secret",
+        "http://first.example/path",
+    ]);
+    command.assert().success().stdout("ok");
+
+    let first = rx.recv().unwrap();
+    let second = rx.recv().unwrap();
+    assert_eq!(header(&first, "host"), Some("first.example"));
+    assert_eq!(header(&second, "host"), Some("second.example"));
+    assert_eq!(header(&first, "authorization"), Some("Bearer secret"));
+    assert_eq!(header(&second, "authorization"), None);
+    assert_eq!(header(&first, "cookie"), Some("a=b"));
+    assert_eq!(header(&second, "cookie"), None);
+    assert_eq!(
+        header(&second, "proxy-authorization"),
+        Some("Basic cHJveHk6c2VjcmV0")
+    );
+}
+
+#[test]
+fn request_target_proxy_location_trusted_keeps_target_headers() {
+    let (proxy_url, rx) = spawn_sequence_server(vec![
+        b"HTTP/1.1 302 Found\r\nLocation: http://second.example/next\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+        b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok",
+    ]);
+
+    let mut command = Command::cargo_bin("curl").unwrap();
+    command.args([
+        "-q",
+        "-sS",
+        "--location-trusted",
+        "--request-target",
+        "/raw",
+        "-x",
+        &proxy_url,
+        "-H",
+        "Host: first.example",
+        "-H",
+        "Authorization: Bearer secret",
+        "-H",
+        "Cookie: a=b",
+        "http://first.example/path",
+    ]);
+    command.assert().success().stdout("ok");
+
+    let first = rx.recv().unwrap();
+    let second = rx.recv().unwrap();
+    assert_eq!(header(&first, "host"), Some("first.example"));
+    assert_eq!(header(&second, "host"), Some("second.example"));
+    assert_eq!(header(&second, "authorization"), Some("Bearer secret"));
+    assert_eq!(header(&second, "cookie"), Some("a=b"));
+}
+
+#[test]
+fn request_target_proxy_location_respects_max_redirs() {
+    let (proxy_url, rx) = spawn_sequence_server(vec![
+        b"HTTP/1.1 302 Found\r\nLocation: http://second.example/next\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+    ]);
+
+    let mut command = Command::cargo_bin("curl").unwrap();
+    command.args([
+        "-q",
+        "-sS",
+        "-L",
+        "--max-redirs",
+        "0",
+        "--request-target",
+        "/raw",
+        "-x",
+        &proxy_url,
+        "http://first.example/path",
+    ]);
+    command.assert().failure().code(47).stdout("");
+
+    let first = rx.recv().unwrap();
+    assert_eq!(first.start_line, "GET /raw HTTP/1.1");
+    assert_eq!(header(&first, "host"), Some("first.example"));
+    assert!(rx.try_recv().is_err());
+}
+
+#[test]
 fn http09_allows_headerless_response() {
     let (url, rx) = spawn_server(b"hello http09");
 
