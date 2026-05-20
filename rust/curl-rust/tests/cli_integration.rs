@@ -2809,6 +2809,38 @@ fn clobber_overwrites_existing_output() {
 }
 
 #[test]
+fn retry_all_errors_retries_remote_header_output_dir_write_error() {
+    let temp = tempdir().unwrap();
+    let output_dir_file = temp.path().join("present");
+    std::fs::write(&output_dir_file, "present").unwrap();
+    let response = b"HTTP/1.1 200 OK\r\nContent-Length: 6\r\nConnection: close\r\nContent-Disposition: inline; filename=\"MMM3036MMM\"\r\nContent-Type: text/html\r\n\r\n-foo-";
+    let (url, rx) = spawn_sequence_server(vec![response, response]);
+
+    let mut command = Command::cargo_bin("curl").unwrap();
+    command.args([
+        "-q",
+        "-sS",
+        &url,
+        "--no-clobber",
+        "--output-dir",
+        output_dir_file.to_str().unwrap(),
+        "-O",
+        "-J",
+        "--retry",
+        "1",
+        "--retry-all-errors",
+        "--retry-delay",
+        "0.001",
+    ]);
+    command.assert().failure().code(23).stdout("");
+
+    assert_eq!(rx.recv().unwrap().start_line, "GET /resource HTTP/1.1");
+    assert_eq!(rx.recv().unwrap().start_line, "GET /resource HTTP/1.1");
+    assert!(rx.recv_timeout(Duration::from_millis(100)).is_err());
+    assert_eq!(std::fs::read_to_string(output_dir_file).unwrap(), "present");
+}
+
+#[test]
 fn remove_on_error_removes_partial_output() {
     let temp = tempdir().unwrap();
     let output = temp.path().join("save");

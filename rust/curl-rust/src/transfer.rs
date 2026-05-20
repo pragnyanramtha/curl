@@ -10351,7 +10351,15 @@ async fn run_http_with_retries(
                     schedule_retry(transfer, metrics, retry_started, attempt.retry_after).await;
                     continue;
                 }
-                return finish_http_transfer(transfer, expanded, metrics, attempt);
+                if let Err(error) = finish_http_transfer(transfer, expanded, metrics, attempt) {
+                    if should_retry_transfer_error(transfer, &error)
+                        && schedule_retry(transfer, metrics, retry_started, None).await
+                    {
+                        continue;
+                    }
+                    return Err(error);
+                }
+                return Ok(());
             }
             Err(error) => {
                 if should_retry_transfer_error(transfer, &error)
@@ -10520,13 +10528,13 @@ fn should_retry_http_attempt(transfer: &TransferConfig, attempt: &HttpAttempt) -
 }
 
 fn should_retry_transfer_error(transfer: &TransferConfig, error: &CurlError) -> bool {
-    let CurlError::Transfer(message) = error else {
-        return false;
-    };
-
     if transfer.retry_all_errors {
         return true;
     }
+
+    let CurlError::Transfer(message) = error else {
+        return false;
+    };
 
     let message = message.to_ascii_lowercase();
     message.contains("timed out")
