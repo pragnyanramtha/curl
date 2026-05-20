@@ -123,14 +123,14 @@ companion data before this rewrite can be called complete.
 | Rust sidecar install/package behavior | partial | CMake and Autotools install the sidecar as `curl-rust` when `BUILD_RUST_CURL_EXE=ON` or `--enable-rust-curl` is enabled; broader downstream package metadata and installer coverage still need audit |
 | GitHub Actions sidecar gate | partial | `.github/workflows/linux.yml` `Rust sidecar` job runs locked Cargo fmt/test/clippy/build/version checks plus CMake and Autotools sidecar build/test/corpus targets |
 | Existing curl Perl suite with C binary | verified for C path | Does not prove Rust parity |
-| Existing curl Perl suite with Rust binary | partial | `curl-rust-corpus-test` maps 270 smoke cases across FILE, FTP, DICT, GOPHER, HTTP, IPFS/IPNS, IMAP, MQTT, POP3, SCP/SFTP, SMB, SMTP, TFTP, TELNET, CLI help/config/options, and URL/HTTP preflight/error cases; broader protocol corpus remains required before full parity |
+| Existing curl Perl suite with Rust binary | partial | `curl-rust-corpus-test` maps 276 smoke cases across FILE, FTP, DICT, GOPHER, HTTP, IPFS/IPNS, IMAP, MQTT, POP3, SCP/SFTP, SMB, SMTP, TFTP, TELNET, CLI help/config/options, and URL/HTTP preflight/error cases; broader protocol corpus remains required before full parity |
 | Pytest HTTP suite with Rust binary | missing | Required before full parity |
 
 Current `curl-rust-corpus-test` selection:
 
 - FILE: 200, 201, 202, 203, 204, 205, 231, 288, 1016, 1017, 1018, 1019, 1020, 1146, 1220, 2072
 - FTP: 100, 102, 104, 107, 113, 114, 115, 117, 118, 120, 121, 124, 125, 126, 136, 137, 138, 147, 148, 182, 225, 226, 227, 237, 238, 261, 270, 290, 291, 295, 754, 1000, 1003, 1005, 1006, 1062, 1153, 1219, 1224, 1282, 2045
-- HTTP: 14, 292, 293, 393, 457, 477, 580, 1460, 2008
+- HTTP: 14, 48, 220, 222, 224, 230, 232, 292, 293, 393, 457, 477, 580, 1460, 2008
 - IMAP: 800, 801, 802, 803, 806, 807, 808, 809, 810, 811, 812, 813, 814, 817, 818, 829, 841, 846, 847, 1847, 1848, 3206
 - DICT: 1450
 - GOPHER: 1200, 1201, 1202, 1203
