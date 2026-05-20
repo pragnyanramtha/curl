@@ -25,7 +25,7 @@ use reqwest::header::{
 use reqwest::{Client, Method, StatusCode, Url, Version};
 
 use crate::cli::{
-    Config, ContinueAt, HttpVersionPreference, IpVersionPreference, OutputTarget,
+    Config, ContinueAt, HttpVersionPreference, IpVersionPreference, LocalPortRange, OutputTarget,
     SslVersionMaxPreference, SslVersionPreference, TransferConfig,
 };
 use crate::cookie::CookieJar;
@@ -3700,12 +3700,7 @@ async fn run_tftp_exchange(
         .into_iter()
         .next()
         .ok_or_else(|| CurlError::Transfer("could not resolve host".to_string()))?;
-    let bind_addr = if peer_addr.is_ipv6() {
-        "[::]:0"
-    } else {
-        "0.0.0.0:0"
-    };
-    let socket = UdpSocket::bind(bind_addr).await.map_err(tcp_io_error)?;
+    let socket = bind_udp_socket_for_peer(peer_addr, transfer.local_port).await?;
     socket
         .send_to(&request, peer_addr)
         .await
@@ -3797,6 +3792,33 @@ async fn run_tftp_exchange(
         return Err(CurlError::FileSizeExceeded);
     }
     Ok(())
+}
+
+async fn bind_udp_socket_for_peer(
+    peer_addr: SocketAddr,
+    local_port: Option<LocalPortRange>,
+) -> Result<UdpSocket> {
+    let bind_ip = if peer_addr.is_ipv6() {
+        IpAddr::V6(std::net::Ipv6Addr::UNSPECIFIED)
+    } else {
+        IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED)
+    };
+    let Some(local_port) = local_port.filter(|range| range.start != 0) else {
+        return UdpSocket::bind(SocketAddr::new(bind_ip, 0))
+            .await
+            .map_err(tcp_io_error);
+    };
+
+    let mut last_error = None;
+    for port in local_port.start..=local_port.end {
+        match UdpSocket::bind(SocketAddr::new(bind_ip, port)).await {
+            Ok(socket) => return Ok(socket),
+            Err(error) => last_error = Some(error),
+        }
+    }
+    Err(tcp_io_error(last_error.unwrap_or_else(|| {
+        io::Error::new(io::ErrorKind::AddrNotAvailable, "no local port available")
+    })))
 }
 
 async fn run_tftp_upload(socket: &UdpSocket, body: &[u8], requested_blksize: u16) -> Result<()> {

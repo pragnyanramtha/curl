@@ -1,6 +1,6 @@
 use std::io::ErrorKind;
 use std::io::{Read, Write};
-use std::net::{Shutdown, TcpListener, UdpSocket};
+use std::net::{Shutdown, SocketAddr, TcpListener, UdpSocket};
 #[cfg(unix)]
 use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
@@ -80,6 +80,7 @@ struct SmtpRecord {
 #[derive(Debug)]
 struct TftpRecord {
     request: Vec<u8>,
+    peer: SocketAddr,
     acknowledgements: Vec<Vec<u8>>,
 }
 
@@ -765,6 +766,11 @@ fn unused_local_port() -> u16 {
     listener.local_addr().unwrap().port()
 }
 
+fn unused_local_udp_port() -> u16 {
+    let socket = UdpSocket::bind("127.0.0.1:0").unwrap();
+    socket.local_addr().unwrap().port()
+}
+
 fn spawn_pop3_server(path: &str, command_response: &'static [u8]) -> (String, Receiver<Vec<u8>>) {
     spawn_pop3_server_with_greeting(path, b"+OK curl POP3 test server\r\n", command_response)
 }
@@ -1094,6 +1100,7 @@ fn spawn_tftp_server_with_oack(
 
         tx.send(TftpRecord {
             request,
+            peer,
             acknowledgements,
         })
         .unwrap();
@@ -5823,6 +5830,23 @@ fn tftp_get_downloads_file_and_sends_default_options() {
         b"\x00\x01file.txt\x00octet\x00tsize\x000\x00blksize\x00512\x00timeout\x005\x00"
     );
     assert_eq!(record.acknowledgements, [b"\0\x04\0\x01".to_vec()]);
+}
+
+#[test]
+fn tftp_local_port_binds_udp_socket() {
+    let local_port = unused_local_udp_port();
+    let (url, rx) = spawn_tftp_server(vec![b"bound".to_vec()]);
+
+    let mut command = Command::cargo_bin("curl").unwrap();
+    command.args(["-q", "-sS", "--local-port", &local_port.to_string(), &url]);
+    command.assert().success().stdout("bound");
+
+    let record = rx.recv().unwrap();
+    assert_eq!(record.peer.port(), local_port);
+    assert_eq!(
+        record.request,
+        b"\x00\x01file.txt\x00octet\x00tsize\x000\x00blksize\x00512\x00timeout\x005\x00"
+    );
 }
 
 #[test]

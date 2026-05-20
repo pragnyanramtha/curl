@@ -101,6 +101,7 @@ pub struct TransferConfig {
     pub proxy_auth: ProxyAuthMethods,
     pub noproxy: Option<String>,
     pub insecure: bool,
+    pub local_port: Option<LocalPortRange>,
     pub connect_timeout: Option<Duration>,
     pub max_time: Option<Duration>,
     pub max_filesize: Option<u64>,
@@ -124,6 +125,18 @@ pub struct TransferConfig {
     pub ssl_version: Option<SslVersionPreference>,
     pub ssl_version_max: Option<SslVersionMaxPreference>,
     pub ip_version: IpVersionPreference,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct LocalPortRange {
+    pub start: u16,
+    pub end: u16,
+}
+
+impl LocalPortRange {
+    pub fn attempts(self) -> u32 {
+        u32::from(self.end) - u32::from(self.start) + 1
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -470,6 +483,7 @@ impl Default for TransferConfig {
             proxy_auth: ProxyAuthMethods::default(),
             noproxy: None,
             insecure: false,
+            local_port: None,
             connect_timeout: None,
             max_time: None,
             max_filesize: None,
@@ -894,6 +908,10 @@ impl Parser {
             "proxy-user" => {
                 let value = self.value_for(name, inline_value)?;
                 self.current().proxy_user = Some(value);
+            }
+            "local-port" => {
+                let value = self.value_for(name, inline_value)?;
+                self.current().local_port = Some(parse_local_port_range(name, &value)?);
             }
             "proxy-anyauth" => self.current().proxy_auth.set_anyauth(true),
             "proxy-basic" => self.current().proxy_auth.set_basic(true),
@@ -1617,6 +1635,7 @@ impl TransferConfig {
             || !self.proxy_auth.is_empty()
             || self.noproxy.is_some()
             || self.insecure
+            || self.local_port.is_some()
             || self.connect_timeout.is_some()
             || self.max_time.is_some()
             || self.max_filesize.is_some()
@@ -1698,6 +1717,7 @@ fn option_takes_value(name: &str) -> bool {
             | "connect-to"
             | "proxy"
             | "proxy-user"
+            | "local-port"
             | "noproxy"
             | "connect-timeout"
             | "max-time"
@@ -1876,6 +1896,58 @@ fn parse_u64(name: &str, value: &str) -> Result<u64> {
     value
         .parse()
         .map_err(|_| CurlError::Usage(format!("option --{name} expects an integer")))
+}
+
+fn parse_local_port_range(name: &str, value: &str) -> Result<LocalPortRange> {
+    let bytes = value.as_bytes();
+    let mut split = 0;
+    while bytes.get(split).is_some_and(u8::is_ascii_digit) {
+        split += 1;
+    }
+
+    let port = parse_local_port_component(name, &value[..split])?;
+    if split == value.len() {
+        return Ok(LocalPortRange {
+            start: port,
+            end: port,
+        });
+    }
+
+    let mut rest = &value[split..];
+    if rest
+        .as_bytes()
+        .first()
+        .is_some_and(|byte| matches!(byte, b' ' | b'\t'))
+    {
+        rest = &rest[1..];
+    }
+    let Some(after_dash) = rest.strip_prefix('-') else {
+        return Err(local_port_bad_use(name));
+    };
+    rest = after_dash;
+    if rest
+        .as_bytes()
+        .first()
+        .is_some_and(|byte| matches!(byte, b' ' | b'\t'))
+    {
+        rest = &rest[1..];
+    }
+    let end = parse_local_port_component(name, rest)?;
+    if end < port {
+        return Err(local_port_bad_use(name));
+    }
+    Ok(LocalPortRange { start: port, end })
+}
+
+fn parse_local_port_component(name: &str, value: &str) -> Result<u16> {
+    if value.is_empty() || !value.bytes().all(|byte| byte.is_ascii_digit()) {
+        return Err(local_port_bad_use(name));
+    }
+    value.parse::<u16>().map_err(|_| local_port_bad_use(name))
+}
+
+fn local_port_bad_use(name: &str) -> CurlError {
+    CurlError::Usage(format!("option --{name}: is badly used here"))
 }
 
 fn parse_size_parameter(name: &str, value: &str) -> Result<u64> {
@@ -2224,6 +2296,7 @@ fn print_common_help() {
                --proxy-ntlm            Use NTLM proxy authentication\n\
                --proxy-anyauth         Pick any proxy authentication method\n\
                --noproxy <list>        List hosts that do not use proxy\n\
+               --local-port <range>    Use a local port number within range\n\
            -k, --insecure              Allow insecure TLS/SSH\n\
            -s, --silent                Silent mode\n\
            -v, --verbose               Verbose transfer trace\n\
@@ -3511,6 +3584,61 @@ mod tests {
         assert_eq!(transfer.proxy.as_deref(), Some("http://proxy.example:8080"));
         assert_eq!(transfer.proxy_user.as_deref(), Some("proxy-user:secret"));
         assert_eq!(transfer.noproxy.as_deref(), Some("example.com"));
+    }
+
+    #[test]
+    fn parses_local_port_option() {
+        let config = parse_args([
+            "-q",
+            "--local-port",
+            "44444-45444",
+            "tftp://example.com/file",
+        ])
+        .unwrap();
+
+        assert_eq!(
+            config.transfers[0].local_port,
+            Some(LocalPortRange {
+                start: 44444,
+                end: 45444
+            })
+        );
+        assert_eq!(config.transfers[0].local_port.unwrap().attempts(), 1001);
+
+        let config =
+            parse_args(["-q", "--local-port", "44444", "tftp://example.com/file"]).unwrap();
+        assert_eq!(
+            config.transfers[0].local_port,
+            Some(LocalPortRange {
+                start: 44444,
+                end: 44444
+            })
+        );
+
+        let config =
+            parse_args(["-q", "--local-port", "1 - 3", "tftp://example.com/file"]).unwrap();
+        assert_eq!(
+            config.transfers[0].local_port,
+            Some(LocalPortRange { start: 1, end: 3 })
+        );
+
+        let config = parse_args(["-q", "--local-port", "0-1", "tftp://example.com/file"]).unwrap();
+        assert_eq!(
+            config.transfers[0].local_port,
+            Some(LocalPortRange { start: 0, end: 1 })
+        );
+    }
+
+    #[test]
+    fn rejects_bad_local_port_values() {
+        for value in [
+            "", "abc", "1-0", "65536", "1-65536", "-2", "1-", "1  -2", "1 - 2 ",
+        ] {
+            assert!(
+                parse_args(["-q", "--local-port", value, "tftp://example.com"]).is_err(),
+                "accepted invalid --local-port value {value:?}"
+            );
+        }
     }
 
     #[test]

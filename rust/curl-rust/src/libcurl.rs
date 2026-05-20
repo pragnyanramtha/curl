@@ -299,6 +299,14 @@ fn write_request(out: &mut String, render: &RenderTransfer<'_>, url: &str) -> Re
     if let Some(slist) = &render.connect_to_slist {
         emit_raw_setopt(out, "CURLOPT_CONNECT_TO", slist);
     }
+    if let Some(local_port) = transfer.local_port.filter(|range| range.start != 0) {
+        emit_long_setopt(out, "CURLOPT_LOCALPORT", i64::from(local_port.start));
+        emit_long_setopt(
+            out,
+            "CURLOPT_LOCALPORTRANGE",
+            i64::from(local_port.attempts()),
+        );
+    }
     if transfer.mail_rcpt_allowfails {
         emit_long_setopt(out, "CURLOPT_MAIL_RCPT_ALLOWFAILS", 1);
     }
@@ -1001,6 +1009,8 @@ mod tests {
             "2",
             "--max-time",
             "3",
+            "--local-port",
+            "4000-4002",
             "https://example.com",
         ])
         .unwrap();
@@ -1012,6 +1022,21 @@ mod tests {
         assert!(source.contains("CURLOPT_SSL_VERIFYHOST, 0L"));
         assert!(source.contains("CURLOPT_CONNECTTIMEOUT_MS, 2000L"));
         assert!(source.contains("CURLOPT_TIMEOUT_MS, 3000L"));
+        assert!(source.contains("CURLOPT_LOCALPORT, 4000L"));
+        assert!(source.contains("CURLOPT_LOCALPORTRANGE, 3L"));
+
+        let config = parse_args([
+            "-q",
+            "--libcurl",
+            "client.c",
+            "--local-port",
+            "0-1",
+            "https://example.com",
+        ])
+        .unwrap();
+        let source = render_source(&config).unwrap();
+        assert!(!source.contains("CURLOPT_LOCALPORT"));
+        assert!(!source.contains("CURLOPT_LOCALPORTRANGE"));
     }
 
     #[test]

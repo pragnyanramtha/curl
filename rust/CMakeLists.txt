@@ -211,6 +211,7 @@ set(_curl_rust_corpus_tests
   1005
   1006
   1007
+  1009
   1016
   1017
   1018
