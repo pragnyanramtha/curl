@@ -23,7 +23,13 @@ async fn main() {
 }
 
 fn exit(error: CurlError) -> ! {
-    eprintln!("curl: {error}");
+    if let CurlError::BadOptionUsage { message, option } = &error {
+        eprintln!("curl: {message}");
+        eprintln!("curl: option {option}: is badly used here");
+        eprintln!("curl: try 'curl --help' for more information");
+    } else {
+        eprintln!("curl: {error}");
+    }
     std::process::exit(error.exit_code());
 }
 

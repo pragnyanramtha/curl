@@ -18,6 +18,7 @@ const MAX_VARIABLE_NAME_LEN: usize = 128;
 pub struct Config {
     pub show_help: bool,
     pub help_category: Option<String>,
+    pub show_manual: bool,
     pub show_version: bool,
     pub libcurl: Option<PathBuf>,
     pub parallel: bool,
@@ -426,6 +427,7 @@ impl Default for Config {
         Self {
             show_help: false,
             help_category: None,
+            show_manual: false,
             show_version: false,
             libcurl: None,
             parallel: false,
@@ -611,10 +613,15 @@ impl Parser {
 
         self.config.transfers.retain(TransferConfig::has_options);
 
-        if self.config.transfers.is_empty() && !self.config.show_help && !self.config.show_version {
+        if self.config.transfers.is_empty()
+            && !self.config.show_help
+            && !self.config.show_manual
+            && !self.config.show_version
+        {
             return Err(CurlError::Usage("no URL specified".to_string()));
         }
         if !self.config.show_help
+            && !self.config.show_manual
             && !self.config.show_version
             && self
                 .config
@@ -660,6 +667,7 @@ impl Parser {
                 self.config.help_category = self.optional_help_category(inline_value);
             }
             "version" => self.config.show_version = true,
+            "manual" => self.config.show_manual = true,
             "disable" => {}
             "config" => {
                 let value = self.value_for(name, inline_value)?;
@@ -754,7 +762,7 @@ impl Parser {
                         "--continue-at is mutually exclusive with --range".to_string(),
                     ));
                 }
-                self.reject_continue_at_output_conflicts()?;
+                self.reject_continue_at_output_conflicts("--continue-at")?;
                 self.current().continue_at = Some(parse_continue_at(name, &value)?);
             }
             "data" | "data-ascii" => {
@@ -875,8 +883,9 @@ impl Parser {
             "clobber" => self.current().file_clobber_mode = FileClobberMode::Always,
             "remove-on-error" => {
                 if self.current().continue_at.is_some() {
-                    return Err(CurlError::Usage(
-                        "--continue-at is mutually exclusive with --remove-on-error".to_string(),
+                    return Err(bad_option_usage(
+                        "--continue-at is mutually exclusive with --remove-on-error",
+                        "--remove-on-error",
                     ));
                 }
                 self.current().remove_on_error = true;
@@ -1090,11 +1099,13 @@ impl Parser {
             "remote-name" => self.set_output_default_if_remote_name_all(),
             "remote-name-all" => self.current().remote_name_all = false,
             "remote-header-name" => self.current().remote_header_name = false,
+            "manual" => self.config.show_manual = false,
             "skip-existing" => self.current().skip_existing = false,
             "clobber" => {
                 if self.current().continue_at.is_some() {
-                    return Err(CurlError::Usage(
-                        "--continue-at is mutually exclusive with --no-clobber".to_string(),
+                    return Err(bad_option_usage(
+                        "--continue-at is mutually exclusive with --no-clobber",
+                        "--no-clobber",
                     ));
                 }
                 self.current().file_clobber_mode = FileClobberMode::Never;
@@ -1167,6 +1178,7 @@ impl Parser {
                     }
                 }
                 'V' => self.config.show_version = true,
+                'M' => self.config.show_manual = true,
                 'q' => {}
                 'K' => {
                     let value = self.short_value('K', rest)?;
@@ -1218,7 +1230,7 @@ impl Parser {
                             "--continue-at is mutually exclusive with --range".to_string(),
                         ));
                     }
-                    self.reject_continue_at_output_conflicts()?;
+                    self.reject_continue_at_output_conflicts("-C")?;
                     self.current().continue_at = Some(parse_continue_at("continue-at", &value)?);
                     break;
                 }
@@ -1530,20 +1542,22 @@ impl Parser {
         append_header_values(&mut self.current().proxy_headers, value)
     }
 
-    fn reject_continue_at_output_conflicts(&self) -> Result<()> {
+    fn reject_continue_at_output_conflicts(&self, option: &str) -> Result<()> {
         let transfer = self
             .config
             .transfers
             .last()
             .expect("parser always has a current transfer");
         if transfer.remove_on_error {
-            return Err(CurlError::Usage(
-                "--continue-at is mutually exclusive with --remove-on-error".to_string(),
+            return Err(bad_option_usage(
+                "--continue-at is mutually exclusive with --remove-on-error",
+                option,
             ));
         }
         if transfer.file_clobber_mode == FileClobberMode::Never {
-            return Err(CurlError::Usage(
-                "--continue-at is mutually exclusive with --no-clobber".to_string(),
+            return Err(bad_option_usage(
+                "--continue-at is mutually exclusive with --no-clobber",
+                option,
             ));
         }
         Ok(())
@@ -1831,6 +1845,13 @@ fn append_header_values(headers: &mut Vec<String>, value: String) -> Result<()> 
         headers.push(value);
     }
     Ok(())
+}
+
+fn bad_option_usage(message: impl Into<String>, option: impl Into<String>) -> CurlError {
+    CurlError::BadOptionUsage {
+        message: message.into(),
+        option: option.into(),
+    }
 }
 
 fn option_takes_value(name: &str) -> bool {
@@ -2482,6 +2503,10 @@ pub fn print_help(category: Option<&str>) {
     } else {
         print_common_help();
     }
+}
+
+pub fn print_manual_disabled_warning() {
+    eprintln!("Warning: built-in manual was disabled at build-time");
 }
 
 fn is_help_category(category: &str) -> bool {

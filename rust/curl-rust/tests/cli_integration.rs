@@ -2853,6 +2853,28 @@ fn remove_on_error_with_no_clobber_removes_numbered_output_only() {
 }
 
 #[test]
+fn continue_at_no_clobber_reports_bad_option_context() {
+    let mut command = Command::cargo_bin("curl").unwrap();
+    command.args(["-q", "--no-clobber", "-C", "1", "https://example.com/"]);
+    command.assert().failure().code(2).stdout("").stderr(
+        "curl: --continue-at is mutually exclusive with --no-clobber\n\
+         curl: option -C: is badly used here\n\
+         curl: try 'curl --help' for more information\n",
+    );
+}
+
+#[test]
+fn continue_at_remove_on_error_reports_bad_option_context() {
+    let mut command = Command::cargo_bin("curl").unwrap();
+    command.args(["-q", "--remove-on-error", "-C", "1", "https://example.com/"]);
+    command.assert().failure().code(2).stdout("").stderr(
+        "curl: --continue-at is mutually exclusive with --remove-on-error\n\
+         curl: option -C: is badly used here\n\
+         curl: try 'curl --help' for more information\n",
+    );
+}
+
+#[test]
 fn duplicate_location_headers_accept_exact_repeat() {
     let (url, rx) = spawn_server(
         b"HTTP/1.1 200 OK\r\nLocation: this\r\nLocation: this\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok",
@@ -5116,6 +5138,17 @@ fn help_unknown_category_lists_categories() {
     assert!(stdout.starts_with("Unknown category provided"));
     assert!(stdout.contains("\n ldap        LDAP protocol\n"));
     assert!(!stdout.contains("Usage: curl"));
+}
+
+#[test]
+fn manual_option_reports_disabled_for_corpus_detection() {
+    let mut command = Command::cargo_bin("curl").unwrap();
+    command.args(["-q", "-M"]);
+    command
+        .assert()
+        .success()
+        .stdout("")
+        .stderr("Warning: built-in manual was disabled at build-time\n");
 }
 
 #[test]

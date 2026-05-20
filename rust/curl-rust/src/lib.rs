@@ -19,6 +19,11 @@ pub async fn run(config: Config) -> Result<i32, CurlError> {
         return Ok(0);
     }
 
+    if config.show_manual {
+        cli::print_manual_disabled_warning();
+        return Ok(0);
+    }
+
     if config.show_version {
         cli::print_version();
         return Ok(0);
