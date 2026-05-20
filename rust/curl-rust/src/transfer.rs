@@ -7769,7 +7769,8 @@ async fn run_http_transfer(
     let mut redirects = 0usize;
 
     let explicit_proxy = explicit_http_proxy(transfer)?;
-    if let Some(connect_to) = connect_to_target(transfer, &url)? {
+    let initial_connect_to = connect_to_target(transfer, &url)?;
+    if initial_connect_to.is_some() {
         if url.scheme() != "http" {
             return Err(CurlError::Unsupported(
                 "--connect-to is only implemented for plain http:// URLs in the Rust sidecar"
@@ -7781,6 +7782,125 @@ async fn run_http_transfer(
                 "--connect-to with HTTP proxy is not implemented in the Rust sidecar".to_string(),
             ));
         }
+    }
+
+    if explicit_proxy.is_none()
+        && transfer.follow_location
+        && raw_http_direct_redirect_supported(transfer, &url, has_multipart)
+        && (transfer.request_target.is_some() || initial_connect_to.is_some())
+    {
+        let custom_method = transfer.method.is_some();
+        let post_redirect_body =
+            !transfer.get && (!transfer.data.is_empty() || !transfer.forms.is_empty());
+        let mut current_method = method.clone();
+        let mut send_request_body = true;
+
+        loop {
+            metrics.method = current_method.as_str().to_string();
+            let request_body = send_request_body
+                .then_some(prepared_body.as_ref())
+                .flatten();
+            let upload = if send_request_body {
+                upload_body.as_deref()
+            } else {
+                None
+            };
+            let (connect_host, connect_port) = raw_http_direct_endpoint(transfer, &url)?;
+            let sensitive_headers_allowed =
+                transfer.location_trusted || same_redirect_origin(&initial_url, &url);
+            let attempt = run_raw_http_direct_transfer(RawHttpDirectContext {
+                transfer,
+                url: &url,
+                connect_host: &connect_host,
+                connect_port,
+                method: &current_method,
+                prepared_body: request_body,
+                upload_body: upload,
+                resume_from,
+                referer: custom_referer.as_deref().or(current_referer.as_deref()),
+                sensitive_headers_allowed,
+            })
+            .await?;
+
+            if attempt.status.is_some_and(is_followed_redirect)
+                && let Some(next_url) = redirect_location(&attempt.final_url, &attempt.headers)?
+            {
+                let status = attempt.status.expect("checked redirect status");
+                if let Some(path) = &transfer.dump_header {
+                    let header_bytes =
+                        output::render_headers(attempt.version, status, &attempt.headers);
+                    output::append_dump_headers(path, &header_bytes, transfer.create_dirs)?;
+                }
+
+                if redirects >= transfer.max_redirs {
+                    metrics.url_effective = attempt.final_url.to_string();
+                    metrics.response_code = Some(status.as_u16());
+                    metrics.referer = custom_referer.clone().or_else(|| current_referer.clone());
+                    metrics.redirect_url = Some(next_url.to_string());
+                    metrics.headers = attempt.headers;
+                    return Err(CurlError::TooManyRedirects {
+                        max: transfer.max_redirs,
+                    });
+                }
+
+                if next_url.scheme() != "http" {
+                    metrics.url_effective = attempt.final_url.to_string();
+                    metrics.response_code = Some(status.as_u16());
+                    metrics.referer = custom_referer.clone().or_else(|| current_referer.clone());
+                    metrics.redirect_url = Some(next_url.to_string());
+                    metrics.headers = attempt.headers;
+                    return Err(CurlError::Unsupported(
+                        "raw HTTP redirects outside plain http:// are not implemented in the Rust sidecar"
+                            .to_string(),
+                    ));
+                }
+
+                if transfer.auto_referer && custom_referer.is_none() {
+                    current_referer = Some(auto_referer_value(&attempt.final_url));
+                }
+                let followup = redirect_followup(
+                    transfer,
+                    status,
+                    &current_method,
+                    custom_method,
+                    post_redirect_body,
+                );
+                if let Some(next_method) = followup.method {
+                    current_method = next_method;
+                }
+                if followup.drop_body {
+                    send_request_body = false;
+                }
+                url = next_url;
+                redirects += 1;
+                continue;
+            }
+
+            metrics.url_effective = attempt.final_url.to_string();
+            metrics.response_code = attempt.status.map(|status| status.as_u16());
+            metrics.referer = custom_referer.clone().or_else(|| current_referer.clone());
+            metrics.content_type = attempt
+                .headers
+                .get(CONTENT_TYPE)
+                .and_then(|value| value.to_str().ok())
+                .map(ToString::to_string);
+            metrics.redirect_url = attempt
+                .headers
+                .get(LOCATION)
+                .and_then(|value| value.to_str().ok())
+                .map(ToString::to_string);
+            metrics.headers = attempt.headers.clone();
+            check_http_content_length_max_filesize(
+                transfer,
+                &attempt.headers,
+                current_method == Method::HEAD,
+            )?;
+            metrics.size_download = attempt.body.len() as u64;
+            return Ok(attempt);
+        }
+    }
+
+    if let Some(connect_to) = initial_connect_to.as_ref() {
         if !raw_http_direct_supported(transfer, &url, has_multipart) {
             return Err(CurlError::Unsupported(
                 "--connect-to is not implemented for this HTTP request shape in the Rust sidecar"
@@ -7850,123 +7970,6 @@ async fn run_http_transfer(
         check_http_content_length_max_filesize(transfer, &attempt.headers, method == Method::HEAD)?;
         metrics.size_download = attempt.body.len() as u64;
         return Ok(attempt);
-    }
-
-    if explicit_proxy.is_none()
-        && transfer.request_target.is_some()
-        && transfer.follow_location
-        && raw_http_direct_redirect_supported(transfer, &url, has_multipart)
-    {
-        let custom_method = transfer.method.is_some();
-        let post_redirect_body =
-            !transfer.get && (!transfer.data.is_empty() || !transfer.forms.is_empty());
-        let mut current_method = method.clone();
-        let mut send_request_body = true;
-
-        loop {
-            metrics.method = current_method.as_str().to_string();
-            let request_body = send_request_body
-                .then_some(prepared_body.as_ref())
-                .flatten();
-            let upload = if send_request_body {
-                upload_body.as_deref()
-            } else {
-                None
-            };
-            let sensitive_headers_allowed =
-                transfer.location_trusted || same_redirect_origin(&initial_url, &url);
-            let attempt = run_raw_http_direct_transfer(RawHttpDirectContext {
-                transfer,
-                url: &url,
-                connect_host: url
-                    .host_str()
-                    .ok_or_else(|| CurlError::Url("URL is missing a host".to_string()))?,
-                connect_port: url.port_or_known_default().unwrap_or(80),
-                method: &current_method,
-                prepared_body: request_body,
-                upload_body: upload,
-                resume_from,
-                referer: custom_referer.as_deref().or(current_referer.as_deref()),
-                sensitive_headers_allowed,
-            })
-            .await?;
-
-            if attempt.status.is_some_and(is_followed_redirect)
-                && let Some(next_url) = redirect_location(&attempt.final_url, &attempt.headers)?
-            {
-                let status = attempt.status.expect("checked redirect status");
-                if let Some(path) = &transfer.dump_header {
-                    let header_bytes =
-                        output::render_headers(attempt.version, status, &attempt.headers);
-                    output::append_dump_headers(path, &header_bytes, transfer.create_dirs)?;
-                }
-
-                if redirects >= transfer.max_redirs {
-                    metrics.url_effective = attempt.final_url.to_string();
-                    metrics.response_code = Some(status.as_u16());
-                    metrics.referer = custom_referer.clone().or_else(|| current_referer.clone());
-                    metrics.redirect_url = Some(next_url.to_string());
-                    metrics.headers = attempt.headers;
-                    return Err(CurlError::TooManyRedirects {
-                        max: transfer.max_redirs,
-                    });
-                }
-
-                if next_url.scheme() != "http" {
-                    metrics.url_effective = attempt.final_url.to_string();
-                    metrics.response_code = Some(status.as_u16());
-                    metrics.referer = custom_referer.clone().or_else(|| current_referer.clone());
-                    metrics.redirect_url = Some(next_url.to_string());
-                    metrics.headers = attempt.headers;
-                    return Err(CurlError::Unsupported(
-                        "--request-target redirects outside plain http:// are not implemented in the Rust sidecar"
-                            .to_string(),
-                    ));
-                }
-
-                if transfer.auto_referer && custom_referer.is_none() {
-                    current_referer = Some(auto_referer_value(&attempt.final_url));
-                }
-                let followup = redirect_followup(
-                    transfer,
-                    status,
-                    &current_method,
-                    custom_method,
-                    post_redirect_body,
-                );
-                if let Some(next_method) = followup.method {
-                    current_method = next_method;
-                }
-                if followup.drop_body {
-                    send_request_body = false;
-                }
-                url = next_url;
-                redirects += 1;
-                continue;
-            }
-
-            metrics.url_effective = attempt.final_url.to_string();
-            metrics.response_code = attempt.status.map(|status| status.as_u16());
-            metrics.referer = custom_referer.clone().or_else(|| current_referer.clone());
-            metrics.content_type = attempt
-                .headers
-                .get(CONTENT_TYPE)
-                .and_then(|value| value.to_str().ok())
-                .map(ToString::to_string);
-            metrics.redirect_url = attempt
-                .headers
-                .get(LOCATION)
-                .and_then(|value| value.to_str().ok())
-                .map(ToString::to_string);
-            metrics.headers = attempt.headers.clone();
-            check_http_content_length_max_filesize(
-                transfer,
-                &attempt.headers,
-                current_method == Method::HEAD,
-            )?;
-            metrics.size_download = attempt.body.len() as u64;
-            return Ok(attempt);
-        }
     }
 
     if explicit_proxy.is_none()
@@ -8190,6 +8193,21 @@ fn raw_http_proxy_supported(transfer: &TransferConfig, url: &Url, has_multipart:
 
 fn raw_http_direct_supported(transfer: &TransferConfig, url: &Url, has_multipart: bool) -> bool {
     raw_http_proxy_supported(transfer, url, has_multipart)
+}
+
+fn raw_http_direct_endpoint(transfer: &TransferConfig, url: &Url) -> Result<(String, u16)> {
+    if let Some(connect_to) = connect_to_target(transfer, url)? {
+        return Ok((connect_to.host, connect_to.port));
+    }
+
+    let host = url
+        .host_str()
+        .ok_or_else(|| CurlError::Url("URL is missing a host".to_string()))?
+        .to_string();
+    let port = url
+        .port_or_known_default()
+        .ok_or_else(|| CurlError::Url("URL is missing a port".to_string()))?;
+    Ok((host, port))
 }
 
 fn raw_http_direct_redirect_supported(

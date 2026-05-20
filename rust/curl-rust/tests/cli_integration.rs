@@ -2967,6 +2967,34 @@ fn connect_to_remaps_plain_http_destination() {
 }
 
 #[test]
+fn connect_to_location_follows_redirect_through_remap() {
+    let (backend_url, rx) = spawn_sequence_server(vec![
+        b"HTTP/1.1 302 Found\r\nLocation: /next\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+        b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok",
+    ]);
+    let backend_port = Url::parse(&backend_url).unwrap().port().unwrap();
+    let rule = format!("example.test:80:127.0.0.1:{backend_port}");
+
+    let mut command = Command::cargo_bin("curl").unwrap();
+    command.args([
+        "-q",
+        "-sS",
+        "-L",
+        "--connect-to",
+        &rule,
+        "http://example.test/resource",
+    ]);
+    command.assert().success().stdout("ok");
+
+    let first = rx.recv().unwrap();
+    let second = rx.recv().unwrap();
+    assert_eq!(first.start_line, "GET /resource HTTP/1.1");
+    assert_eq!(second.start_line, "GET /next HTTP/1.1");
+    assert_eq!(header(&first, "host"), Some("example.test"));
+    assert_eq!(header(&second, "host"), Some("example.test"));
+}
+
+#[test]
 fn connect_to_nonmatching_rule_does_not_remap_or_fail() {
     let (url, rx) = spawn_server(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok");
 
