@@ -74,6 +74,9 @@ pub struct TransferConfig {
     pub time_cond: Option<String>,
     pub write_out: Option<String>,
     pub follow_location: bool,
+    pub post301: bool,
+    pub post302: bool,
+    pub post303: bool,
     pub max_redirs: usize,
     pub retry: usize,
     pub retry_all_errors: bool,
@@ -209,6 +212,9 @@ impl Default for TransferConfig {
             time_cond: None,
             write_out: None,
             follow_location: false,
+            post301: false,
+            post302: false,
+            post303: false,
             max_redirs: 50,
             retry: 0,
             retry_all_errors: false,
@@ -583,6 +589,9 @@ impl Parser {
                 self.current().write_out = Some(self.read_write_out_value(&value)?);
             }
             "location" | "location-trusted" => self.current().follow_location = true,
+            "post301" => self.current().post301 = true,
+            "post302" => self.current().post302 = true,
+            "post303" => self.current().post303 = true,
             "max-redirs" => {
                 let value = self.value_for(name, inline_value)?;
                 self.current().max_redirs = parse_usize(name, &value)?;
@@ -716,6 +725,9 @@ impl Parser {
             "remote-name" => self.current().remote_name = false,
             "remote-header-name" => self.current().remote_header_name = false,
             "location" | "location-trusted" => self.current().follow_location = false,
+            "post301" => self.current().post301 = false,
+            "post302" => self.current().post302 = false,
+            "post303" => self.current().post303 = false,
             "retry-all-errors" => self.current().retry_all_errors = false,
             "retry-connrefused" => self.current().retry_connrefused = false,
             "fail" => {
@@ -1245,6 +1257,9 @@ impl TransferConfig {
             || self.time_cond.is_some()
             || self.write_out.is_some()
             || self.follow_location
+            || self.post301
+            || self.post302
+            || self.post303
             || self.retry != 0
             || self.retry_all_errors
             || self.retry_connrefused
@@ -1781,6 +1796,9 @@ fn print_common_help() {
            -I, --head                  Show document information only\n\
            -l, --list-only             List only mode\n\
            -L, --location              Follow redirects\n\
+               --post301               Keep POST after 301 redirect\n\
+               --post302               Keep POST after 302 redirect\n\
+               --post303               Keep POST after 303 redirect\n\
            -Z, --parallel              Perform transfers in parallel\n\
                --parallel-max <num>    Maximum parallel transfer count\n\
                --retry <num>           Retry transient transfer problems\n\
@@ -3251,8 +3269,12 @@ mod tests {
             "-q",
             "--location",
             "--compressed",
+            "--post301",
+            "--post302",
+            "--post303",
             "--no-location",
             "--no-compressed",
+            "--no-post302",
             "https://example.com",
         ])
         .unwrap();
@@ -3260,6 +3282,9 @@ mod tests {
         let transfer = &config.transfers[0];
         assert!(!transfer.follow_location);
         assert!(!transfer.compressed);
+        assert!(transfer.post301);
+        assert!(!transfer.post302);
+        assert!(transfer.post303);
     }
 
     #[test]

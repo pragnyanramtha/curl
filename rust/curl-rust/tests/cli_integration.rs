@@ -2158,8 +2158,8 @@ fn default_config_is_skipped_by_q_cluster() {
 fn url_at_file_downloads_each_url_as_remote_name() {
     let temp = tempdir().unwrap();
     let (url, rx) = spawn_sequence_server(vec![
-        b"HTTP/1.1 200 OK\r\nContent-Length: 3\r\n\r\none",
-        b"HTTP/1.1 200 OK\r\nContent-Length: 3\r\n\r\ntwo",
+        b"HTTP/1.1 200 OK\r\nContent-Length: 3\r\nConnection: close\r\n\r\none",
+        b"HTTP/1.1 200 OK\r\nContent-Length: 3\r\nConnection: close\r\n\r\ntwo",
     ]);
     let origin = gateway_origin(&url);
     let urls = temp.path().join("urls.txt");
@@ -9316,6 +9316,60 @@ fn auto_referer_redirect_rewrites_post_to_get() {
     assert!(second.start_line.starts_with("GET /next HTTP/1.1"));
     assert!(second.body.is_empty());
     assert_eq!(header(&second, "referer"), Some(url.as_str()));
+}
+
+fn assert_post_redirect_preserves_method(first_response: &'static [u8], option: &str) {
+    let (url, rx) = spawn_sequence_server(vec![
+        first_response,
+        b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok",
+    ]);
+
+    let mut command = Command::cargo_bin("curl").unwrap();
+    command.args([
+        "-q",
+        "-sS",
+        "-L",
+        "-d",
+        "moo",
+        option,
+        "-w",
+        " %{method}",
+        &url,
+    ]);
+    command.assert().success().stdout("ok POST");
+
+    let first = rx.recv().unwrap();
+    let second = rx.recv().unwrap();
+    assert!(first.start_line.starts_with("POST /resource HTTP/1.1"));
+    assert_eq!(first.body, b"moo");
+    assert_eq!(header(&first, "referer"), None);
+    assert!(second.start_line.starts_with("POST /next HTTP/1.1"));
+    assert_eq!(second.body, b"moo");
+    assert_eq!(header(&second, "referer"), None);
+}
+
+#[test]
+fn post301_preserves_post_on_redirect() {
+    assert_post_redirect_preserves_method(
+        b"HTTP/1.1 301 Moved Permanently\r\nLocation: /next\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+        "--post301",
+    );
+}
+
+#[test]
+fn post302_preserves_post_on_redirect() {
+    assert_post_redirect_preserves_method(
+        b"HTTP/1.1 302 Found\r\nLocation: /next\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+        "--post302",
+    );
+}
+
+#[test]
+fn post303_preserves_post_on_redirect() {
+    assert_post_redirect_preserves_method(
+        b"HTTP/1.1 303 See Other\r\nLocation: /next\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+        "--post303",
+    );
 }
 
 #[test]

@@ -381,6 +381,10 @@ fn write_request(out: &mut String, render: &RenderTransfer<'_>, url: &str) -> Re
     if transfer.follow_location {
         emit_long_setopt(out, "CURLOPT_FOLLOWLOCATION", 1);
     }
+    let postredir = postredir_bitmask(transfer);
+    if postredir != 0 {
+        emit_long_setopt(out, "CURLOPT_POSTREDIR", postredir);
+    }
     if transfer.http09_allowed {
         emit_long_setopt(out, "CURLOPT_HTTP09_ALLOWED", 1);
     }
@@ -558,6 +562,20 @@ fn emit_ip_version(out: &mut String, version: IpVersionPreference) {
     emit_raw_setopt(out, "CURLOPT_IPRESOLVE", value);
 }
 
+fn postredir_bitmask(transfer: &TransferConfig) -> i64 {
+    let mut bitmask = 0;
+    if transfer.post301 {
+        bitmask |= 1;
+    }
+    if transfer.post302 {
+        bitmask |= 2;
+    }
+    if transfer.post303 {
+        bitmask |= 4;
+    }
+    bitmask
+}
+
 fn emit_slist_append(out: &mut String, slist: &str, value: &str) {
     writeln!(
         out,
@@ -696,6 +714,23 @@ mod tests {
 
         assert!(source.contains("CURLOPT_AUTOREFERER, 1"));
         assert!(!source.contains("CURLOPT_REFERER"));
+    }
+
+    #[test]
+    fn renders_post_redirect_options() {
+        let config = parse_args([
+            "-q",
+            "--libcurl",
+            "client.c",
+            "--post301",
+            "--post303",
+            "https://example.com",
+        ])
+        .unwrap();
+
+        let source = render_source(&config).unwrap();
+
+        assert!(source.contains("CURLOPT_POSTREDIR, 5L"));
     }
 
     #[test]

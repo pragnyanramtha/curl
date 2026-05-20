@@ -285,7 +285,7 @@ fn expand_urls(transfer: &TransferConfig) -> Result<Vec<glob::ExpandedUrl>> {
 }
 
 fn build_client(transfer: &TransferConfig, cookie_jar: Option<Arc<CookieJar>>) -> Result<Client> {
-    let redirect = if transfer.follow_location && !transfer.auto_referer {
+    let redirect = if transfer.follow_location && !manual_http_redirects(transfer) {
         reqwest::redirect::Policy::limited(transfer.max_redirs)
     } else {
         reqwest::redirect::Policy::none()
@@ -7774,6 +7774,7 @@ async fn run_http_transfer(
 
     let mut current_method = method;
     let mut send_request_body = true;
+    let manual_redirects = manual_http_redirects(transfer);
 
     loop {
         metrics.method = current_method.as_str().to_string();
@@ -7837,7 +7838,7 @@ async fn run_http_transfer(
             }
         }
 
-        if transfer.auto_referer
+        if manual_redirects
             && transfer.follow_location
             && is_followed_redirect(status)
             && let Some(next_url) = redirect_location(&final_url, &headers)?
@@ -7854,10 +7855,10 @@ async fn run_http_transfer(
             }
 
             response.bytes().await.transfer_err()?;
-            if custom_referer.is_none() {
+            if transfer.auto_referer && custom_referer.is_none() {
                 current_referer = Some(auto_referer_value(&final_url));
             }
-            if let Some(next_method) = redirect_followup_method(status, &current_method) {
+            if let Some(next_method) = redirect_followup_method(transfer, status, &current_method) {
                 current_method = next_method;
                 send_request_body = false;
             }
@@ -8892,15 +8893,25 @@ fn is_followed_redirect(status: StatusCode) -> bool {
     )
 }
 
-fn redirect_followup_method(status: StatusCode, method: &Method) -> Option<Method> {
+fn manual_http_redirects(transfer: &TransferConfig) -> bool {
+    transfer.auto_referer || transfer.post301 || transfer.post302 || transfer.post303
+}
+
+fn redirect_followup_method(
+    transfer: &TransferConfig,
+    status: StatusCode,
+    method: &Method,
+) -> Option<Method> {
     if *method == Method::HEAD {
         return None;
     }
 
     match status {
-        StatusCode::MOVED_PERMANENTLY | StatusCode::FOUND if *method == Method::POST => {
+        StatusCode::MOVED_PERMANENTLY if *method == Method::POST && !transfer.post301 => {
             Some(Method::GET)
         }
+        StatusCode::FOUND if *method == Method::POST && !transfer.post302 => Some(Method::GET),
+        StatusCode::SEE_OTHER if *method == Method::POST && transfer.post303 => None,
         StatusCode::SEE_OTHER if *method != Method::GET => Some(Method::GET),
         _ => None,
     }
