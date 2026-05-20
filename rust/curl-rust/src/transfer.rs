@@ -20,7 +20,7 @@ use reqwest::header::{
     ACCEPT, ACCEPT_ENCODING, ACCEPT_RANGES, AUTHORIZATION, CONTENT_ENCODING, CONTENT_LENGTH,
     CONTENT_RANGE, CONTENT_TYPE, COOKIE, ETAG, HeaderMap, HeaderName, HeaderValue,
     IF_MODIFIED_SINCE, IF_NONE_MATCH, IF_UNMODIFIED_SINCE, LAST_MODIFIED, LOCATION, RANGE, REFERER,
-    RETRY_AFTER, USER_AGENT,
+    RETRY_AFTER, TRANSFER_ENCODING, USER_AGENT,
 };
 use reqwest::{Client, Method, StatusCode, Url, Version};
 
@@ -110,6 +110,7 @@ struct RawHttpDirectContext<'a> {
     upload_body: Option<&'a [u8]>,
     resume_from: u64,
     referer: Option<&'a str>,
+    sensitive_headers_allowed: bool,
 }
 
 struct ConnectToRule<'a> {
@@ -7796,6 +7797,7 @@ async fn run_http_transfer(
             upload_body: upload_body.as_deref(),
             resume_from,
             referer: custom_referer.as_deref().or(current_referer.as_deref()),
+            sensitive_headers_allowed: true,
         })
         .await?;
         metrics.url_effective = attempt.final_url.to_string();
@@ -7851,6 +7853,123 @@ async fn run_http_transfer(
     }
 
     if explicit_proxy.is_none()
+        && transfer.request_target.is_some()
+        && transfer.follow_location
+        && raw_http_direct_redirect_supported(transfer, &url, has_multipart)
+    {
+        let custom_method = transfer.method.is_some();
+        let post_redirect_body =
+            !transfer.get && (!transfer.data.is_empty() || !transfer.forms.is_empty());
+        let mut current_method = method.clone();
+        let mut send_request_body = true;
+
+        loop {
+            metrics.method = current_method.as_str().to_string();
+            let request_body = send_request_body
+                .then_some(prepared_body.as_ref())
+                .flatten();
+            let upload = if send_request_body {
+                upload_body.as_deref()
+            } else {
+                None
+            };
+            let sensitive_headers_allowed =
+                transfer.location_trusted || same_redirect_origin(&initial_url, &url);
+            let attempt = run_raw_http_direct_transfer(RawHttpDirectContext {
+                transfer,
+                url: &url,
+                connect_host: url
+                    .host_str()
+                    .ok_or_else(|| CurlError::Url("URL is missing a host".to_string()))?,
+                connect_port: url.port_or_known_default().unwrap_or(80),
+                method: &current_method,
+                prepared_body: request_body,
+                upload_body: upload,
+                resume_from,
+                referer: custom_referer.as_deref().or(current_referer.as_deref()),
+                sensitive_headers_allowed,
+            })
+            .await?;
+
+            if attempt.status.is_some_and(is_followed_redirect)
+                && let Some(next_url) = redirect_location(&attempt.final_url, &attempt.headers)?
+            {
+                let status = attempt.status.expect("checked redirect status");
+                if let Some(path) = &transfer.dump_header {
+                    let header_bytes =
+                        output::render_headers(attempt.version, status, &attempt.headers);
+                    output::append_dump_headers(path, &header_bytes, transfer.create_dirs)?;
+                }
+
+                if redirects >= transfer.max_redirs {
+                    metrics.url_effective = attempt.final_url.to_string();
+                    metrics.response_code = Some(status.as_u16());
+                    metrics.referer = custom_referer.clone().or_else(|| current_referer.clone());
+                    metrics.redirect_url = Some(next_url.to_string());
+                    metrics.headers = attempt.headers;
+                    return Err(CurlError::TooManyRedirects {
+                        max: transfer.max_redirs,
+                    });
+                }
+
+                if next_url.scheme() != "http" {
+                    metrics.url_effective = attempt.final_url.to_string();
+                    metrics.response_code = Some(status.as_u16());
+                    metrics.referer = custom_referer.clone().or_else(|| current_referer.clone());
+                    metrics.redirect_url = Some(next_url.to_string());
+                    metrics.headers = attempt.headers;
+                    return Err(CurlError::Unsupported(
+                        "--request-target redirects outside plain http:// are not implemented in the Rust sidecar"
+                            .to_string(),
+                    ));
+                }
+
+                if transfer.auto_referer && custom_referer.is_none() {
+                    current_referer = Some(auto_referer_value(&attempt.final_url));
+                }
+                let followup = redirect_followup(
+                    transfer,
+                    status,
+                    &current_method,
+                    custom_method,
+                    post_redirect_body,
+                );
+                if let Some(next_method) = followup.method {
+                    current_method = next_method;
+                }
+                if followup.drop_body {
+                    send_request_body = false;
+                }
+                url = next_url;
+                redirects += 1;
+                continue;
+            }
+
+            metrics.url_effective = attempt.final_url.to_string();
+            metrics.response_code = attempt.status.map(|status| status.as_u16());
+            metrics.referer = custom_referer.clone().or_else(|| current_referer.clone());
+            metrics.content_type = attempt
+                .headers
+                .get(CONTENT_TYPE)
+                .and_then(|value| value.to_str().ok())
+                .map(ToString::to_string);
+            metrics.redirect_url = attempt
+                .headers
+                .get(LOCATION)
+                .and_then(|value| value.to_str().ok())
+                .map(ToString::to_string);
+            metrics.headers = attempt.headers.clone();
+            check_http_content_length_max_filesize(
+                transfer,
+                &attempt.headers,
+                current_method == Method::HEAD,
+            )?;
+            metrics.size_download = attempt.body.len() as u64;
+            return Ok(attempt);
+        }
+    }
+
+    if explicit_proxy.is_none()
         && raw_http_direct_supported(transfer, &url, has_multipart)
         && (transfer.request_target.is_some() || needs_raw_custom_header_wire_semantics(transfer)?)
     {
@@ -7866,6 +7985,7 @@ async fn run_http_transfer(
             upload_body: upload_body.as_deref(),
             resume_from,
             referer: custom_referer.as_deref().or(current_referer.as_deref()),
+            sensitive_headers_allowed: true,
         })
         .await?;
         metrics.url_effective = attempt.final_url.to_string();
@@ -8072,6 +8192,20 @@ fn raw_http_direct_supported(transfer: &TransferConfig, url: &Url, has_multipart
     raw_http_proxy_supported(transfer, url, has_multipart)
 }
 
+fn raw_http_direct_redirect_supported(
+    transfer: &TransferConfig,
+    url: &Url,
+    has_multipart: bool,
+) -> bool {
+    url.scheme() == "http"
+        && !has_multipart
+        && !cookie_engine_active(transfer)
+        && !matches!(
+            transfer.http_version,
+            HttpVersionPreference::Http2 | HttpVersionPreference::Http2PriorKnowledge
+        )
+}
+
 fn needs_raw_custom_header_wire_semantics(transfer: &TransferConfig) -> Result<bool> {
     Ok(parse_headers(&transfer.headers)?.iter().any(|(_, value)| {
         value
@@ -8192,16 +8326,19 @@ fn raw_http_direct_request(context: &RawHttpDirectContext<'_>) -> Result<Vec<u8>
     if context.transfer.compressed && !has_header("accept-encoding") {
         request.extend_from_slice(b"Accept-Encoding: deflate, gzip, br\r\n");
     }
-    if let Some(cookie) = &context.transfer.cookie
+    if context.sensitive_headers_allowed
+        && let Some(cookie) = &context.transfer.cookie
         && !has_header("cookie")
     {
         request.extend_from_slice(format!("Cookie: {cookie}\r\n").as_bytes());
     }
-    if let Some(token) = &context.transfer.oauth2_bearer
+    if context.sensitive_headers_allowed
+        && let Some(token) = &context.transfer.oauth2_bearer
         && !has_header("authorization")
     {
         request.extend_from_slice(format!("Authorization: Bearer {token}\r\n").as_bytes());
-    } else if let Some(user) = &context.transfer.user
+    } else if context.sensitive_headers_allowed
+        && let Some(user) = &context.transfer.user
         && context.transfer.oauth2_bearer.is_none()
         && !has_header("authorization")
     {
@@ -8249,6 +8386,9 @@ fn raw_http_direct_request(context: &RawHttpDirectContext<'_>) -> Result<Vec<u8>
         request.extend_from_slice(format!("Content-Length: {}\r\n", body.len()).as_bytes());
     }
     for (name, value) in parsed_headers {
+        if !context.sensitive_headers_allowed && is_redirect_sensitive_header(name.as_str()) {
+            continue;
+        }
         if let Some(value) = value {
             append_raw_header(&mut request, &name, &value);
         }
@@ -8430,6 +8570,8 @@ async fn raw_http_read_response(
     let resume_action = http_resume_action(method, resume_from, status, &headers)?;
     let body = if method == Method::HEAD || resume_action == HttpResumeAction::AlreadyComplete {
         Vec::new()
+    } else if raw_http_response_is_chunked(&headers) {
+        raw_http_read_chunked_body(stream).await?
     } else if let Some(length) = headers
         .get(CONTENT_LENGTH)
         .and_then(|value| value.to_str().ok())
@@ -8455,6 +8597,65 @@ async fn raw_http_read_response(
         retry_after,
         resume_from,
     })
+}
+
+fn raw_http_response_is_chunked(headers: &HeaderMap) -> bool {
+    headers.get_all(TRANSFER_ENCODING).iter().any(|value| {
+        value.to_str().ok().is_some_and(|value| {
+            value
+                .split(',')
+                .any(|coding| coding.trim().eq_ignore_ascii_case("chunked"))
+        })
+    })
+}
+
+async fn raw_http_read_chunked_body(stream: &mut TcpStream) -> Result<Vec<u8>> {
+    let mut body = Vec::new();
+    loop {
+        let line = raw_http_read_line(stream).await?;
+        let size_text = line
+            .trim_end_matches(['\r', '\n'])
+            .split_once(';')
+            .map_or(line.trim_end_matches(['\r', '\n']), |(size, _)| size)
+            .trim();
+        let size = usize::from_str_radix(size_text, 16).map_err(|_| CurlError::WeirdServerReply)?;
+        if size == 0 {
+            loop {
+                let trailer = raw_http_read_line(stream).await?;
+                if trailer == "\r\n" || trailer == "\n" || trailer.trim().is_empty() {
+                    return Ok(body);
+                }
+            }
+        }
+
+        let mut chunk = vec![0_u8; size];
+        stream.read_exact(&mut chunk).await.map_err(tcp_io_error)?;
+        body.extend_from_slice(&chunk);
+
+        let mut terminator = [0_u8; 2];
+        stream
+            .read_exact(&mut terminator)
+            .await
+            .map_err(tcp_io_error)?;
+        if terminator != *b"\r\n" {
+            return Err(CurlError::WeirdServerReply);
+        }
+    }
+}
+
+async fn raw_http_read_line(stream: &mut TcpStream) -> Result<String> {
+    let mut line = Vec::new();
+    let mut byte = [0_u8; 1];
+    loop {
+        stream.read_exact(&mut byte).await.map_err(tcp_io_error)?;
+        line.push(byte[0]);
+        if byte[0] == b'\n' {
+            return String::from_utf8(line).map_err(|_| CurlError::WeirdServerReply);
+        }
+        if line.len() > 16 * 1024 {
+            return Err(CurlError::WeirdServerReply);
+        }
+    }
 }
 
 fn raw_http_header_prefix_possible(bytes: &[u8]) -> bool {

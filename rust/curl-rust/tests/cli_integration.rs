@@ -383,6 +383,68 @@ fn spawn_sequence_server_bytes(responses: Vec<Vec<u8>>) -> (String, Receiver<Req
     (format!("http://{addr}/resource"), rx)
 }
 
+fn spawn_request_target_https_redirect_server() -> (String, Receiver<RequestRecord>) {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = listener.local_addr().unwrap();
+    let (tx, rx) = mpsc::channel();
+
+    thread::spawn(move || {
+        let (mut stream, _) = listener.accept().unwrap();
+        tx.send(read_request(&mut stream)).unwrap();
+        let response = format!(
+            "HTTP/1.1 302 Found\r\nLocation: https://{addr}/next\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+        );
+        stream.write_all(response.as_bytes()).unwrap();
+
+        listener.set_nonblocking(true).unwrap();
+        let deadline = Instant::now() + Duration::from_millis(250);
+        while Instant::now() < deadline {
+            match listener.accept() {
+                Ok((mut stream, _)) => {
+                    tx.send(read_request(&mut stream)).unwrap();
+                    stream
+                        .write_all(
+                            b"HTTP/1.1 200 OK\r\nContent-Length: 3\r\nConnection: close\r\n\r\nbad",
+                        )
+                        .unwrap();
+                    break;
+                }
+                Err(error) if error.kind() == ErrorKind::WouldBlock => {
+                    thread::sleep(Duration::from_millis(10));
+                }
+                Err(_) => break,
+            }
+        }
+    });
+
+    (format!("http://{addr}/resource"), rx)
+}
+
+fn spawn_request_target_chunked_redirect_server() -> (String, Receiver<RequestRecord>) {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = listener.local_addr().unwrap();
+    let (tx, rx) = mpsc::channel();
+
+    thread::spawn(move || {
+        let (mut first, _) = listener.accept().unwrap();
+        tx.send(read_request(&mut first)).unwrap();
+        first
+            .write_all(
+                b"HTTP/1.1 302 Found\r\nLocation: /next\r\nTransfer-Encoding: chunked\r\nConnection: keep-alive\r\n\r\n0\r\n\r\n",
+            )
+            .unwrap();
+
+        let (mut second, _) = listener.accept().unwrap();
+        tx.send(read_request(&mut second)).unwrap();
+        second
+            .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok")
+            .unwrap();
+        let _ = first.shutdown(Shutdown::Both);
+    });
+
+    (format!("http://{addr}/resource"), rx)
+}
+
 fn spawn_dual_family_server() -> Option<DualFamilyServer> {
     let ipv6 = TcpListener::bind("[::1]:0").ok()?;
     let port = ipv6.local_addr().ok()?.port();
@@ -2590,6 +2652,75 @@ fn request_target_sets_direct_http_request_line() {
     assert_eq!(request.start_line, "OPTIONS * HTTP/1.1");
     assert!(header(&request, "user-agent").unwrap().starts_with("curl/"));
     assert_eq!(header(&request, "accept"), Some("*/*"));
+}
+
+#[test]
+fn request_target_location_follows_redirect_with_same_target() {
+    let (url, rx) = spawn_sequence_server(vec![
+        b"HTTP/1.1 302 Found\r\nLocation: /next\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+        b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok",
+    ]);
+
+    let mut command = Command::cargo_bin("curl").unwrap();
+    command.args(["-q", "-sS", "-L", "--request-target", "/raw", &url]);
+    command.assert().success().stdout("ok");
+
+    let first = rx.recv().unwrap();
+    let second = rx.recv().unwrap();
+    assert_eq!(first.start_line, "GET /raw HTTP/1.1");
+    assert_eq!(second.start_line, "GET /raw HTTP/1.1");
+}
+
+#[test]
+fn request_target_location_decodes_chunked_redirect_body() {
+    let (url, rx) = spawn_request_target_chunked_redirect_server();
+
+    let mut command = Command::cargo_bin("curl").unwrap();
+    command.timeout(Duration::from_secs(2));
+    command.args(["-q", "-sS", "-L", "--request-target", "/raw", &url]);
+    command.assert().success().stdout("ok");
+
+    let first = rx.recv().unwrap();
+    let second = rx.recv().unwrap();
+    assert_eq!(first.start_line, "GET /raw HTTP/1.1");
+    assert_eq!(second.start_line, "GET /raw HTTP/1.1");
+}
+
+#[test]
+fn request_target_location_rejects_non_http_redirect_before_plaintext_follow() {
+    let (url, rx) = spawn_request_target_https_redirect_server();
+
+    let mut command = Command::cargo_bin("curl").unwrap();
+    command.args(["-q", "-sS", "-L", "--request-target", "/raw", &url]);
+    command.assert().failure().code(2).stdout("");
+
+    let request = rx.recv().unwrap();
+    assert_eq!(request.start_line, "GET /raw HTTP/1.1");
+    assert!(rx.recv_timeout(Duration::from_millis(500)).is_err());
+}
+
+#[test]
+fn request_target_location_respects_max_redirs() {
+    let (url, rx) = spawn_sequence_server(vec![
+        b"HTTP/1.1 302 Found\r\nLocation: /next\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+    ]);
+
+    let mut command = Command::cargo_bin("curl").unwrap();
+    command.args([
+        "-q",
+        "-sS",
+        "-L",
+        "--max-redirs",
+        "0",
+        "--request-target",
+        "/raw",
+        &url,
+    ]);
+    command.assert().failure().code(47).stdout("");
+
+    let request = rx.recv().unwrap();
+    assert_eq!(request.start_line, "GET /raw HTTP/1.1");
+    assert!(rx.try_recv().is_err());
 }
 
 #[test]
