@@ -2620,6 +2620,118 @@ fn extra_output_slots_emit_warning() {
 }
 
 #[test]
+fn skip_existing_existing_output_skips_http_transfer() {
+    let temp = tempdir().unwrap();
+    let output = temp.path().join("there");
+    let trace = temp.path().join("trace");
+    std::fs::write(&output, "content").unwrap();
+    let (url, rx) = spawn_server(b"HTTP/1.1 200 OK\r\nContent-Length: 6\r\n\r\n-foo-\n");
+
+    let mut command = Command::cargo_bin("curl").unwrap();
+    command.args([
+        "-q",
+        "--trace-ascii",
+        trace.to_str().unwrap(),
+        "-sS",
+        "-o",
+        output.to_str().unwrap(),
+        "--skip-existing",
+        &url,
+    ]);
+    command.assert().success().stdout("").stderr(format!(
+        "Note: skips transfer, \"{}\" exists locally\n",
+        output.display()
+    ));
+
+    assert_eq!(std::fs::read_to_string(&output).unwrap(), "content");
+    assert!(rx.recv_timeout(Duration::from_millis(100)).is_err());
+}
+
+#[test]
+fn skip_existing_missing_output_downloads_normally() {
+    let temp = tempdir().unwrap();
+    let output = temp.path().join("there");
+    let (url, rx) = spawn_server(b"HTTP/1.1 200 OK\r\nContent-Length: 6\r\n\r\n-foo-\n");
+
+    let mut command = Command::cargo_bin("curl").unwrap();
+    command.args([
+        "-q",
+        "-sS",
+        "-o",
+        output.to_str().unwrap(),
+        "--skip-existing",
+        &url,
+    ]);
+    command.assert().success().stdout("").stderr("");
+
+    assert_eq!(std::fs::read_to_string(&output).unwrap(), "-foo-\n");
+    let request = rx.recv().unwrap();
+    assert_eq!(request.start_line, "GET /resource HTTP/1.1");
+}
+
+#[test]
+fn skip_existing_file_url_does_not_overwrite_self() {
+    let temp = tempdir().unwrap();
+    let path = temp.path().join("self.txt");
+    let trace = temp.path().join("trace");
+    let contents = "foo\n   bar\nbar\n";
+    std::fs::write(&path, contents).unwrap();
+    let url = Url::from_file_path(&path).unwrap().to_string();
+
+    let mut command = Command::cargo_bin("curl").unwrap();
+    command.args([
+        "-q",
+        "--trace-ascii",
+        trace.to_str().unwrap(),
+        "-sS",
+        "-o",
+        path.to_str().unwrap(),
+        "--skip-existing",
+        &url,
+    ]);
+    command.assert().success().stdout("").stderr(format!(
+        "Note: skips transfer, \"{}\" exists locally\n",
+        path.display()
+    ));
+
+    assert_eq!(std::fs::read_to_string(&path).unwrap(), contents);
+}
+
+#[test]
+fn skip_existing_globbed_outputs_skip_each_expanded_url() {
+    let temp = tempdir().unwrap();
+    let trace = temp.path().join("trace");
+    let hey = temp.path().join("hey");
+    let ho = temp.path().join("ho");
+    std::fs::write(&hey, "content").unwrap();
+    std::fs::write(&ho, "content").unwrap();
+    let (url, rx) = spawn_server(b"HTTP/1.1 200 OK\r\nContent-Length: 6\r\n\r\n-foo-\n");
+    let globbed = format!("{url}/{{hey,ho}}");
+    let output = temp.path().join("#1").display().to_string();
+
+    let mut command = Command::cargo_bin("curl").unwrap();
+    command.args([
+        "-q",
+        "--trace-ascii",
+        trace.to_str().unwrap(),
+        "-sS",
+        "-o",
+        &output,
+        "--skip-existing",
+        &globbed,
+    ]);
+    command.assert().success().stdout("").stderr(format!(
+        "Note: skips transfer, \"{}\" exists locally\nNote: skips transfer, \"{}\" exists locally\n",
+        hey.display(),
+        ho.display()
+    ));
+
+    assert_eq!(std::fs::read_to_string(&hey).unwrap(), "content");
+    assert_eq!(std::fs::read_to_string(&ho).unwrap(), "content");
+    assert!(rx.recv_timeout(Duration::from_millis(100)).is_err());
+}
+
+#[test]
 fn duplicate_location_headers_accept_exact_repeat() {
     let (url, rx) = spawn_server(
         b"HTTP/1.1 200 OK\r\nLocation: this\r\nLocation: this\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok",

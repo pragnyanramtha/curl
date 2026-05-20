@@ -75,6 +75,7 @@ pub struct TransferConfig {
     pub remote_name: bool,
     pub remote_name_all: bool,
     pub remote_header_name: bool,
+    pub skip_existing: bool,
     pub dump_header: Option<PathBuf>,
     pub etag_compare: Option<PathBuf>,
     pub etag_save: Option<PathBuf>,
@@ -125,6 +126,7 @@ pub struct TransferConfig {
     pub compressed: bool,
     pub tr_encoding: bool,
     pub raw: bool,
+    pub trace_output: bool,
     pub verbose: bool,
     pub silent: bool,
     pub show_error: bool,
@@ -475,6 +477,7 @@ impl Default for TransferConfig {
             remote_name: false,
             remote_name_all: false,
             remote_header_name: false,
+            skip_existing: false,
             dump_header: None,
             etag_compare: None,
             etag_save: None,
@@ -525,6 +528,7 @@ impl Default for TransferConfig {
             compressed: false,
             tr_encoding: false,
             raw: false,
+            trace_output: false,
             verbose: false,
             silent: false,
             show_error: false,
@@ -855,6 +859,7 @@ impl Parser {
             }
             "remote-name" => self.set_output_remote_name(),
             "remote-header-name" => self.current().remote_header_name = true,
+            "skip-existing" => self.current().skip_existing = true,
             "dump-header" => {
                 let value = self.value_for(name, inline_value)?;
                 self.current().dump_header = Some(PathBuf::from(value));
@@ -1003,6 +1008,7 @@ impl Parser {
             "verbose" => self.current().verbose = true,
             "trace" | "trace-ascii" => {
                 let _ = self.value_for(name, inline_value)?;
+                self.current().trace_output = true;
             }
             "trace-time" => {
                 if inline_value.is_some() {
@@ -1063,6 +1069,7 @@ impl Parser {
             "remote-name" => self.set_output_default_if_remote_name_all(),
             "remote-name-all" => self.current().remote_name_all = false,
             "remote-header-name" => self.current().remote_header_name = false,
+            "skip-existing" => self.current().skip_existing = false,
             "location" => self.current().follow_location = false,
             "location-trusted" => {
                 let transfer = self.current();
@@ -1701,6 +1708,7 @@ impl TransferConfig {
             || self.remote_name
             || self.remote_name_all
             || self.remote_header_name
+            || self.skip_existing
             || self.dump_header.is_some()
             || self.etag_compare.is_some()
             || self.etag_save.is_some()
@@ -1750,6 +1758,7 @@ impl TransferConfig {
             || self.compressed
             || self.tr_encoding
             || self.raw
+            || self.trace_output
             || self.verbose
             || self.silent
             || self.show_error
@@ -2538,6 +2547,7 @@ fn print_common_help() {
                --out-null              Discard response data\n\
            -O, --remote-name           Write output to remote filename\n\
                --remote-name-all       Use remote filename for all URLs\n\
+               --skip-existing         Skip output paths that already exist\n\
                --etag-compare <file>   Load ETag from file\n\
                --etag-save <file>      Save response ETag to file\n\
            -z, --time-cond <time>      Transfer based on time condition\n\
@@ -3016,6 +3026,21 @@ mod tests {
     }
 
     #[test]
+    fn parses_skip_existing_boolean_option() {
+        let config = parse_args(["-q", "--skip-existing=0", "https://example.com"]).unwrap();
+        assert!(config.transfers[0].skip_existing);
+
+        let config = parse_args([
+            "-q",
+            "--skip-existing",
+            "--no-skip-existing=1",
+            "https://example.com",
+        ])
+        .unwrap();
+        assert!(!config.transfers[0].skip_existing);
+    }
+
+    #[test]
     fn parses_location_trusted_separately_from_location() {
         let config = parse_args(["-q", "--location-trusted", "https://example.com"]).unwrap();
         assert!(config.transfers[0].follow_location);
@@ -3234,6 +3259,7 @@ mod tests {
 
         let transfer = &config.transfers[0];
         assert_eq!(transfer.urls, ["file:///tmp/input"]);
+        assert!(transfer.trace_output);
     }
 
     #[test]

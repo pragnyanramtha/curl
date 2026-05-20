@@ -711,6 +711,19 @@ async fn run_expanded_url(
         cookie_jar.allow_explicit_cookie_for_url(&url, transfer.location_trusted);
     }
 
+    if let Some(path) = skip_existing_output_path(transfer, &expanded)? {
+        if transfer.verbose || transfer.trace_output {
+            eprintln!(
+                "Note: skips transfer, \"{}\" exists locally",
+                path.display()
+            );
+        }
+        metrics.filename_effective = Some(path.display().to_string());
+        metrics.time_total = started.elapsed();
+        write_writeout(transfer, &metrics)?;
+        return Ok(0);
+    }
+
     let userinfo_check = if transfer.disallow_username_in_url {
         reject_url_userinfo(&expanded.url)
     } else {
@@ -835,6 +848,25 @@ async fn run_expanded_url(
             Ok(metrics.exit_code)
         }
     }
+}
+
+fn skip_existing_output_path(
+    transfer: &TransferConfig,
+    expanded: &glob::ExpandedUrl,
+) -> Result<Option<PathBuf>> {
+    if !transfer.skip_existing || transfer.out_null || transfer.remote_header_name {
+        return Ok(None);
+    }
+
+    let Ok(url) = Url::parse(&expanded.url) else {
+        return Ok(None);
+    };
+    let headers = HeaderMap::new();
+    let Some(path) = output::output_path(transfer, &url, &headers, &expanded.variables)? else {
+        return Ok(None);
+    };
+
+    Ok(path.exists().then_some(path))
 }
 
 async fn run_file_transfer(
