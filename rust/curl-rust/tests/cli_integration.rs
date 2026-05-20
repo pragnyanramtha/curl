@@ -738,7 +738,12 @@ fn spawn_ftp_server_with_listener(
                 stream
                     .write_all(format!("350 Restarting at {restart_offset}\r\n").as_bytes())
                     .unwrap();
-            } else if command.starts_with("RETR ") || command == "LIST" || command == "NLST" {
+            } else if command.starts_with("RETR ")
+                || command == "LIST"
+                || command.starts_with("LIST ")
+                || command == "NLST"
+                || command.starts_with("NLST ")
+            {
                 if options.retr_denied {
                     stream.write_all(b"550 File unavailable\r\n").unwrap();
                     continue;
@@ -4821,6 +4826,127 @@ fn ftp_retr_downloads_file_and_sends_default_sequence() {
         b"USER anonymous\r\nPASS ftp@example.com\r\nPWD\r\nCWD path\r\nEPSV\r\nTYPE I\r\nSIZE file.txt\r\nRETR file.txt\r\nQUIT\r\n"
     );
     assert_eq!(record.data_connections, 1);
+}
+
+#[test]
+fn ftp_method_multicwd_cwds_each_directory() {
+    let (url, rx) = spawn_ftp_server("/first/second/third/296", ftp_options(b"multi"));
+
+    let mut command = Command::cargo_bin("curl").unwrap();
+    command.args(["-q", "-sS", "--ftp-method", "multicwd", &url]);
+    command.assert().success().stdout("multi");
+
+    let record = rx.recv().unwrap();
+    assert_eq!(
+        record.commands,
+        b"USER anonymous\r\nPASS ftp@example.com\r\nPWD\r\nCWD first\r\nCWD second\r\nCWD third\r\nEPSV\r\nTYPE I\r\nSIZE 296\r\nRETR 296\r\nQUIT\r\n"
+    );
+}
+
+#[test]
+fn ftp_method_singlecwd_cwds_full_directory_once() {
+    let (url, rx) = spawn_ftp_server("/first/second/third/297", ftp_options(b"single"));
+
+    let mut command = Command::cargo_bin("curl").unwrap();
+    command.args(["-q", "-sS", "--ftp-method", "singlecwd", &url]);
+    command.assert().success().stdout("single");
+
+    let record = rx.recv().unwrap();
+    assert_eq!(
+        record.commands,
+        b"USER anonymous\r\nPASS ftp@example.com\r\nPWD\r\nCWD first/second/third\r\nEPSV\r\nTYPE I\r\nSIZE 297\r\nRETR 297\r\nQUIT\r\n"
+    );
+}
+
+#[test]
+fn ftp_method_nocwd_uses_full_file_path() {
+    let (url, rx) = spawn_ftp_server("/first/second/th%69rd/298", ftp_options(b"nocwd"));
+
+    let mut command = Command::cargo_bin("curl").unwrap();
+    command.args(["-q", "-sS", "--ftp-method", "nocwd", &url]);
+    command.assert().success().stdout("nocwd");
+
+    let record = rx.recv().unwrap();
+    assert_eq!(
+        record.commands,
+        b"USER anonymous\r\nPASS ftp@example.com\r\nPWD\r\nEPSV\r\nTYPE I\r\nSIZE first/second/third/298\r\nRETR first/second/third/298\r\nQUIT\r\n"
+    );
+}
+
+#[test]
+fn ftp_method_nocwd_lists_decoded_directory_argument() {
+    let (url, rx) = spawn_ftp_server("/fir%23t/th%69rd/244/", ftp_options(b"listing"));
+
+    let mut command = Command::cargo_bin("curl").unwrap();
+    command.args(["-q", "-sS", "--ftp-method", "nocwd", &url]);
+    command.assert().success().stdout("listing");
+
+    let record = rx.recv().unwrap();
+    assert_eq!(
+        record.commands,
+        b"USER anonymous\r\nPASS ftp@example.com\r\nPWD\r\nEPSV\r\nTYPE A\r\nLIST fir#t/third/244\r\nQUIT\r\n"
+    );
+}
+
+#[test]
+fn ftp_method_root_directory_listing_modes() {
+    let (url, rx) = spawn_ftp_server("//", ftp_options(b"multi root"));
+
+    let mut command = Command::cargo_bin("curl").unwrap();
+    command.args(["-q", "-sS", "--ftp-method", "multicwd", &url]);
+    command.assert().success().stdout("multi root");
+
+    assert_eq!(
+        rx.recv().unwrap().commands,
+        b"USER anonymous\r\nPASS ftp@example.com\r\nPWD\r\nCWD /\r\nEPSV\r\nTYPE A\r\nLIST\r\nQUIT\r\n"
+    );
+
+    let (url, rx) = spawn_ftp_server("//", ftp_options(b"single root"));
+
+    let mut command = Command::cargo_bin("curl").unwrap();
+    command.args(["-q", "-sS", "--ftp-method", "singlecwd", &url]);
+    command.assert().success().stdout("single root");
+
+    assert_eq!(
+        rx.recv().unwrap().commands,
+        b"USER anonymous\r\nPASS ftp@example.com\r\nPWD\r\nCWD /\r\nEPSV\r\nTYPE A\r\nLIST\r\nQUIT\r\n"
+    );
+
+    let (url, rx) = spawn_ftp_server("//", ftp_options(b"nocwd root"));
+
+    let mut command = Command::cargo_bin("curl").unwrap();
+    command.args(["-q", "-sS", "--ftp-method", "nocwd", &url]);
+    command.assert().success().stdout("nocwd root");
+
+    assert_eq!(
+        rx.recv().unwrap().commands,
+        b"USER anonymous\r\nPASS ftp@example.com\r\nPWD\r\nEPSV\r\nTYPE A\r\nLIST /\r\nQUIT\r\n"
+    );
+}
+
+#[test]
+fn ftp_method_root_file_modes() {
+    let (url, rx) = spawn_ftp_server("//1226", ftp_options(b"single root file"));
+
+    let mut command = Command::cargo_bin("curl").unwrap();
+    command.args(["-q", "-sS", "--ftp-method", "singlecwd", &url]);
+    command.assert().success().stdout("single root file");
+
+    assert_eq!(
+        rx.recv().unwrap().commands,
+        b"USER anonymous\r\nPASS ftp@example.com\r\nPWD\r\nCWD /\r\nEPSV\r\nTYPE I\r\nSIZE 1226\r\nRETR 1226\r\nQUIT\r\n"
+    );
+
+    let (url, rx) = spawn_ftp_server("//1227", ftp_options(b"nocwd root file"));
+
+    let mut command = Command::cargo_bin("curl").unwrap();
+    command.args(["-q", "-sS", "--ftp-method", "nocwd", &url]);
+    command.assert().success().stdout("nocwd root file");
+
+    assert_eq!(
+        rx.recv().unwrap().commands,
+        b"USER anonymous\r\nPASS ftp@example.com\r\nPWD\r\nEPSV\r\nTYPE I\r\nSIZE /1227\r\nRETR /1227\r\nQUIT\r\n"
+    );
 }
 
 #[test]
@@ -11202,6 +11328,32 @@ fn libcurl_writes_ftp_passive_options() {
     let text = std::fs::read_to_string(source).unwrap();
     assert!(text.contains("CURLOPT_FTP_USE_EPSV, 0L"));
     assert!(text.contains("CURLOPT_FTP_SKIP_PASV_IP, 1L"));
+}
+
+#[test]
+fn libcurl_writes_ftp_file_method_option() {
+    let temp = tempdir().unwrap();
+    let source = temp.path().join("ftp-method-client.c");
+    let (url, rx) = spawn_ftp_server("/first/second/file.txt", ftp_options(b"method"));
+
+    let mut command = Command::cargo_bin("curl").unwrap();
+    command.args([
+        "-q",
+        "-sS",
+        "--libcurl",
+        source.to_str().unwrap(),
+        "--ftp-method",
+        "singlecwd",
+        &url,
+    ]);
+    command.assert().success().stdout("method");
+
+    assert_eq!(
+        rx.recv().unwrap().commands,
+        b"USER anonymous\r\nPASS ftp@example.com\r\nPWD\r\nCWD first/second\r\nEPSV\r\nTYPE I\r\nSIZE file.txt\r\nRETR file.txt\r\nQUIT\r\n"
+    );
+    let text = std::fs::read_to_string(source).unwrap();
+    assert!(text.contains("CURLOPT_FTP_FILEMETHOD, 3L"));
 }
 
 #[test]

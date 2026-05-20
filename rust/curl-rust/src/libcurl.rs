@@ -6,8 +6,8 @@ use std::time::Duration;
 use url::Url;
 
 use crate::cli::{
-    Config, ContinueAt, HttpVersionPreference, IpVersionPreference, SslVersionMaxPreference,
-    SslVersionPreference, TransferConfig,
+    Config, ContinueAt, FtpFileMethod, HttpVersionPreference, IpVersionPreference,
+    SslVersionMaxPreference, SslVersionPreference, TransferConfig,
 };
 use crate::data::{self, PreparedBody};
 use crate::error::{CurlError, Result};
@@ -275,6 +275,9 @@ fn write_request(out: &mut String, render: &RenderTransfer<'_>, url: &str) -> Re
             "CURLOPT_FTP_CREATE_MISSING_DIRS",
             "CURLFTP_CREATE_DIR_RETRY",
         );
+    }
+    if let Some(method) = transfer.ftp_file_method {
+        emit_long_setopt(out, "CURLOPT_FTP_FILEMETHOD", ftp_file_method_value(method));
     }
     if transfer.ftp_disable_epsv {
         emit_long_setopt(out, "CURLOPT_FTP_USE_EPSV", 0);
@@ -738,6 +741,14 @@ fn emit_ip_version(out: &mut String, version: IpVersionPreference) {
         IpVersionPreference::Ipv6 => "CURL_IPRESOLVE_V6",
     };
     emit_raw_setopt(out, "CURLOPT_IPRESOLVE", value);
+}
+
+fn ftp_file_method_value(method: FtpFileMethod) -> i64 {
+    match method {
+        FtpFileMethod::MultiCwd => 1,
+        FtpFileMethod::NoCwd => 2,
+        FtpFileMethod::SingleCwd => 3,
+    }
 }
 
 fn postredir_bitmask(transfer: &TransferConfig) -> i64 {

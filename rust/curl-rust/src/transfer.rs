@@ -25,8 +25,8 @@ use reqwest::header::{
 use reqwest::{Client, Method, StatusCode, Url, Version};
 
 use crate::cli::{
-    Config, ContinueAt, HttpVersionPreference, IpVersionPreference, LocalPortRange, OutputTarget,
-    SslVersionMaxPreference, SslVersionPreference, TransferConfig,
+    Config, ContinueAt, FtpFileMethod, HttpVersionPreference, IpVersionPreference, LocalPortRange,
+    OutputTarget, SslVersionMaxPreference, SslVersionPreference, TransferConfig,
 };
 use crate::cookie::CookieJar;
 use crate::data::{self, PreparedBody};
@@ -1069,7 +1069,10 @@ async fn run_ftp_exchange(
         .host_str()
         .ok_or_else(|| CurlError::Url("FTP URL is missing a host".to_string()))?;
     let port = url.port().unwrap_or(FTP_DEFAULT_PORT);
-    let path = ftp_path(&url)?;
+    let path = ftp_path(
+        &url,
+        transfer.ftp_file_method.unwrap_or(FtpFileMethod::MultiCwd),
+    )?;
     let ftp_list_only = ftp_effective_list_only(transfer, &path);
     let ftp_ascii = ftp_effective_ascii(transfer, &path);
     if transfer.range.is_some()
@@ -1288,7 +1291,14 @@ async fn run_ftp_exchange(
 struct FtpPath {
     directories: Vec<Vec<u8>>,
     file: Option<Vec<u8>>,
+    list_argument: Option<Vec<u8>>,
     url_type: Option<FtpUrlType>,
+}
+
+struct FtpPathParts {
+    directories: Vec<Vec<u8>>,
+    file: Option<Vec<u8>>,
+    list_argument: Option<Vec<u8>>,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -1756,14 +1766,25 @@ async fn ftp_set_type(
 
 fn ftp_transfer_command(path: &FtpPath, list_only: bool) -> Vec<u8> {
     if list_only {
-        Vec::from(&b"NLST"[..])
+        ftp_list_command(b"NLST", path.list_argument.as_deref())
     } else if let Some(file) = &path.file {
         let mut command = Vec::from(&b"RETR "[..]);
         command.extend_from_slice(file);
         command
     } else {
-        Vec::from(&b"LIST"[..])
+        ftp_list_command(b"LIST", path.list_argument.as_deref())
     }
+}
+
+fn ftp_list_command(command: &[u8], argument: Option<&[u8]>) -> Vec<u8> {
+    let Some(argument) = argument else {
+        return command.to_vec();
+    };
+    let mut result = Vec::with_capacity(command.len() + 1 + argument.len());
+    result.extend_from_slice(command);
+    result.push(b' ');
+    result.extend_from_slice(argument);
+    result
 }
 
 fn ftp_effective_list_only(transfer: &TransferConfig, path: &FtpPath) -> bool {
@@ -1951,7 +1972,7 @@ fn ftp_parse_pasv_numbers(bytes: &[u8]) -> Option<[u8; 6]> {
     Some(numbers)
 }
 
-fn ftp_path(url: &Url) -> Result<FtpPath> {
+fn ftp_path(url: &Url, method: FtpFileMethod) -> Result<FtpPath> {
     let encoded = url.path().strip_prefix('/').unwrap_or(url.path());
     let (encoded, url_type) = ftp_strip_url_type(encoded);
     let decoded = percent_decode(encoded.as_bytes()).collect::<Vec<_>>();
@@ -1961,26 +1982,91 @@ fn ftp_path(url: &Url) -> Result<FtpPath> {
         ));
     }
 
-    let (directory_bytes, file) = if decoded.is_empty() || decoded.ends_with(b"/") {
-        let directory = decoded.strip_suffix(b"/").unwrap_or(&decoded);
-        (directory, None)
-    } else if let Some(slash) = decoded.iter().rposition(|byte| *byte == b'/') {
-        let file = decoded[slash + 1..].to_vec();
-        let directory = if slash == 0 && decoded.starts_with(b"/") {
-            &decoded[..1]
-        } else {
-            &decoded[..slash]
-        };
-        (directory, Some(file))
-    } else {
-        (&[][..], Some(decoded.clone()))
+    let parts = match method {
+        FtpFileMethod::MultiCwd => ftp_multicwd_path(&decoded),
+        FtpFileMethod::SingleCwd => ftp_singlecwd_path(&decoded),
+        FtpFileMethod::NoCwd => ftp_nocwd_path(&decoded),
     };
 
     Ok(FtpPath {
-        directories: ftp_directory_components(directory_bytes),
-        file,
+        directories: parts.directories,
+        file: parts.file,
+        list_argument: parts.list_argument,
         url_type,
     })
+}
+
+fn ftp_multicwd_path(path: &[u8]) -> FtpPathParts {
+    if path.is_empty() || path.ends_with(b"/") {
+        let directory = ftp_directory_path(path);
+        return FtpPathParts {
+            directories: ftp_directory_components(directory),
+            file: None,
+            list_argument: None,
+        };
+    }
+
+    if let Some(slash) = path.iter().rposition(|byte| *byte == b'/') {
+        let file = path[slash + 1..].to_vec();
+        let directory = if slash == 0 && path.starts_with(b"/") {
+            &path[..1]
+        } else {
+            &path[..slash]
+        };
+        FtpPathParts {
+            directories: ftp_directory_components(directory),
+            file: Some(file),
+            list_argument: None,
+        }
+    } else {
+        FtpPathParts {
+            directories: Vec::new(),
+            file: Some(path.to_vec()),
+            list_argument: None,
+        }
+    }
+}
+
+fn ftp_singlecwd_path(path: &[u8]) -> FtpPathParts {
+    if let Some(slash) = path.iter().rposition(|byte| *byte == b'/') {
+        let directory_len = if slash == 0 { 1 } else { slash };
+        let directory = &path[..directory_len];
+        let file = (!path[slash + 1..].is_empty()).then(|| path[slash + 1..].to_vec());
+        FtpPathParts {
+            directories: vec![directory.to_vec()],
+            file,
+            list_argument: None,
+        }
+    } else {
+        let file = (!path.is_empty()).then(|| path.to_vec());
+        FtpPathParts {
+            directories: Vec::new(),
+            file,
+            list_argument: None,
+        }
+    }
+}
+
+fn ftp_nocwd_path(path: &[u8]) -> FtpPathParts {
+    FtpPathParts {
+        directories: Vec::new(),
+        file: (!path.is_empty() && !path.ends_with(b"/")).then(|| path.to_vec()),
+        list_argument: ftp_nocwd_list_argument(path),
+    }
+}
+
+fn ftp_directory_path(path: &[u8]) -> &[u8] {
+    if path == b"/" {
+        path
+    } else {
+        path.strip_suffix(b"/").unwrap_or(path)
+    }
+}
+
+fn ftp_nocwd_list_argument(path: &[u8]) -> Option<Vec<u8>> {
+    let slash = path.iter().rposition(|byte| *byte == b'/')?;
+    let length = if slash == 0 { 1 } else { slash };
+    Some(path[..length].to_vec())
 }
 
 fn ftp_strip_url_type(path: &str) -> (&str, Option<FtpUrlType>) {

@@ -41,6 +41,7 @@ pub struct TransferConfig {
     pub use_ascii: bool,
     pub ftp_append: bool,
     pub ftp_create_dirs: bool,
+    pub ftp_file_method: Option<FtpFileMethod>,
     pub ftp_disable_epsv: bool,
     pub ftp_skip_pasv_ip: Option<bool>,
     pub ftp_quote: Vec<String>,
@@ -151,6 +152,13 @@ impl LocalPortRange {
 pub enum ContinueAt {
     Offset(u64),
     Auto,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FtpFileMethod {
+    MultiCwd,
+    NoCwd,
+    SingleCwd,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -432,6 +440,7 @@ impl Default for TransferConfig {
             use_ascii: false,
             ftp_append: false,
             ftp_create_dirs: false,
+            ftp_file_method: None,
             ftp_disable_epsv: false,
             ftp_skip_pasv_ip: None,
             ftp_quote: Vec::new(),
@@ -696,6 +705,10 @@ impl Parser {
             "use-ascii" => self.current().use_ascii = true,
             "append" => self.current().ftp_append = true,
             "ftp-create-dirs" => self.current().ftp_create_dirs = true,
+            "ftp-method" => {
+                let value = self.value_for(name, inline_value)?;
+                self.current().ftp_file_method = Some(parse_ftp_file_method(&value));
+            }
             "disable-epsv" => self.current().ftp_disable_epsv = true,
             "epsv" => self.current().ftp_disable_epsv = false,
             "ftp-pasv" => {}
@@ -1655,6 +1668,7 @@ impl TransferConfig {
             || self.use_ascii
             || self.ftp_append
             || self.ftp_create_dirs
+            || self.ftp_file_method.is_some()
             || self.ftp_disable_epsv
             || self.ftp_skip_pasv_ip.is_some()
             || !self.ftp_quote.is_empty()
@@ -1788,6 +1802,7 @@ fn option_takes_value(name: &str) -> bool {
             | "upload-file"
             | "mail-from"
             | "mail-rcpt"
+            | "ftp-method"
             | "key"
             | "pubkey"
             | "knownhosts"
@@ -2238,6 +2253,19 @@ fn parse_range_value(name: &str, value: String) -> Result<String> {
     Ok(value)
 }
 
+fn parse_ftp_file_method(value: &str) -> FtpFileMethod {
+    if value.eq_ignore_ascii_case("multicwd") {
+        FtpFileMethod::MultiCwd
+    } else if value.eq_ignore_ascii_case("nocwd") {
+        FtpFileMethod::NoCwd
+    } else if value.eq_ignore_ascii_case("singlecwd") {
+        FtpFileMethod::SingleCwd
+    } else {
+        eprintln!("Warning: unrecognized ftp file method '{value}', using default");
+        FtpFileMethod::MultiCwd
+    }
+}
+
 fn parse_tftp_blksize(name: &str, value: &str) -> Result<u16> {
     const MIN_BLKSIZE: u64 = 8;
     const MAX_BLKSIZE: u64 = 65_464;
@@ -2477,6 +2505,7 @@ fn print_common_help() {
                --pubkey <file>         SSH public key file\n\
                --knownhosts <file>     SSH known_hosts file\n\
                --compressed-ssh        Enable SSH compression\n\
+               --ftp-method <method>   Set FTP CWD method\n\
                --tftp-blksize <value>  Set TFTP BLKSIZE option\n\
                --tftp-no-options       Do not send TFTP options\n\
           -B, --use-ascii             Use ASCII/text transfer\n\
@@ -3283,6 +3312,35 @@ mod tests {
         ])
         .unwrap();
         assert!(!config.transfers[0].ftp_create_dirs);
+    }
+
+    #[test]
+    fn parses_ftp_method_option() {
+        let config =
+            parse_args(["-q", "--ftp-method", "singlecwd", "ftp://example.com/file"]).unwrap();
+        assert_eq!(
+            config.transfers[0].ftp_file_method,
+            Some(FtpFileMethod::SingleCwd)
+        );
+
+        let config = parse_args(["-q", "--ftp-method=nocwd", "ftp://example.com/file"]).unwrap();
+        assert_eq!(
+            config.transfers[0].ftp_file_method,
+            Some(FtpFileMethod::NoCwd)
+        );
+
+        let config =
+            parse_args(["-q", "--ftp-method", "MULTICWD", "ftp://example.com/file"]).unwrap();
+        assert_eq!(
+            config.transfers[0].ftp_file_method,
+            Some(FtpFileMethod::MultiCwd)
+        );
+
+        let config = parse_args(["-q", "--ftp-method", "bogus", "ftp://example.com/file"]).unwrap();
+        assert_eq!(
+            config.transfers[0].ftp_file_method,
+            Some(FtpFileMethod::MultiCwd)
+        );
     }
 
     #[test]
