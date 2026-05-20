@@ -41,6 +41,8 @@ const TELNET_WILL: u8 = 251;
 const TELNET_SB: u8 = 250;
 const TELNET_SE: u8 = 240;
 const TFTP_DEFAULT_BLKSIZE: u16 = 512;
+const TFTP_MIN_BLKSIZE: usize = 8;
+const TFTP_MAX_BLKSIZE: usize = 65_464;
 const TFTP_MAX_PACKET_SIZE: usize = 65_468;
 const FTP_DEFAULT_PORT: u16 = 21;
 const IMAP_DEFAULT_PORT: u16 = 143;
@@ -3761,7 +3763,7 @@ async fn run_tftp_exchange(
             }
             5 => return Err(tftp_error_response(received)),
             6 => {
-                block_size = tftp_oack_blksize(received).unwrap_or(block_size);
+                block_size = tftp_oack_blksize(received, requested_blksize, false)?;
                 let ack = tftp_ack_packet(0);
                 socket.send_to(&ack, addr).await.map_err(tcp_io_error)?;
             }
@@ -3858,7 +3860,7 @@ async fn run_tftp_upload(socket: &UdpSocket, body: &[u8], requested_blksize: u16
                 if last_sent_block.is_some() {
                     return Err(CurlError::TftpIllegal);
                 }
-                block_size = tftp_oack_blksize(received).unwrap_or(block_size);
+                block_size = tftp_oack_blksize(received, requested_blksize, true)?;
                 let (data_packet, block, data_len) =
                     tftp_next_data_packet(body, block_size, &mut offset, &mut next_block);
                 socket
@@ -7395,22 +7397,61 @@ fn tftp_block_number(packet: &[u8]) -> Result<u16> {
     Ok(u16::from_be_bytes([packet[2], packet[3]]))
 }
 
-fn tftp_oack_blksize(packet: &[u8]) -> Option<usize> {
-    let mut parts = packet.get(2..)?.split(|byte| *byte == 0);
-    while let Some(option) = parts.next() {
-        if option.is_empty() {
-            break;
+fn tftp_oack_blksize(packet: &[u8], requested_blksize: u16, upload: bool) -> Result<usize> {
+    let mut block_size = usize::from(TFTP_DEFAULT_BLKSIZE);
+    let mut index = 2;
+    while index < packet.len() {
+        let Some(option_end) = packet[index..].iter().position(|byte| *byte == 0) else {
+            return Err(CurlError::TftpIllegal);
+        };
+        let option = &packet[index..index + option_end];
+        index += option_end + 1;
+        if index >= packet.len() {
+            return Err(CurlError::TftpIllegal);
         }
-        let value = parts.next()?;
-        if option.eq_ignore_ascii_case(b"blksize")
-            && let Ok(text) = std::str::from_utf8(value)
-            && let Ok(blksize) = text.parse::<usize>()
-            && blksize > 0
+
+        let Some(value_end) = packet[index..].iter().position(|byte| *byte == 0) else {
+            return Err(CurlError::TftpIllegal);
+        };
+        let value = &packet[index..index + value_end];
+        index += value_end + 1;
+
+        if option.eq_ignore_ascii_case(b"blksize") {
+            let blksize = tftp_oack_number_prefix(value)?;
+            if !(TFTP_MIN_BLKSIZE..=TFTP_MAX_BLKSIZE).contains(&blksize)
+                || blksize > usize::from(requested_blksize)
+            {
+                return Err(CurlError::TftpIllegal);
+            }
+            block_size = blksize;
+        } else if option.eq_ignore_ascii_case(b"tsize")
+            && !upload
+            && let Ok(tsize) = tftp_oack_number_prefix(value)
+            && tsize == 0
         {
-            return Some(blksize);
+            return Err(CurlError::TftpIllegal);
         }
     }
-    None
+    Ok(block_size)
+}
+
+fn tftp_oack_number_prefix(value: &[u8]) -> Result<usize> {
+    let mut number = 0_usize;
+    let mut digits = 0_usize;
+    for byte in value {
+        if !byte.is_ascii_digit() {
+            break;
+        }
+        digits += 1;
+        number = number
+            .checked_mul(10)
+            .and_then(|number| number.checked_add(usize::from(byte - b'0')))
+            .ok_or(CurlError::TftpIllegal)?;
+    }
+    if digits == 0 {
+        return Err(CurlError::TftpIllegal);
+    }
+    Ok(number)
 }
 
 fn tftp_error_response(packet: &[u8]) -> CurlError {

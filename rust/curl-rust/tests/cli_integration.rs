@@ -1107,6 +1107,21 @@ fn tftp_oack(options: &[(&str, &str)]) -> Vec<u8> {
     packet
 }
 
+fn spawn_tftp_oack_once(oack: Vec<u8>) -> (String, Receiver<Vec<u8>>) {
+    let socket = UdpSocket::bind("127.0.0.1:0").unwrap();
+    let addr = socket.local_addr().unwrap();
+    let (tx, rx) = mpsc::channel();
+
+    thread::spawn(move || {
+        let mut buffer = vec![0; 70_000];
+        let (read, peer) = socket.recv_from(&mut buffer).unwrap();
+        tx.send(buffer[..read].to_vec()).unwrap();
+        socket.send_to(&oack, peer).unwrap();
+    });
+
+    (format!("tftp://{addr}/file.txt"), rx)
+}
+
 fn tftp_ack(block: u16) -> Vec<u8> {
     let mut packet = Vec::from(&4_u16.to_be_bytes()[..]);
     packet.extend_from_slice(&block.to_be_bytes());
@@ -5795,6 +5810,104 @@ fn tftp_exact_block_requires_final_empty_block() {
 }
 
 #[test]
+fn tftp_oack_without_blksize_falls_back_to_default_block_size() {
+    let first = vec![b'a'; 512];
+    let second = b"tail".to_vec();
+    let (url, rx) =
+        spawn_tftp_server_with_oack(vec![first, second], Some(tftp_oack(&[("tsize", "516")])));
+
+    let mut command = Command::cargo_bin("curl").unwrap();
+    command.args(["-q", "-sS", "--tftp-blksize", "1024", &url]);
+    command
+        .assert()
+        .success()
+        .stdout(format!("{}tail", "a".repeat(512)));
+
+    let record = rx.recv().unwrap();
+    assert_eq!(
+        record.acknowledgements,
+        [
+            b"\0\x04\0\0".to_vec(),
+            b"\0\x04\0\x01".to_vec(),
+            b"\0\x04\0\x02".to_vec()
+        ]
+    );
+}
+
+#[test]
+fn tftp_oack_rejects_malformed_option_pair() {
+    let mut oack = Vec::from(&6_u16.to_be_bytes()[..]);
+    oack.extend_from_slice(b"blksize\0");
+    let (url, rx) = spawn_tftp_oack_once(oack);
+
+    let mut command = Command::cargo_bin("curl").unwrap();
+    command.args(["-q", "-sS", &url]);
+    command.assert().failure().code(71).stdout("");
+
+    assert!(rx.recv().unwrap().starts_with(b"\0\x01file.txt\0octet\0"));
+}
+
+#[test]
+fn tftp_oack_rejects_block_size_larger_than_requested() {
+    let (url, rx) = spawn_tftp_oack_once(tftp_oack(&[("blksize", "16")]));
+
+    let mut command = Command::cargo_bin("curl").unwrap();
+    command.args(["-q", "-sS", "--tftp-blksize", "8", &url]);
+    command.assert().failure().code(71).stdout("");
+
+    assert!(rx.recv().unwrap().starts_with(b"\0\x01file.txt\0octet\0"));
+}
+
+#[test]
+fn tftp_oack_rejects_invalid_block_size_values() {
+    for value in ["", "abc", "0", "7", "65465"] {
+        let (url, rx) = spawn_tftp_oack_once(tftp_oack(&[("blksize", value)]));
+
+        let mut command = Command::cargo_bin("curl").unwrap();
+        command.args(["-q", "-sS", &url]);
+        command.assert().failure().code(71).stdout("");
+
+        assert!(
+            rx.recv().unwrap().starts_with(b"\0\x01file.txt\0octet\0"),
+            "request was not captured for blksize={value:?}"
+        );
+    }
+}
+
+#[test]
+fn tftp_oack_accepts_case_insensitive_numeric_prefix_block_size() {
+    let (url, rx) = spawn_tftp_server_with_oack(
+        vec![vec![b'a'; 8], b"tail".to_vec()],
+        Some(tftp_oack(&[("BLKSIZE", "0008junk")])),
+    );
+
+    let mut command = Command::cargo_bin("curl").unwrap();
+    command.args(["-q", "-sS", "--tftp-blksize", "8", &url]);
+    command.assert().success().stdout("aaaaaaaatail");
+
+    let record = rx.recv().unwrap();
+    assert_eq!(
+        record.acknowledgements,
+        [
+            b"\0\x04\0\0".to_vec(),
+            b"\0\x04\0\x01".to_vec(),
+            b"\0\x04\0\x02".to_vec()
+        ]
+    );
+}
+
+#[test]
+fn tftp_oack_rejects_zero_download_tsize() {
+    let (url, rx) = spawn_tftp_oack_once(tftp_oack(&[("tsize", "0")]));
+
+    let mut command = Command::cargo_bin("curl").unwrap();
+    command.args(["-q", "-sS", &url]);
+    command.assert().failure().code(71).stdout("");
+
+    assert!(rx.recv().unwrap().starts_with(b"\0\x01file.txt\0octet\0"));
+}
+
+#[test]
 fn tftp_no_options_sends_plain_rrq() {
     let (url, rx) = spawn_tftp_server(vec![b"plain".to_vec()]);
 
@@ -6055,6 +6168,34 @@ fn tftp_upload_oack_exact_block_sends_final_empty_block() {
     expected.extend_from_slice(b"\x00blksize\x008\x00timeout\x005\x00");
     assert_eq!(record.request, expected);
     assert_eq!(record.data_blocks, [(1, body.to_vec()), (2, Vec::new())]);
+}
+
+#[test]
+fn tftp_upload_oack_without_blksize_falls_back_to_default_block_size() {
+    let body = b"larger than eight bytes";
+    let (url, rx) = spawn_tftp_upload_server(tftp_oack(&[("tsize", "999")]), 512);
+    let temp = tempdir().unwrap();
+    let upload = temp.path().join("fallback.bin");
+    std::fs::write(&upload, body).unwrap();
+
+    let mut command = Command::cargo_bin("curl").unwrap();
+    command.args([
+        "-q",
+        "-sS",
+        "--tftp-blksize",
+        "8",
+        "-T",
+        upload.to_str().unwrap(),
+        &url,
+    ]);
+    command.assert().success().stdout("");
+
+    let record = rx.recv().unwrap();
+    let mut expected = b"\x00\x02upload.bin\x00octet\x00tsize\x00".to_vec();
+    expected.extend_from_slice(body.len().to_string().as_bytes());
+    expected.extend_from_slice(b"\x00blksize\x008\x00timeout\x005\x00");
+    assert_eq!(record.request, expected);
+    assert_eq!(record.data_blocks, [(1, body.to_vec())]);
 }
 
 #[test]
