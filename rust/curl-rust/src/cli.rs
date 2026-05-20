@@ -74,6 +74,7 @@ pub struct TransferConfig {
     pub time_cond: Option<String>,
     pub write_out: Option<String>,
     pub follow_location: bool,
+    pub location_trusted: bool,
     pub post301: bool,
     pub post302: bool,
     pub post303: bool,
@@ -212,6 +213,7 @@ impl Default for TransferConfig {
             time_cond: None,
             write_out: None,
             follow_location: false,
+            location_trusted: false,
             post301: false,
             post302: false,
             post303: false,
@@ -588,7 +590,12 @@ impl Parser {
                 let value = self.value_for(name, inline_value)?;
                 self.current().write_out = Some(self.read_write_out_value(&value)?);
             }
-            "location" | "location-trusted" => self.current().follow_location = true,
+            "location" => self.current().follow_location = true,
+            "location-trusted" => {
+                let transfer = self.current();
+                transfer.follow_location = true;
+                transfer.location_trusted = true;
+            }
             "post301" => self.current().post301 = true,
             "post302" => self.current().post302 = true,
             "post303" => self.current().post303 = true,
@@ -724,7 +731,12 @@ impl Parser {
             "parallel-immediate" => self.config.parallel_immediate = false,
             "remote-name" => self.current().remote_name = false,
             "remote-header-name" => self.current().remote_header_name = false,
-            "location" | "location-trusted" => self.current().follow_location = false,
+            "location" => self.current().follow_location = false,
+            "location-trusted" => {
+                let transfer = self.current();
+                transfer.follow_location = false;
+                transfer.location_trusted = false;
+            }
             "post301" => self.current().post301 = false,
             "post302" => self.current().post302 = false,
             "post303" => self.current().post303 = false,
@@ -1257,6 +1269,7 @@ impl TransferConfig {
             || self.time_cond.is_some()
             || self.write_out.is_some()
             || self.follow_location
+            || self.location_trusted
             || self.post301
             || self.post302
             || self.post303
@@ -2130,6 +2143,23 @@ mod tests {
         assert_eq!(transfer.data[0].value, "a=b");
         assert_eq!(transfer.output.as_deref(), Some("out.txt"));
         assert_eq!(transfer.urls, ["https://example.com"]);
+    }
+
+    #[test]
+    fn parses_location_trusted_separately_from_location() {
+        let config = parse_args(["-q", "--location-trusted", "https://example.com"]).unwrap();
+        assert!(config.transfers[0].follow_location);
+        assert!(config.transfers[0].location_trusted);
+
+        let config = parse_args([
+            "-q",
+            "--location-trusted",
+            "--no-location-trusted",
+            "https://example.com",
+        ])
+        .unwrap();
+        assert!(!config.transfers[0].follow_location);
+        assert!(!config.transfers[0].location_trusted);
     }
 
     #[test]

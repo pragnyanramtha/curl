@@ -424,6 +424,9 @@ fn write_request(out: &mut String, render: &RenderTransfer<'_>, url: &str) -> Re
     if transfer.follow_location {
         emit_long_setopt(out, "CURLOPT_FOLLOWLOCATION", 1);
     }
+    if transfer.location_trusted {
+        emit_long_setopt(out, "CURLOPT_UNRESTRICTED_AUTH", 1);
+    }
     let postredir = postredir_bitmask(transfer);
     if postredir != 0 {
         emit_long_setopt(out, "CURLOPT_POSTREDIR", postredir);
@@ -782,6 +785,23 @@ mod tests {
         let source = render_source(&config).unwrap();
 
         assert!(source.contains("CURLOPT_POSTREDIR, 5L"));
+    }
+
+    #[test]
+    fn renders_location_trusted_unrestricted_auth() {
+        let config = parse_args([
+            "-q",
+            "--libcurl",
+            "client.c",
+            "--location-trusted",
+            "https://example.com",
+        ])
+        .unwrap();
+
+        let source = render_source(&config).unwrap();
+
+        assert!(source.contains("CURLOPT_FOLLOWLOCATION, 1L"));
+        assert!(source.contains("CURLOPT_UNRESTRICTED_AUTH, 1L"));
     }
 
     #[test]

@@ -7748,6 +7748,7 @@ async fn run_http_transfer(
     } else {
         transfer.referer.clone()
     };
+    let initial_url = url.clone();
     let mut redirects = 0usize;
 
     let explicit_proxy = explicit_http_proxy(transfer)?;
@@ -7896,15 +7897,23 @@ async fn run_http_transfer(
         };
         let mut request = client.request(current_method.clone(), url.clone());
         request = apply_version(request, transfer, &url);
+        let sensitive_headers_allowed =
+            transfer.location_trusted || same_redirect_origin(&initial_url, &url);
         let applied_headers = apply_headers(
             request,
             transfer,
             request_body,
             resume_from,
             current_referer.as_deref(),
+            sensitive_headers_allowed,
         )?;
         request = applied_headers.request;
-        request = apply_auth(request, transfer, applied_headers.has_authorization);
+        request = apply_auth(
+            request,
+            transfer,
+            applied_headers.has_authorization,
+            sensitive_headers_allowed,
+        );
 
         if let Some(form) = multipart {
             request = request.multipart(form);
@@ -8983,6 +8992,7 @@ fn apply_headers(
     body: Option<&PreparedBody>,
     resume_from: u64,
     referer: Option<&str>,
+    sensitive_headers_allowed: bool,
 ) -> Result<AppliedHttpHeaders> {
     let parsed_headers = parse_headers(&transfer.headers)?;
     let has_header = |header: &str| {
@@ -9015,14 +9025,16 @@ fn apply_headers(
         );
     }
 
-    if let Some(cookie) = &transfer.cookie
+    if sensitive_headers_allowed
+        && let Some(cookie) = &transfer.cookie
         && !cookie_engine_active(transfer)
         && !has_header("cookie")
     {
         request = request.header(COOKIE, cookie);
     }
 
-    if let Some(token) = &transfer.oauth2_bearer
+    if sensitive_headers_allowed
+        && let Some(token) = &transfer.oauth2_bearer
         && !has_authorization
     {
         request = request.header(AUTHORIZATION, format!("Bearer {token}"));
@@ -9058,6 +9070,9 @@ fn apply_headers(
     }
 
     for (name, value) in parsed_headers {
+        if !sensitive_headers_allowed && is_redirect_sensitive_header(name.as_str()) {
+            continue;
+        }
         if let Some(value) = value {
             request = request.header(name, value);
         }
@@ -9075,7 +9090,12 @@ fn is_followed_redirect(status: StatusCode) -> bool {
 }
 
 fn manual_http_redirects(transfer: &TransferConfig) -> bool {
-    transfer.auto_referer || transfer.post301 || transfer.post302 || transfer.post303
+    transfer.auto_referer
+        || transfer.post301
+        || transfer.post302
+        || transfer.post303
+        || transfer.location_trusted
+        || has_redirect_sensitive_options(transfer)
 }
 
 struct RedirectFollowup {
@@ -9149,6 +9169,40 @@ fn auto_referer_value(previous: &Url) -> String {
     referer.to_string()
 }
 
+fn has_redirect_sensitive_options(transfer: &TransferConfig) -> bool {
+    transfer.user.is_some()
+        || transfer.oauth2_bearer.is_some()
+        || transfer.cookie.is_some()
+        || transfer
+            .headers
+            .iter()
+            .any(|header| redirect_sensitive_header_arg(header))
+}
+
+fn redirect_sensitive_header_arg(header: &str) -> bool {
+    let name = header
+        .split_once(':')
+        .map(|(name, _)| name)
+        .or_else(|| header.strip_suffix(';'))
+        .unwrap_or_default();
+    is_redirect_sensitive_header(name.trim())
+}
+
+fn is_redirect_sensitive_header(name: &str) -> bool {
+    name.eq_ignore_ascii_case("authorization")
+        || name.eq_ignore_ascii_case("cookie")
+        || name.eq_ignore_ascii_case("cookie2")
+}
+
+fn same_redirect_origin(initial: &Url, current: &Url) -> bool {
+    initial.scheme() == current.scheme()
+        && initial
+            .host_str()
+            .zip(current.host_str())
+            .is_some_and(|(initial, current)| initial.eq_ignore_ascii_case(current))
+        && initial.port_or_known_default() == current.port_or_known_default()
+}
+
 fn parse_headers(headers: &[String]) -> Result<Vec<(HeaderName, Option<HeaderValue>)>> {
     let mut parsed = Vec::new();
     for header in headers {
@@ -9211,7 +9265,12 @@ fn apply_auth(
     request: reqwest::RequestBuilder,
     transfer: &TransferConfig,
     has_authorization: bool,
+    sensitive_headers_allowed: bool,
 ) -> reqwest::RequestBuilder {
+    if !sensitive_headers_allowed {
+        return request;
+    }
+
     let Some(user) = &transfer.user else {
         return request;
     };

@@ -295,6 +295,18 @@ fn spawn_server_bytes(response: Vec<u8>) -> (String, Receiver<RequestRecord>) {
     spawn_sequence_server_bytes(vec![response])
 }
 
+fn spawn_cross_origin_redirect(
+    final_response: &'static [u8],
+) -> (String, Receiver<RequestRecord>, Receiver<RequestRecord>) {
+    let (target_url, target_rx) = spawn_server(final_response);
+    let redirect = format!(
+        "HTTP/1.1 302 Found\r\nLocation: {target_url}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+    )
+    .into_bytes();
+    let (start_url, start_rx) = spawn_sequence_server_bytes(vec![redirect]);
+    (start_url, start_rx, target_rx)
+}
+
 fn gateway_origin(url: &str) -> String {
     let url = Url::parse(url).unwrap();
     let host = url.host_str().unwrap();
@@ -9491,6 +9503,142 @@ fn location_does_not_auto_referer_without_referer_auto() {
     let second = rx.recv().unwrap();
     assert_eq!(header(&first, "referer"), None);
     assert_eq!(header(&second, "referer"), None);
+}
+
+#[test]
+fn redirect_strips_oauth2_bearer_on_cross_origin_by_default() {
+    let (url, first_rx, second_rx) =
+        spawn_cross_origin_redirect(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok");
+
+    let mut command = Command::cargo_bin("curl").unwrap();
+    command.args(["-q", "-sS", "-L", "--oauth2-bearer", "token123", &url]);
+    command.assert().success().stdout("ok");
+
+    let first = first_rx.recv().unwrap();
+    let second = second_rx.recv().unwrap();
+    assert_eq!(header(&first, "authorization"), Some("Bearer token123"));
+    assert_eq!(header(&second, "authorization"), None);
+}
+
+#[test]
+fn location_trusted_keeps_oauth2_bearer_on_cross_origin_redirect() {
+    let (url, first_rx, second_rx) =
+        spawn_cross_origin_redirect(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok");
+
+    let mut command = Command::cargo_bin("curl").unwrap();
+    command.args([
+        "-q",
+        "-sS",
+        "--location-trusted",
+        "--oauth2-bearer",
+        "token123",
+        &url,
+    ]);
+    command.assert().success().stdout("ok");
+
+    let first = first_rx.recv().unwrap();
+    let second = second_rx.recv().unwrap();
+    assert_eq!(header(&first, "authorization"), Some("Bearer token123"));
+    assert_eq!(header(&second, "authorization"), Some("Bearer token123"));
+}
+
+#[test]
+fn redirect_strips_basic_auth_on_cross_origin_by_default() {
+    let (url, first_rx, second_rx) =
+        spawn_cross_origin_redirect(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok");
+
+    let mut command = Command::cargo_bin("curl").unwrap();
+    command.args(["-q", "-sS", "-L", "--user", "user:pass", &url]);
+    command.assert().success().stdout("ok");
+
+    let first = first_rx.recv().unwrap();
+    let second = second_rx.recv().unwrap();
+    assert_eq!(header(&first, "authorization"), Some("Basic dXNlcjpwYXNz"));
+    assert_eq!(header(&second, "authorization"), None);
+}
+
+#[test]
+fn redirect_keeps_basic_auth_on_same_origin() {
+    let (url, rx) = spawn_sequence_server(vec![
+        b"HTTP/1.1 302 Found\r\nLocation: /next\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+        b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok",
+    ]);
+
+    let mut command = Command::cargo_bin("curl").unwrap();
+    command.args(["-q", "-sS", "-L", "--user", "user:pass", &url]);
+    command.assert().success().stdout("ok");
+
+    let first = rx.recv().unwrap();
+    let second = rx.recv().unwrap();
+    assert_eq!(header(&first, "authorization"), Some("Basic dXNlcjpwYXNz"));
+    assert_eq!(header(&second, "authorization"), Some("Basic dXNlcjpwYXNz"));
+}
+
+#[test]
+fn redirect_strips_sensitive_custom_headers_on_cross_origin_by_default() {
+    let (url, first_rx, second_rx) =
+        spawn_cross_origin_redirect(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok");
+
+    let mut command = Command::cargo_bin("curl").unwrap();
+    command.args([
+        "-q",
+        "-sS",
+        "-L",
+        "-H",
+        "Authorization: Custom auth",
+        "-H",
+        "Cookie: sid=abc",
+        &url,
+    ]);
+    command.assert().success().stdout("ok");
+
+    let first = first_rx.recv().unwrap();
+    let second = second_rx.recv().unwrap();
+    assert_eq!(header(&first, "authorization"), Some("Custom auth"));
+    assert_eq!(header(&first, "cookie"), Some("sid=abc"));
+    assert_eq!(header(&second, "authorization"), None);
+    assert_eq!(header(&second, "cookie"), None);
+}
+
+#[test]
+fn location_trusted_keeps_sensitive_custom_headers_on_cross_origin_redirect() {
+    let (url, first_rx, second_rx) =
+        spawn_cross_origin_redirect(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok");
+
+    let mut command = Command::cargo_bin("curl").unwrap();
+    command.args([
+        "-q",
+        "-sS",
+        "--location-trusted",
+        "-H",
+        "Authorization: Custom auth",
+        "-H",
+        "Cookie: sid=abc",
+        &url,
+    ]);
+    command.assert().success().stdout("ok");
+
+    let first = first_rx.recv().unwrap();
+    let second = second_rx.recv().unwrap();
+    assert_eq!(header(&first, "authorization"), Some("Custom auth"));
+    assert_eq!(header(&first, "cookie"), Some("sid=abc"));
+    assert_eq!(header(&second, "authorization"), Some("Custom auth"));
+    assert_eq!(header(&second, "cookie"), Some("sid=abc"));
+}
+
+#[test]
+fn redirect_strips_literal_cookie_on_cross_origin_by_default() {
+    let (url, first_rx, second_rx) =
+        spawn_cross_origin_redirect(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok");
+
+    let mut command = Command::cargo_bin("curl").unwrap();
+    command.args(["-q", "-sS", "-L", "-b", "sid=abc", &url]);
+    command.assert().success().stdout("ok");
+
+    let first = first_rx.recv().unwrap();
+    let second = second_rx.recv().unwrap();
+    assert_eq!(header(&first, "cookie"), Some("sid=abc"));
+    assert_eq!(header(&second, "cookie"), None);
 }
 
 #[test]
