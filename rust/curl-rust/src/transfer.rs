@@ -3610,7 +3610,7 @@ async fn run_tftp_exchange(
         .host_str()
         .ok_or_else(|| CurlError::Url("TFTP URL is missing a host".to_string()))?;
     let port = url.port().unwrap_or(69);
-    let (filename, mode) = tftp_filename_and_mode(&url)?;
+    let (filename, mode) = tftp_filename_and_mode(&url, transfer.use_ascii)?;
     let requested_blksize = transfer.tftp_blksize.unwrap_or(TFTP_DEFAULT_BLKSIZE);
     let initial_blksize = if transfer.tftp_no_options {
         TFTP_DEFAULT_BLKSIZE
@@ -7021,7 +7021,7 @@ fn smtp_dot_stuffed_body(input: &[u8]) -> Vec<u8> {
     output
 }
 
-fn tftp_filename_and_mode(url: &Url) -> Result<(Vec<u8>, &'static str)> {
+fn tftp_filename_and_mode(url: &Url, use_ascii: bool) -> Result<(Vec<u8>, &'static str)> {
     let path = url.path().strip_prefix('/').unwrap_or(url.path());
     let mut decoded = percent_decode(path.as_bytes()).collect::<Vec<_>>();
     if decoded.contains(&0) {
@@ -7033,8 +7033,12 @@ fn tftp_filename_and_mode(url: &Url) -> Result<(Vec<u8>, &'static str)> {
     let mode = if strip_tftp_mode_suffix(&mut decoded, b";mode=netascii") {
         "netascii"
     } else {
-        strip_tftp_mode_suffix(&mut decoded, b";mode=octet");
-        "octet"
+        let explicit_octet = strip_tftp_mode_suffix(&mut decoded, b";mode=octet");
+        if explicit_octet || !use_ascii {
+            "octet"
+        } else {
+            "netascii"
+        }
     };
 
     if decoded.is_empty() {

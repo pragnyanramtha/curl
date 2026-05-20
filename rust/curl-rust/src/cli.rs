@@ -37,6 +37,7 @@ pub struct TransferConfig {
     pub head: bool,
     pub get: bool,
     pub list_only: bool,
+    pub use_ascii: bool,
     pub ftp_append: bool,
     pub ftp_create_dirs: bool,
     pub ftp_disable_epsv: bool,
@@ -363,6 +364,7 @@ impl Default for TransferConfig {
             head: false,
             get: false,
             list_only: false,
+            use_ascii: false,
             ftp_append: false,
             ftp_create_dirs: false,
             ftp_disable_epsv: false,
@@ -611,6 +613,7 @@ impl Parser {
             "head" => self.current().head = true,
             "get" => self.current().get = true,
             "list-only" => self.current().list_only = true,
+            "use-ascii" => self.current().use_ascii = true,
             "append" => self.current().ftp_append = true,
             "ftp-create-dirs" => self.current().ftp_create_dirs = true,
             "disable-epsv" => self.current().ftp_disable_epsv = true,
@@ -928,6 +931,7 @@ impl Parser {
             "head" => self.current().head = false,
             "get" => self.current().get = false,
             "list-only" => self.current().list_only = false,
+            "use-ascii" => self.current().use_ascii = false,
             "append" => self.current().ftp_append = false,
             "ftp-create-dirs" => self.current().ftp_create_dirs = false,
             "disable-epsv" => self.current().ftp_disable_epsv = false,
@@ -1017,6 +1021,7 @@ impl Parser {
                 'I' => self.current().head = true,
                 'G' => self.current().get = true,
                 'l' => self.current().list_only = true,
+                'B' => self.current().use_ascii = true,
                 'a' => self.current().ftp_append = true,
                 'Q' => {
                     let value = self.short_value('Q', rest)?;
@@ -1449,6 +1454,7 @@ impl TransferConfig {
             || self.head
             || self.get
             || self.list_only
+            || self.use_ascii
             || self.ftp_append
             || self.ftp_create_dirs
             || self.ftp_disable_epsv
@@ -2045,6 +2051,7 @@ fn print_common_help() {
                --compressed-ssh        Enable SSH compression\n\
                --tftp-blksize <value>  Set TFTP BLKSIZE option\n\
                --tftp-no-options       Do not send TFTP options\n\
+          -B, --use-ascii             Use ASCII/text transfer\n\
            -t, --telnet-option <opt>   Set telnet option\n\
                --ipfs-gateway <URL>    Gateway for IPFS/IPNS URLs\n\
                --proto-default <proto> Default protocol for schemeless URLs\n\
@@ -2735,6 +2742,21 @@ mod tests {
         ])
         .unwrap();
         assert!(!config.transfers[0].tftp_no_options);
+    }
+
+    #[test]
+    fn parses_use_ascii_option() {
+        let config = parse_args(["-q", "-B", "tftp://example.com/file"]).unwrap();
+        assert!(config.transfers[0].use_ascii);
+
+        let config = parse_args([
+            "-q",
+            "--use-ascii",
+            "--no-use-ascii",
+            "tftp://example.com/file",
+        ])
+        .unwrap();
+        assert!(!config.transfers[0].use_ascii);
     }
 
     #[test]

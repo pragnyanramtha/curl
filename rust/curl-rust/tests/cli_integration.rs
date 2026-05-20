@@ -5694,6 +5694,44 @@ fn tftp_url_double_slash_preserves_leading_filename_slash() {
 }
 
 #[test]
+fn tftp_use_ascii_sends_netascii_mode() {
+    let (url, rx) = spawn_tftp_server(vec![b"ascii".to_vec()]);
+
+    let mut command = Command::cargo_bin("curl").unwrap();
+    command.args(["-q", "-sS", "--tftp-no-options", "--use-ascii", &url]);
+    command.assert().success().stdout("ascii");
+
+    let record = rx.recv().unwrap();
+    assert_eq!(record.request, b"\0\x01file.txt\0netascii\0");
+}
+
+#[test]
+fn tftp_mode_octet_suffix_overrides_use_ascii() {
+    let (url, rx) = spawn_tftp_server(vec![b"octet".to_vec()]);
+    let url = url.replace("/file.txt", "/file.txt;mode=octet");
+
+    let mut command = Command::cargo_bin("curl").unwrap();
+    command.args(["-q", "-sS", "--tftp-no-options", "--use-ascii", &url]);
+    command.assert().success().stdout("octet");
+
+    let record = rx.recv().unwrap();
+    assert_eq!(record.request, b"\0\x01file.txt\0octet\0");
+}
+
+#[test]
+fn tftp_mode_netascii_suffix_sends_netascii() {
+    let (url, rx) = spawn_tftp_server(vec![b"suffix".to_vec()]);
+    let url = url.replace("/file.txt", "/file.txt;mode=netascii");
+
+    let mut command = Command::cargo_bin("curl").unwrap();
+    command.args(["-q", "-sS", "--tftp-no-options", &url]);
+    command.assert().success().stdout("suffix");
+
+    let record = rx.recv().unwrap();
+    assert_eq!(record.request, b"\0\x01file.txt\0netascii\0");
+}
+
+#[test]
 fn tftp_writeout_reports_zero_http_code_and_download_size() {
     let (url, rx) = spawn_tftp_server(vec![b"abcdef".to_vec()]);
 
@@ -9470,14 +9508,16 @@ fn libcurl_writes_tftp_options() {
         "--tftp-blksize",
         "1024",
         "--tftp-no-options",
+        "--use-ascii",
         &url,
     ]);
     command.assert().success().stdout("ok");
 
-    assert_eq!(rx.recv().unwrap().request, b"\0\x01file.txt\0octet\0");
+    assert_eq!(rx.recv().unwrap().request, b"\0\x01file.txt\0netascii\0");
     let text = std::fs::read_to_string(source).unwrap();
     assert!(text.contains("CURLOPT_TFTP_BLKSIZE, 1024"));
     assert!(text.contains("CURLOPT_TFTP_NO_OPTIONS, 1"));
+    assert!(text.contains("CURLOPT_TRANSFERTEXT, 1"));
 }
 
 #[test]

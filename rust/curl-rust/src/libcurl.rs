@@ -308,6 +308,9 @@ fn write_request(out: &mut String, render: &RenderTransfer<'_>, url: &str) -> Re
     if transfer.tftp_no_options {
         emit_long_setopt(out, "CURLOPT_TFTP_NO_OPTIONS", 1);
     }
+    if transfer.use_ascii {
+        emit_long_setopt(out, "CURLOPT_TRANSFERTEXT", 1);
+    }
     if let Some(body) = &render.body
         && !transfer.get
     {
