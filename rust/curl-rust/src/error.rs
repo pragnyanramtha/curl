@@ -64,6 +64,8 @@ pub enum CurlError {
     HttpStatus { status: u16 },
     #[error("HTTP server does not seem to support byte ranges. Cannot resume.")]
     RangeError,
+    #[error("Content decoding failed: {0}")]
+    BadContentEncoding(String),
     #[error("Cannot resume transfer")]
     BadDownloadResume,
     #[error("Maximum file size exceeded")]
@@ -127,6 +129,7 @@ impl CurlError {
             Self::TooManyRedirects { .. } => 47,
             Self::HttpStatus { .. } => 22,
             Self::RangeError => 33,
+            Self::BadContentEncoding(_) => 61,
             Self::BadDownloadResume => 36,
             Self::FileSizeExceeded => 63,
             Self::RemoteDiskFull => 70,

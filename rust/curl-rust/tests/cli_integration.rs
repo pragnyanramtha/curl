@@ -41,6 +41,10 @@ const DEFLATE_COMPRESSED_BODY: &[u8] = &[
     0x78, 0x9c, 0xcb, 0x48, 0xcd, 0xc9, 0xc9, 0x57, 0x48, 0xce, 0xcf, 0x2d, 0x28, 0x4a, 0x2d, 0x2e,
     0x4e, 0x4d, 0xe1, 0x02, 0x00, 0x3c, 0x1c, 0x06, 0x74,
 ];
+const RAW_DEFLATE_COMPRESSED_BODY: &[u8] = &[
+    0xcb, 0x48, 0xcd, 0xc9, 0xc9, 0x57, 0x48, 0xce, 0xcf, 0x2d, 0x28, 0x4a, 0x2d, 0x2e, 0x4e, 0x4d,
+    0xe1, 0x02, 0x00,
+];
 const BROTLI_COMPRESSED_BODY: &[u8] = &[
     0x0f, 0x08, 0x80, 0x68, 0x65, 0x6c, 0x6c, 0x6f, 0x20, 0x63, 0x6f, 0x6d, 0x70, 0x72, 0x65, 0x73,
     0x73, 0x65, 0x64, 0x0a, 0x03,
@@ -2004,10 +2008,11 @@ fn downloads_http_and_renders_writeout() {
 
 #[test]
 fn compressed_decodes_supported_response_bodies() {
-    for (encoding, compressed_body) in [
-        ("gzip", GZIP_COMPRESSED_BODY),
-        ("deflate", DEFLATE_COMPRESSED_BODY),
-        ("br", BROTLI_COMPRESSED_BODY),
+    for (label, encoding, compressed_body) in [
+        ("gzip", "gzip", GZIP_COMPRESSED_BODY),
+        ("zlib deflate", "deflate", DEFLATE_COMPRESSED_BODY),
+        ("raw deflate", "deflate", RAW_DEFLATE_COMPRESSED_BODY),
+        ("brotli", "br", BROTLI_COMPRESSED_BODY),
     ] {
         let (url, rx) = spawn_server_bytes(compressed_response(encoding, compressed_body));
 
@@ -2018,18 +2023,102 @@ fn compressed_decodes_supported_response_bodies() {
             .unwrap();
         assert!(
             output.status.success(),
-            "{encoding}: {}",
+            "{label}: {}",
             String::from_utf8_lossy(&output.stderr)
         );
-        assert_eq!(output.stdout, COMPRESSED_BODY, "{encoding}");
+        assert_eq!(output.stdout, COMPRESSED_BODY, "{label}");
 
         let request = rx.recv().unwrap();
         assert_eq!(
             header(&request, "accept-encoding"),
             Some("deflate, gzip, br"),
-            "{encoding}"
+            "{label}"
         );
     }
+}
+
+#[test]
+fn compressed_include_preserves_encoded_response_headers() {
+    let (url, _rx) = spawn_server_bytes(compressed_response("gzip", GZIP_COMPRESSED_BODY));
+
+    let output = Command::cargo_bin("curl")
+        .unwrap()
+        .args(["-q", "-sS", "--compressed", "-i", &url])
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.starts_with("HTTP/1.1 200 OK\r\n"));
+    assert!(stdout.contains("content-encoding: gzip\r\n"));
+    assert!(stdout.contains("content-length: 37\r\n"));
+    assert!(stdout.ends_with("\r\n\r\nhello compressed\n"));
+}
+
+#[test]
+fn compressed_dump_header_preserves_encoded_response_headers() {
+    let temp = tempdir().unwrap();
+    let headers = temp.path().join("headers.txt");
+    let (url, _rx) = spawn_server_bytes(compressed_response("gzip", GZIP_COMPRESSED_BODY));
+
+    let output = Command::cargo_bin("curl")
+        .unwrap()
+        .args([
+            "-q",
+            "-sS",
+            "--compressed",
+            "--dump-header",
+            headers.to_str().unwrap(),
+            &url,
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(output.stdout, COMPRESSED_BODY);
+
+    let dumped = std::fs::read_to_string(headers).unwrap();
+    assert!(dumped.starts_with("HTTP/1.1 200 OK\r\n"));
+    assert!(dumped.contains("content-encoding: gzip\r\n"));
+    assert!(dumped.contains("content-length: 37\r\n"));
+}
+
+#[test]
+fn raw_http_compressed_request_target_decodes_body_and_preserves_headers() {
+    let (url, rx) = spawn_server_bytes(compressed_response("gzip", GZIP_COMPRESSED_BODY));
+
+    let output = Command::cargo_bin("curl")
+        .unwrap()
+        .args([
+            "-q",
+            "-sS",
+            "--compressed",
+            "--request-target",
+            "/raw",
+            "-i",
+            &url,
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.starts_with("HTTP/1.1 200 OK\r\n"));
+    assert!(stdout.contains("Content-Encoding: gzip\r\n"));
+    assert!(stdout.contains("Content-Length: 37\r\n"));
+    assert!(stdout.ends_with("\r\n\r\nhello compressed\n"));
+
+    let request = rx.recv().unwrap();
+    assert!(request.start_line.starts_with("GET /raw HTTP/1.1"));
 }
 
 #[test]
@@ -2078,6 +2167,20 @@ fn http_does_not_decode_content_encoding_without_compressed() {
 
     let request = rx.recv().unwrap();
     assert_eq!(header(&request, "accept-encoding"), None);
+}
+
+#[test]
+fn compressed_unknown_content_encoding_returns_bad_content_encoding() {
+    let (url, _rx) = spawn_server_bytes(compressed_response("zstd", b"encoded"));
+
+    let output = Command::cargo_bin("curl")
+        .unwrap()
+        .args(["-q", "-sS", "--compressed", &url])
+        .output()
+        .unwrap();
+    assert_eq!(output.status.code(), Some(61));
+    assert_eq!(output.stdout, b"");
+    assert!(String::from_utf8_lossy(&output.stderr).contains("content encoding"));
 }
 
 #[test]

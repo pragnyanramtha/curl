@@ -5,6 +5,8 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
+use brotli::Decompressor as BrotliDecoder;
+use flate2::read::{DeflateDecoder, GzDecoder, ZlibDecoder};
 use percent_encoding::percent_decode;
 use ssh2::{
     CheckResult, ErrorCode as SshErrorCode, FileStat as SftpFileStat, HashType, KnownHostFileKind,
@@ -15,9 +17,10 @@ use tokio::net::{TcpStream, UdpSocket};
 use tokio::task::JoinSet;
 
 use reqwest::header::{
-    ACCEPT, ACCEPT_ENCODING, ACCEPT_RANGES, AUTHORIZATION, CONTENT_LENGTH, CONTENT_RANGE,
-    CONTENT_TYPE, COOKIE, ETAG, HeaderName, HeaderValue, IF_MODIFIED_SINCE, IF_NONE_MATCH,
-    IF_UNMODIFIED_SINCE, LAST_MODIFIED, LOCATION, RANGE, REFERER, RETRY_AFTER, USER_AGENT,
+    ACCEPT, ACCEPT_ENCODING, ACCEPT_RANGES, AUTHORIZATION, CONTENT_ENCODING, CONTENT_LENGTH,
+    CONTENT_RANGE, CONTENT_TYPE, COOKIE, ETAG, HeaderMap, HeaderName, HeaderValue,
+    IF_MODIFIED_SINCE, IF_NONE_MATCH, IF_UNMODIFIED_SINCE, LAST_MODIFIED, LOCATION, RANGE, REFERER,
+    RETRY_AFTER, USER_AGENT,
 };
 use reqwest::{Client, Method, StatusCode, Url, Version};
 
@@ -294,7 +297,10 @@ fn build_client(transfer: &TransferConfig, cookie_jar: Option<Arc<CookieJar>>) -
     let mut builder = Client::builder()
         .redirect(redirect)
         .referer(false)
-        .danger_accept_invalid_certs(transfer.insecure);
+        .danger_accept_invalid_certs(transfer.insecure)
+        .no_gzip()
+        .no_brotli()
+        .no_deflate();
 
     if transfer.http09_allowed {
         builder = builder.http09_responses();
@@ -308,10 +314,6 @@ fn build_client(transfer: &TransferConfig, cookie_jar: Option<Arc<CookieJar>>) -
         builder = builder.dns_resolver(Arc::new(IpFamilyResolver {
             ip_version: transfer.ip_version,
         }));
-    }
-
-    if !transfer.compressed {
-        builder = builder.no_gzip().no_brotli().no_deflate();
     }
 
     if let Some(cookie_jar) = cookie_jar {
@@ -7891,6 +7893,7 @@ async fn run_http_transfer(
         } else {
             response.bytes().await.transfer_err()?.to_vec()
         };
+        let body = decode_http_body_if_compressed(transfer, &headers, body)?;
         metrics.size_download = body.len() as u64;
         let retry_after = retry_after_delay(&headers);
 
@@ -7980,14 +7983,16 @@ async fn run_raw_http_proxy_transfer(context: RawHttpProxyContext<'_>) -> Result
     )
     .await?;
     stream.write_all(&request).await.map_err(tcp_io_error)?;
-    raw_http_read_response(
+    let mut attempt = raw_http_read_response(
         &mut stream,
         context.method,
         context.url,
         context.resume_from,
         context.transfer.http09_allowed,
     )
-    .await
+    .await?;
+    decode_http_attempt_body(context.transfer, &mut attempt)?;
+    Ok(attempt)
 }
 
 async fn run_raw_http_direct_transfer(context: RawHttpDirectContext<'_>) -> Result<HttpAttempt> {
@@ -7999,14 +8004,16 @@ async fn run_raw_http_direct_transfer(context: RawHttpDirectContext<'_>) -> Resu
     let port = context.url.port_or_known_default().unwrap_or(80);
     let mut stream = connect_tcp(host, port, context.transfer).await?;
     stream.write_all(&request).await.map_err(tcp_io_error)?;
-    raw_http_read_response(
+    let mut attempt = raw_http_read_response(
         &mut stream,
         context.method,
         context.url,
         context.resume_from,
         context.transfer.http09_allowed,
     )
-    .await
+    .await?;
+    decode_http_attempt_body(context.transfer, &mut attempt)?;
+    Ok(attempt)
 }
 
 fn raw_http_direct_request(context: &RawHttpDirectContext<'_>) -> Result<Vec<u8>> {
@@ -8341,6 +8348,71 @@ fn raw_http09_attempt(
         retry_after: None,
         resume_from,
     })
+}
+
+fn decode_http_attempt_body(transfer: &TransferConfig, attempt: &mut HttpAttempt) -> Result<()> {
+    let body = std::mem::take(&mut attempt.body);
+    attempt.body = decode_http_body_if_compressed(transfer, &attempt.headers, body)?;
+    Ok(())
+}
+
+fn decode_http_body_if_compressed(
+    transfer: &TransferConfig,
+    headers: &HeaderMap,
+    body: Vec<u8>,
+) -> Result<Vec<u8>> {
+    if !transfer.compressed || body.is_empty() {
+        return Ok(body);
+    }
+
+    let mut encodings = Vec::new();
+    for value in headers.get_all(CONTENT_ENCODING) {
+        let value = value
+            .to_str()
+            .map_err(|error| CurlError::BadContentEncoding(error.to_string()))?;
+        encodings.extend(
+            value
+                .split(',')
+                .map(str::trim)
+                .filter(|encoding| !encoding.is_empty())
+                .map(str::to_ascii_lowercase),
+        );
+    }
+
+    let mut decoded = body;
+    for encoding in encodings.iter().rev() {
+        decoded = decode_content_encoding(encoding, decoded)?;
+    }
+    Ok(decoded)
+}
+
+fn decode_content_encoding(encoding: &str, body: Vec<u8>) -> Result<Vec<u8>> {
+    match encoding {
+        "identity" | "none" => Ok(body),
+        "gzip" | "x-gzip" => read_content_decoder(GzDecoder::new(&body[..]), encoding),
+        "deflate" => decode_deflate_body(body),
+        "br" => read_content_decoder(BrotliDecoder::new(&body[..], 4096), encoding),
+        _ => Err(CurlError::BadContentEncoding(format!(
+            "unrecognized content encoding type: {encoding}"
+        ))),
+    }
+}
+
+fn decode_deflate_body(body: Vec<u8>) -> Result<Vec<u8>> {
+    match read_content_decoder(ZlibDecoder::new(&body[..]), "deflate") {
+        Ok(decoded) => Ok(decoded),
+        Err(zlib_error) => read_content_decoder(DeflateDecoder::new(&body[..]), "deflate").map_err(
+            |deflate_error| CurlError::BadContentEncoding(format!("{zlib_error}; {deflate_error}")),
+        ),
+    }
+}
+
+fn read_content_decoder(mut reader: impl Read, encoding: &str) -> Result<Vec<u8>> {
+    let mut decoded = Vec::new();
+    reader
+        .read_to_end(&mut decoded)
+        .map_err(|error| CurlError::BadContentEncoding(format!("{encoding}: {error}")))?;
+    Ok(decoded)
 }
 
 fn parse_raw_http_headers(

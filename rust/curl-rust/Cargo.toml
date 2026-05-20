@@ -12,6 +12,8 @@ path = "src/main.rs"
 [dependencies]
 anyhow = "1.0"
 base64 = "0.22"
+brotli = "8.0"
+flate2 = "1.1"
 httpdate = "1.0"
 percent-encoding = "2.3"
 reqwest = { version = "0.12", default-features = false, features = ["brotli", "cookies", "deflate", "gzip", "http2", "multipart", "rustls-tls"] }

@@ -224,6 +224,8 @@ dependencies = [
  "anyhow",
  "assert_cmd",
  "base64",
+ "brotli",
+ "flate2",
  "httpdate",
  "percent-encoding",
  "predicates",
