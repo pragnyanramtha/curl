@@ -354,9 +354,7 @@ add_custom_target(curl-rust-test
 if(CURL_BUILD_TESTING AND PERL_EXECUTABLE)
   set(_curl_rust_corpus_deps
     curl-rust
-    servers
-    libtests
-    build-certs
+    testdeps
   )
   if(TARGET ${EXE_NAME})
     list(APPEND _curl_rust_corpus_deps ${EXE_NAME})
