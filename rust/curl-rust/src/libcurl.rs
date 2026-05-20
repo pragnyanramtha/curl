@@ -795,6 +795,16 @@ mod tests {
     }
 
     #[test]
+    fn renders_follow_location_option() {
+        let config =
+            parse_args(["-q", "--libcurl", "client.c", "-L", "https://example.com"]).unwrap();
+
+        let source = render_source(&config).unwrap();
+
+        assert!(source.contains("CURLOPT_FOLLOWLOCATION, 1L"));
+    }
+
+    #[test]
     fn renders_location_trusted_unrestricted_auth() {
         let config = parse_args([
             "-q",
@@ -809,6 +819,111 @@ mod tests {
 
         assert!(source.contains("CURLOPT_FOLLOWLOCATION, 1L"));
         assert!(source.contains("CURLOPT_UNRESTRICTED_AUTH, 1L"));
+    }
+
+    #[test]
+    fn renders_range_and_compressed_options() {
+        let config = parse_args([
+            "-q",
+            "--libcurl",
+            "client.c",
+            "--compressed",
+            "--range",
+            "2-5",
+            "https://example.com",
+        ])
+        .unwrap();
+
+        let source = render_source(&config).unwrap();
+
+        assert!(source.contains("CURLOPT_ACCEPT_ENCODING, \"\""));
+        assert!(source.contains("CURLOPT_RANGE, \"2-5\""));
+    }
+
+    #[test]
+    fn renders_continue_at_fixed_offset() {
+        let config = parse_args([
+            "-q",
+            "--libcurl",
+            "client.c",
+            "--continue-at",
+            "7",
+            "https://example.com",
+        ])
+        .unwrap();
+
+        let source = render_source(&config).unwrap();
+
+        assert!(source.contains("CURLOPT_RESUME_FROM_LARGE, (curl_off_t)7"));
+    }
+
+    #[test]
+    fn renders_continue_at_auto_comment() {
+        let config = parse_args([
+            "-q",
+            "--libcurl",
+            "client.c",
+            "--continue-at",
+            "-",
+            "https://example.com",
+        ])
+        .unwrap();
+
+        let source = render_source(&config).unwrap();
+
+        assert!(source.contains("--continue-at - depends on the selected output file size"));
+        assert!(!source.contains("CURLOPT_RESUME_FROM_LARGE"));
+    }
+
+    #[test]
+    fn renders_cookie_options() {
+        let config = parse_args([
+            "-q",
+            "--libcurl",
+            "client.c",
+            "-b",
+            "sid=abc",
+            "-b",
+            "cookies.txt",
+            "-c",
+            "jar.txt",
+            "-j",
+            "https://example.com",
+        ])
+        .unwrap();
+
+        let source = render_source(&config).unwrap();
+
+        assert!(source.contains("CURLOPT_COOKIE, \"sid=abc\""));
+        assert!(source.contains("CURLOPT_COOKIEFILE, \"cookies.txt\""));
+        assert!(source.contains("CURLOPT_COOKIEJAR, \"jar.txt\""));
+        assert!(source.contains("CURLOPT_COOKIESESSION, 1L"));
+    }
+
+    #[test]
+    fn renders_connection_scalar_options() {
+        let config = parse_args([
+            "-q",
+            "--libcurl",
+            "client.c",
+            "--proxy-user",
+            "proxy:secret",
+            "--insecure",
+            "--connect-timeout",
+            "2",
+            "--max-time",
+            "3",
+            "https://example.com",
+        ])
+        .unwrap();
+
+        let source = render_source(&config).unwrap();
+
+        assert!(source.contains("CURLOPT_PROXYUSERPWD, \"proxy:secret\""));
+        assert!(source.contains("CURLOPT_SSL_VERIFYPEER, 0L"));
+        assert!(source.contains("CURLOPT_SSL_VERIFYHOST, 0L"));
+        assert!(source.contains("CURLOPT_CONNECTTIMEOUT_MS, 2000L"));
+        assert!(source.contains("CURLOPT_TIMEOUT_MS, 3000L"));
     }
 
     #[test]
