@@ -2805,6 +2805,35 @@ fn raw_with_compressed_keeps_encoded_body() {
 }
 
 #[test]
+fn raw_requires_raw_reader_instead_of_dechunking_fallbacks() {
+    let temp = tempdir().unwrap();
+    let jar = temp.path().join("cookies.txt");
+    let chunked = b"5\r\nhello\r\n0\r\n\r\n";
+    let response = [
+        b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n".to_vec(),
+        chunked.to_vec(),
+    ]
+    .concat();
+    let (url, _rx) = spawn_server_bytes(response);
+
+    let output = Command::cargo_bin("curl")
+        .unwrap()
+        .args([
+            "-q",
+            "-sS",
+            "--raw",
+            "--cookie-jar",
+            jar.to_str().unwrap(),
+            &url,
+        ])
+        .output()
+        .unwrap();
+    assert_eq!(output.status.code(), Some(2));
+    assert_eq!(output.stdout, b"");
+    assert!(String::from_utf8_lossy(&output.stderr).contains("--raw"));
+}
+
+#[test]
 fn compressed_custom_accept_encoding_still_decodes_response_body() {
     let (url, rx) = spawn_server_bytes(compressed_response("gzip", GZIP_COMPRESSED_BODY));
 
@@ -11835,6 +11864,69 @@ fn dump_header_percent_writes_headers_to_stderr() {
         .stdout("ok")
         .stderr("HTTP/1.1 200 OK\r\nx-test: yes\r\ncontent-length: 2\r\n\r\n");
     rx.recv().unwrap();
+}
+
+#[test]
+fn stderr_redirects_writeout_stderr_to_file() {
+    let (url, rx) = spawn_server(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok");
+    let temp = tempdir().unwrap();
+    let stderr_path = temp.path().join("stderr.txt");
+
+    let mut command = Command::cargo_bin("curl").unwrap();
+    command.args([
+        "-q",
+        "-sS",
+        "--stderr",
+        stderr_path.to_str().unwrap(),
+        "--out-null",
+        "-w",
+        "%{stderr}nonsense\n",
+        &url,
+    ]);
+    command.assert().success().stdout("").stderr("");
+
+    rx.recv().unwrap();
+    assert_eq!(std::fs::read_to_string(stderr_path).unwrap(), "nonsense\n");
+}
+
+#[test]
+fn stderr_dash_redirects_parse_errors_to_stdout() {
+    let mut command = Command::cargo_bin("curl").unwrap();
+    let output = command
+        .args(["--stderr", "-", "--does-not-exist"])
+        .output()
+        .unwrap();
+
+    assert_eq!(output.status.code(), Some(2));
+    assert_eq!(output.stderr, b"");
+    assert_eq!(
+        String::from_utf8(output.stdout).unwrap(),
+        "curl: unknown option --does-not-exist\n"
+    );
+}
+
+#[test]
+fn stderr_redirects_parse_errors_to_file() {
+    let temp = tempdir().unwrap();
+    let stderr_path = temp.path().join("stderr.txt");
+
+    let mut command = Command::cargo_bin("curl").unwrap();
+    let output = command
+        .args([
+            "--stderr",
+            stderr_path.to_str().unwrap(),
+            "--does-not-exist",
+        ])
+        .output()
+        .unwrap();
+
+    assert_eq!(output.status.code(), Some(2));
+    assert_eq!(output.stdout, b"");
+    assert_eq!(output.stderr, b"");
+    assert_eq!(
+        std::fs::read_to_string(stderr_path).unwrap(),
+        "curl: unknown option --does-not-exist\n"
+    );
 }
 
 #[test]

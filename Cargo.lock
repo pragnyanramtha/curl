@@ -227,6 +227,7 @@ dependencies = [
  "brotli",
  "flate2",
  "httpdate",
+ "libc",
  "percent-encoding",
  "predicates",
  "reqwest",

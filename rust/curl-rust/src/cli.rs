@@ -645,6 +645,9 @@ impl Parser {
                 let value = self.value_for(name, inline_value)?;
                 self.config.libcurl = Some(parse_nonempty_path(name, &value)?);
             }
+            "stderr" => {
+                let _ = self.value_for(name, inline_value)?;
+            }
             "url" => {
                 let value = self.value_for(name, inline_value)?;
                 self.append_url_value(value)?;
@@ -1733,6 +1736,7 @@ fn option_takes_value(name: &str) -> bool {
     matches!(
         name,
         "config"
+            | "stderr"
             | "libcurl"
             | "variable"
             | "url"
@@ -1799,6 +1803,78 @@ fn option_takes_value(name: &str) -> bool {
             | "trace"
             | "trace-ascii"
             | "tls-max"
+    )
+}
+
+pub fn stderr_redirect_target(args: &[String]) -> Option<String> {
+    let mut target = None;
+    let mut index = 0;
+    while index < args.len() {
+        let arg = &args[index];
+        if arg == "--" {
+            break;
+        }
+
+        if let Some(long) = arg.strip_prefix("--") {
+            let (name, inline_value) =
+                long.split_once('=').map_or((long, None), |(name, value)| {
+                    (name, Some(value.to_string()))
+                });
+            let name = name.strip_prefix("expand-").unwrap_or(name);
+            if name == "stderr" {
+                if let Some(value) = inline_value {
+                    target = Some(value);
+                } else if let Some(value) = args.get(index + 1) {
+                    target = Some(value.clone());
+                    index += 1;
+                }
+            } else if inline_value.is_none() && !name.starts_with("no-") && option_takes_value(name)
+            {
+                index += 1;
+            }
+        } else if let Some(shorts) = arg.strip_prefix('-')
+            && !shorts.is_empty()
+        {
+            for (offset, option) in shorts.char_indices() {
+                if short_option_takes_value(option) {
+                    if offset + option.len_utf8() == shorts.len() {
+                        index += 1;
+                    }
+                    break;
+                }
+            }
+        }
+        index += 1;
+    }
+    target
+}
+
+fn short_option_takes_value(option: char) -> bool {
+    matches!(
+        option,
+        'K' | 'X'
+            | 'Q'
+            | 'H'
+            | 'e'
+            | 'r'
+            | 'C'
+            | 'd'
+            | 'F'
+            | 'T'
+            | 't'
+            | 'o'
+            | 'D'
+            | 'z'
+            | 'w'
+            | 'u'
+            | 'U'
+            | 'x'
+            | 'm'
+            | 'Y'
+            | 'y'
+            | 'A'
+            | 'b'
+            | 'c'
     )
 }
 
@@ -2388,6 +2464,7 @@ fn print_common_help() {
                --variable <name=data>  Set command-line variable\n\
                --expand-* <value>      Expand variables in option value\n\
                --libcurl <file>        Generate libcurl code\n\
+               --stderr <file>         Where to redirect stderr\n\
                --http0.9              Allow HTTP/0.9 responses\n\
                --raw                  Do HTTP raw; no transfer decoding\n\
            -X, --request <method>      Specify request method\n\
@@ -2847,6 +2924,40 @@ mod tests {
 
         let config = parse_args(["-q", "--raw", "--no-raw", "https://example.com"]).unwrap();
         assert!(!config.transfers[0].raw);
+    }
+
+    #[test]
+    fn parses_stderr_option() {
+        parse_args(["-q", "--stderr", "errors.txt", "https://example.com"]).unwrap();
+        parse_args(["-q", "--stderr=errors.txt", "https://example.com"]).unwrap();
+    }
+
+    #[test]
+    fn finds_last_command_line_stderr_redirect_target() {
+        let args = vec![
+            "--url".to_string(),
+            "--stderr".to_string(),
+            "--stderr".to_string(),
+            "first.log".to_string(),
+            "--stderr=-".to_string(),
+        ];
+
+        assert_eq!(stderr_redirect_target(&args).as_deref(), Some("-"));
+    }
+
+    #[test]
+    fn stderr_redirect_scan_skips_option_values() {
+        let args = vec![
+            "--url".to_string(),
+            "--stderr".to_string(),
+            "-o".to_string(),
+            "--stderr".to_string(),
+            "--stderr".to_string(),
+            "actual.log".to_string(),
+            "https://example.com".to_string(),
+        ];
+
+        assert_eq!(stderr_redirect_target(&args).as_deref(), Some("actual.log"));
     }
 
     #[test]
