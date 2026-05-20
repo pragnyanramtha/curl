@@ -112,6 +112,7 @@ pub struct TransferConfig {
     pub low_speed_limit: u64,
     pub low_speed_time: Duration,
     pub max_filesize: Option<u64>,
+    pub ignore_content_length: bool,
     pub user_agent: Option<String>,
     pub referer: Option<String>,
     pub auto_referer: bool,
@@ -511,6 +512,7 @@ impl Default for TransferConfig {
             low_speed_limit: 0,
             low_speed_time: Duration::ZERO,
             max_filesize: None,
+            ignore_content_length: false,
             user_agent: None,
             referer: None,
             auto_referer: false,
@@ -623,11 +625,6 @@ impl Parser {
         };
 
         if let Some(name) = name.strip_prefix("no-") {
-            if inline_value.is_some() {
-                return Err(CurlError::Usage(format!(
-                    "option --no-{name} does not take a value"
-                )));
-            }
             self.parse_no_long(name)?;
             return Ok(());
         }
@@ -986,6 +983,7 @@ impl Parser {
                 let value = self.value_for(name, inline_value)?;
                 self.current().max_filesize = Some(parse_size_parameter(name, &value)?);
             }
+            "ignore-content-length" => self.current().ignore_content_length = true,
             "user-agent" => {
                 let value = self.value_for(name, inline_value)?;
                 self.current().user_agent = Some(value);
@@ -1104,6 +1102,7 @@ impl Parser {
             "compressed" => self.current().compressed = false,
             "tr-encoding" => self.current().tr_encoding = false,
             "raw" => self.current().raw = false,
+            "ignore-content-length" => self.current().ignore_content_length = false,
             "verbose" => self.current().verbose = false,
             "progress-meter" => self.current().silent = true,
             "silent" => self.current().silent = false,
@@ -1738,6 +1737,7 @@ impl TransferConfig {
             || self.low_speed_limit != 0
             || self.low_speed_time != Duration::ZERO
             || self.max_filesize.is_some()
+            || self.ignore_content_length
             || self.user_agent.is_some()
             || self.referer.is_some()
             || self.auto_referer
@@ -2533,6 +2533,7 @@ fn print_common_help() {
                --retry-delay <seconds> Wait time between retries\n\
                --retry-max-time <sec>  Retry only within this period\n\
                --max-filesize <bytes> Maximum file size to download\n\
+               --ignore-content-length Ignore Content-Length headers\n\
            -o, --output <file>         Write output to file\n\
                --out-null              Discard response data\n\
            -O, --remote-name           Write output to remote filename\n\
@@ -3099,6 +3100,22 @@ mod tests {
         ])
         .unwrap();
         assert!(!config.transfers[0].tr_encoding);
+    }
+
+    #[test]
+    fn parses_ignore_content_length_boolean_option() {
+        let config =
+            parse_args(["-q", "--ignore-content-length=0", "https://example.com"]).unwrap();
+        assert!(config.transfers[0].ignore_content_length);
+
+        let config = parse_args([
+            "-q",
+            "--ignore-content-length",
+            "--no-ignore-content-length=1",
+            "https://example.com",
+        ])
+        .unwrap();
+        assert!(!config.transfers[0].ignore_content_length);
     }
 
     #[test]

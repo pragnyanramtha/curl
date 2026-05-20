@@ -4299,6 +4299,23 @@ fn max_filesize_does_not_fail_head_with_large_content_length() {
 }
 
 #[test]
+fn ignore_content_length_reads_short_http_body_until_close() {
+    let (url, rx) = spawn_server(
+        b"HTTP/1.1 200 OK\r\nContent-Length: 677654\r\nConnection: close\r\n\r\nmuahahaha\n",
+    );
+
+    let mut command = Command::cargo_bin("curl").unwrap();
+    command.args(["-q", "-sS", "--ignore-content-length", &url]);
+    command.assert().success().stdout("muahahaha\n");
+
+    let request = rx.recv().unwrap();
+    assert_eq!(request.start_line, "GET /resource HTTP/1.1");
+    assert!(header(&request, "host").is_some());
+    assert!(header(&request, "user-agent").is_some());
+    assert_eq!(header(&request, "accept"), Some("*/*"));
+}
+
+#[test]
 fn raw_http_head_reuses_connection_for_sequential_urls() {
     let (url, rx) = spawn_reusable_sequence_server(vec![
         b"HTTP/1.1 200 OK\r\nDate: Tue, 09 Nov 2010 14:49:00 GMT\r\n\r\n",
@@ -4824,6 +4841,45 @@ fn ftp_retr_downloads_file_and_sends_default_sequence() {
     assert_eq!(
         record.commands,
         b"USER anonymous\r\nPASS ftp@example.com\r\nPWD\r\nCWD path\r\nEPSV\r\nTYPE I\r\nSIZE file.txt\r\nRETR file.txt\r\nQUIT\r\n"
+    );
+    assert_eq!(record.data_connections, 1);
+}
+
+#[test]
+fn ftp_ignore_content_length_skips_size_before_retr() {
+    let body = b"0123456789abcdef0123456789abcdef0123456789abcdef";
+    let mut options = ftp_options(body.as_slice());
+    options.size = Some(8);
+    let (url, rx) = spawn_ftp_server("/416", options);
+
+    let mut command = Command::cargo_bin("curl").unwrap();
+    command.args(["-q", "-sS", "--ignore-content-length", &url]);
+    command.assert().success().stdout(body.as_slice());
+
+    let record = rx.recv().unwrap();
+    assert_eq!(
+        record.commands,
+        b"USER anonymous\r\nPASS ftp@example.com\r\nPWD\r\nEPSV\r\nTYPE I\r\nRETR 416\r\nQUIT\r\n"
+    );
+    assert_eq!(record.data_connections, 1);
+}
+
+#[test]
+fn ftp_ignore_content_length_pasv_fallback_skips_size_before_retr() {
+    let body = b"despite a size in the RETR response\r\n";
+    let mut options = ftp_options(body.as_slice());
+    options.epsv_fails = true;
+    options.size = Some(8);
+    let (url, rx) = spawn_ftp_server("/1137", options);
+
+    let mut command = Command::cargo_bin("curl").unwrap();
+    command.args(["-q", "-sS", "--ignore-content-length", &url]);
+    command.assert().success().stdout(body.as_slice());
+
+    let record = rx.recv().unwrap();
+    assert_eq!(
+        record.commands,
+        b"USER anonymous\r\nPASS ftp@example.com\r\nPWD\r\nEPSV\r\nPASV\r\nTYPE I\r\nRETR 1137\r\nQUIT\r\n"
     );
     assert_eq!(record.data_connections, 1);
 }
@@ -11067,6 +11123,7 @@ fn libcurl_writes_source_file_for_supported_options() {
         "--disallow-username-in-url",
         "--max-filesize",
         "2M",
+        "--ignore-content-length",
         "--http1.1",
         "--tlsv1.2",
         "--tls-max",
@@ -11107,6 +11164,7 @@ fn libcurl_writes_source_file_for_supported_options() {
     assert!(text.contains("CURLOPT_CONNECT_TO, slist3"));
     assert!(text.contains("CURLOPT_DISALLOW_USERNAME_IN_URL, 1"));
     assert!(text.contains("CURLOPT_MAXFILESIZE_LARGE, (curl_off_t)2097152"));
+    assert!(text.contains("CURLOPT_IGNORE_CONTENT_LENGTH, 1"));
     assert!(text.contains("CURLOPT_REFERER, \"firstone.html\""));
     assert!(text.contains("CURLOPT_AUTOREFERER, 1"));
     assert!(text.contains("CURLOPT_HTTP_VERSION, CURL_HTTP_VERSION_1_1"));

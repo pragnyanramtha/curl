@@ -346,6 +346,9 @@ fn write_request(out: &mut String, render: &RenderTransfer<'_>, url: &str) -> Re
     if transfer.use_ascii {
         emit_long_setopt(out, "CURLOPT_TRANSFERTEXT", 1);
     }
+    if transfer.ignore_content_length {
+        emit_long_setopt(out, "CURLOPT_IGNORE_CONTENT_LENGTH", 1);
+    }
     if let Some(body) = &render.body
         && !transfer.get
     {
@@ -906,6 +909,36 @@ mod tests {
         assert!(source.contains("CURLOPT_PROXY, \"http://proxy.example:8080\""));
         assert!(source.contains("CURLOPT_NOPROXY, \"localhost\""));
         assert!(source.contains("CURLOPT_USERAGENT, \"MyUA\""));
+    }
+
+    #[test]
+    fn renders_ignore_content_length_option() {
+        let config = parse_args([
+            "-q",
+            "--libcurl",
+            "client.c",
+            "--ignore-content-length",
+            "https://example.com",
+        ])
+        .unwrap();
+
+        let source = render_source(&config).unwrap();
+
+        assert!(source.contains("CURLOPT_IGNORE_CONTENT_LENGTH, 1L"));
+
+        let config = parse_args([
+            "-q",
+            "--libcurl",
+            "client.c",
+            "--ignore-content-length",
+            "--no-ignore-content-length",
+            "https://example.com",
+        ])
+        .unwrap();
+
+        let source = render_source(&config).unwrap();
+
+        assert!(!source.contains("CURLOPT_IGNORE_CONTENT_LENGTH"));
     }
 
     #[test]

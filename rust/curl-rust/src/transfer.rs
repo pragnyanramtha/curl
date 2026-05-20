@@ -1452,16 +1452,19 @@ async fn ftp_download_body(
     ftp_run_quote_commands(stream, &transfer.ftp_prequote, metrics, control_headers).await?;
 
     if let Some(file) = path.file.as_ref().filter(|_| !ascii && !list_only) {
-        let mut size_command = Vec::from(&b"SIZE "[..]);
-        size_command.extend_from_slice(file);
-        let response = ftp_command(stream, &size_command, metrics, control_headers).await?;
-        let remote_size = if response.code == 213 {
-            ftp_size_value(&response)
-        } else {
+        let remote_size = if transfer.ignore_content_length {
             None
+        } else {
+            let mut size_command = Vec::from(&b"SIZE "[..]);
+            size_command.extend_from_slice(file);
+            let response = ftp_command(stream, &size_command, metrics, control_headers).await?;
+            if response.code == 213 {
+                ftp_size_value(&response)
+            } else {
+                None
+            }
         };
-        if response.code == 213
-            && let (Some(max), Some(size)) = (transfer.max_filesize, remote_size)
+        if let (Some(max), Some(size)) = (transfer.max_filesize, remote_size)
             && max > 0
             && size > max
         {
@@ -8071,6 +8074,9 @@ fn check_http_content_length_max_filesize(
     if ignore_body {
         return Ok(());
     }
+    if transfer.ignore_content_length {
+        return Ok(());
+    }
 
     let Some(value) = headers.get(CONTENT_LENGTH) else {
         return Ok(());
@@ -8479,6 +8485,7 @@ async fn run_http_transfer(
         && (transfer.request_target.is_some()
             || transfer.raw
             || transfer.tr_encoding
+            || transfer.ignore_content_length
             || initial_connect_to.is_some()
             || custom_host_header
             || (method != Method::HEAD && max_filesize_limit(transfer).is_some()))
@@ -8665,7 +8672,10 @@ async fn run_http_transfer(
     if let Some(proxy) = explicit_proxy.as_ref()
         && transfer.follow_location
         && raw_http_proxy_redirect_supported(transfer, &url, has_multipart)
-        && (transfer.request_target.is_some() || transfer.raw || transfer.tr_encoding)
+        && (transfer.request_target.is_some()
+            || transfer.raw
+            || transfer.tr_encoding
+            || transfer.ignore_content_length)
     {
         let custom_method = transfer.method.is_some();
         let post_redirect_body =
@@ -8810,6 +8820,7 @@ async fn run_http_transfer(
         && raw_http_direct_supported(transfer, &url, has_multipart)
         && (transfer.request_target.is_some()
             || transfer.raw
+            || transfer.ignore_content_length
             || transfer.compressed
             || transfer.tr_encoding
             || raw_custom_header_wire_semantics
@@ -9212,6 +9223,7 @@ async fn run_raw_http_proxy_transfer(context: RawHttpProxyContext<'_>) -> Result
         context.url,
         context.resume_from,
         context.transfer.http09_allowed,
+        context.transfer.ignore_content_length,
         context.transfer.raw,
     )
     .await?;
@@ -9311,6 +9323,7 @@ async fn raw_http_send_direct_request(
         context.url,
         context.resume_from,
         context.transfer.http09_allowed,
+        context.transfer.ignore_content_length,
         context.transfer.raw,
     )
     .await
@@ -9716,6 +9729,7 @@ async fn raw_http_read_response(
     final_url: &Url,
     resume_from: u64,
     http09_allowed: bool,
+    ignore_content_length: bool,
     raw_transfer_decoding: bool,
 ) -> Result<HttpAttempt> {
     let mut header_bytes = Vec::new();
@@ -9761,10 +9775,11 @@ async fn raw_http_read_response(
         raw_http_read_chunked_wire_body(stream).await?
     } else if raw_http_response_is_chunked(&headers) {
         raw_http_read_chunked_body(stream).await?
-    } else if let Some(length) = headers
-        .get(CONTENT_LENGTH)
-        .and_then(|value| value.to_str().ok())
-        .and_then(|value| value.parse::<usize>().ok())
+    } else if !ignore_content_length
+        && let Some(length) = headers
+            .get(CONTENT_LENGTH)
+            .and_then(|value| value.to_str().ok())
+            .and_then(|value| value.parse::<usize>().ok())
     {
         let mut body = vec![0_u8; length];
         stream.read_exact(&mut body).await.map_err(tcp_io_error)?;
