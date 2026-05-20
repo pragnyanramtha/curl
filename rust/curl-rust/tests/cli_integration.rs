@@ -390,6 +390,45 @@ fn spawn_sequence_server_bytes(responses: Vec<Vec<u8>>) -> (String, Receiver<Req
     (format!("http://{addr}/resource"), rx)
 }
 
+fn spawn_reusable_sequence_server(
+    responses: Vec<&'static [u8]>,
+) -> (String, Receiver<(usize, RequestRecord)>) {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = listener.local_addr().unwrap();
+    let (tx, rx) = mpsc::channel();
+
+    thread::spawn(move || {
+        let mut responses = responses.into_iter();
+        let Some(first_response) = responses.next() else {
+            return;
+        };
+
+        let mut connection_index = 1;
+        let (mut stream, _) = listener.accept().unwrap();
+        tx.send((connection_index, read_request(&mut stream)))
+            .unwrap();
+        stream.write_all(first_response).unwrap();
+
+        for response in responses {
+            stream
+                .set_read_timeout(Some(Duration::from_millis(500)))
+                .unwrap();
+            let request = if let Some(request) = read_request_maybe(&mut stream) {
+                request
+            } else {
+                let (next_stream, _) = listener.accept().unwrap();
+                stream = next_stream;
+                connection_index += 1;
+                read_request(&mut stream)
+            };
+            tx.send((connection_index, request)).unwrap();
+            stream.write_all(response).unwrap();
+        }
+    });
+
+    (format!("http://{addr}/resource"), rx)
+}
+
 fn spawn_request_target_https_redirect_server() -> (String, Receiver<RequestRecord>) {
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let addr = listener.local_addr().unwrap();
@@ -2116,15 +2155,26 @@ fn spawn_gopher_server_with_listener(
 }
 
 fn read_request(stream: &mut impl Read) -> RequestRecord {
+    read_request_maybe(stream).unwrap()
+}
+
+fn read_request_maybe(stream: &mut impl Read) -> Option<RequestRecord> {
     let mut bytes = Vec::new();
     let mut buffer = [0; 1024];
 
     loop {
-        let read = stream.read(&mut buffer).unwrap();
-        if read == 0 {
-            break;
+        match stream.read(&mut buffer) {
+            Ok(0) if bytes.is_empty() => return None,
+            Ok(0) => break,
+            Ok(read) => bytes.extend_from_slice(&buffer[..read]),
+            Err(error)
+                if bytes.is_empty()
+                    && matches!(error.kind(), ErrorKind::WouldBlock | ErrorKind::TimedOut) =>
+            {
+                return None;
+            }
+            Err(error) => panic!("failed to read request: {error}"),
         }
-        bytes.extend_from_slice(&buffer[..read]);
         if bytes.windows(4).any(|window| window == b"\r\n\r\n") {
             break;
         }
@@ -2151,19 +2201,19 @@ fn read_request(stream: &mut impl Read) -> RequestRecord {
         .unwrap_or(0);
 
     while bytes.len() < header_end + content_length {
-        let read = stream.read(&mut buffer).unwrap();
-        if read == 0 {
-            break;
+        match stream.read(&mut buffer) {
+            Ok(0) => break,
+            Ok(read) => bytes.extend_from_slice(&buffer[..read]),
+            Err(error) => panic!("failed to read request body: {error}"),
         }
-        bytes.extend_from_slice(&buffer[..read]);
     }
 
     let body = bytes[header_end..header_end + content_length].to_vec();
-    RequestRecord {
+    Some(RequestRecord {
         start_line,
         headers,
         body,
-    }
+    })
 }
 
 fn header<'a>(request: &'a RequestRecord, name: &str) -> Option<&'a str> {
@@ -2540,6 +2590,31 @@ fn compressed_decodes_supported_response_bodies() {
 }
 
 #[test]
+fn compressed_writeout_reports_size_delivered() {
+    let (url, _rx) = spawn_server_bytes(compressed_response("gzip", GZIP_COMPRESSED_BODY));
+
+    let output = Command::cargo_bin("curl")
+        .unwrap()
+        .args([
+            "-q",
+            "-sS",
+            "--compressed",
+            "-w",
+            "%{stderr}%{size_delivered}\n",
+            &url,
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(output.stdout, COMPRESSED_BODY);
+    assert_eq!(String::from_utf8(output.stderr).unwrap(), "17\n");
+}
+
+#[test]
 fn compressed_include_preserves_encoded_response_headers() {
     let (url, _rx) = spawn_server_bytes(compressed_response("gzip", GZIP_COMPRESSED_BODY));
 
@@ -2555,8 +2630,8 @@ fn compressed_include_preserves_encoded_response_headers() {
     );
     let stdout = String::from_utf8_lossy(&output.stdout);
     assert!(stdout.starts_with("HTTP/1.1 200 OK\r\n"));
-    assert!(stdout.contains("content-encoding: gzip\r\n"));
-    assert!(stdout.contains("content-length: 37\r\n"));
+    assert!(stdout.contains("Content-Encoding: gzip\r\n"));
+    assert!(stdout.contains("Content-Length: 37\r\n"));
     assert!(stdout.ends_with("\r\n\r\nhello compressed\n"));
 }
 
@@ -2587,8 +2662,8 @@ fn compressed_dump_header_preserves_encoded_response_headers() {
 
     let dumped = std::fs::read_to_string(headers).unwrap();
     assert!(dumped.starts_with("HTTP/1.1 200 OK\r\n"));
-    assert!(dumped.contains("content-encoding: gzip\r\n"));
-    assert!(dumped.contains("content-length: 37\r\n"));
+    assert!(dumped.contains("Content-Encoding: gzip\r\n"));
+    assert!(dumped.contains("Content-Length: 37\r\n"));
 }
 
 #[test]
@@ -3755,6 +3830,24 @@ fn max_filesize_does_not_fail_head_with_large_content_length() {
 }
 
 #[test]
+fn raw_http_head_reuses_connection_for_sequential_urls() {
+    let (url, rx) = spawn_reusable_sequence_server(vec![
+        b"HTTP/1.1 200 OK\r\nDate: Tue, 09 Nov 2010 14:49:00 GMT\r\n\r\n",
+        b"HTTP/1.1 200 OK\r\nDate: Tue, 09 Nov 2010 14:49:00 GMT\r\n\r\n",
+    ]);
+
+    let mut command = Command::cargo_bin("curl").unwrap();
+    command.args(["-q", "-sS", "-d", "foo=moo&moo=poo", "-G", "-I", &url, &url]);
+    command.assert().success();
+
+    let (first_connection, first) = rx.recv().unwrap();
+    let (second_connection, second) = rx.recv().unwrap();
+    assert_eq!(first_connection, second_connection);
+    assert_eq!(first.start_line, "HEAD /resource?foo=moo&moo=poo HTTP/1.1");
+    assert_eq!(second.start_line, "HEAD /resource?foo=moo&moo=poo HTTP/1.1");
+}
+
+#[test]
 fn max_filesize_truncates_telnet_body_then_fails() {
     let (url, rx) = spawn_telnet_server(b"abcdef", b"", b"");
 
@@ -4224,6 +4317,15 @@ fn version_lists_dict_protocol() {
 
     assert!(output.status.success());
     assert!(String::from_utf8(output.stdout).unwrap().contains("DICT"));
+}
+
+#[test]
+fn version_lists_libz_feature() {
+    let mut command = Command::cargo_bin("curl").unwrap();
+    let output = command.args(["-q", "-V"]).output().unwrap();
+
+    assert!(output.status.success());
+    assert!(String::from_utf8(output.stdout).unwrap().contains("libz"));
 }
 
 #[test]

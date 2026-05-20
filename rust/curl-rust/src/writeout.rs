@@ -7,6 +7,7 @@ pub struct Metrics {
     pub url_effective: String,
     pub response_code: Option<u16>,
     pub size_download: u64,
+    pub size_delivered: u64,
     pub time_total: Duration,
     pub content_type: Option<String>,
     pub filename_effective: Option<String>,
@@ -31,6 +32,7 @@ impl Metrics {
             url_effective: url.to_string(),
             response_code: None,
             size_download: 0,
+            size_delivered: 0,
             time_total: Duration::ZERO,
             content_type: None,
             filename_effective: None,
@@ -135,6 +137,7 @@ fn variable(name: &str, metrics: &Metrics) -> String {
             .map(|code| format!("{code:03}"))
             .unwrap_or_else(|| "000".to_string()),
         "size_download" => metrics.size_download.to_string(),
+        "size_delivered" => metrics.size_delivered.to_string(),
         "time_total" => format!("{:.6}", metrics.time_total.as_secs_f64()),
         "content_type" => metrics.content_type.clone().unwrap_or_default(),
         "filename_effective" => metrics.filename_effective.clone().unwrap_or_default(),
@@ -152,11 +155,12 @@ fn variable(name: &str, metrics: &Metrics) -> String {
 
 fn json(metrics: &Metrics) -> String {
     format!(
-        "{{\"url_effective\":\"{}\",\"http_code\":{},\"response_code\":{},\"size_download\":{},\"time_total\":{:.6},\"method\":\"{}\",\"exitcode\":{},\"errormsg\":\"{}\",\"referer\":{},\"num_retries\":{}}}",
+        "{{\"url_effective\":\"{}\",\"http_code\":{},\"response_code\":{},\"size_download\":{},\"size_delivered\":{},\"time_total\":{:.6},\"method\":\"{}\",\"exitcode\":{},\"errormsg\":\"{}\",\"referer\":{},\"num_retries\":{}}}",
         escape_json(&metrics.url_effective),
         metrics.response_code.unwrap_or(0),
         metrics.response_code.unwrap_or(0),
         metrics.size_download,
+        metrics.size_delivered,
         metrics.time_total.as_secs_f64(),
         escape_json(&metrics.method),
         metrics.exit_code,
@@ -210,6 +214,7 @@ mod tests {
         let mut metrics = Metrics::empty("https://example.com/", "GET");
         metrics.response_code = Some(200);
         metrics.size_download = 5;
+        metrics.size_delivered = 5;
         metrics.num_retries = 2;
         metrics.referer = Some("https://refer.example/source".to_string());
 
@@ -220,6 +225,7 @@ mod tests {
             ),
             "https://example.com/ 200 5 https://refer.example/source 2\n"
         );
+        assert_eq!(render("%{size_delivered}", &metrics), "5");
         assert!(
             render("%{json}", &metrics).contains("\"referer\":\"https://refer.example/source\"")
         );

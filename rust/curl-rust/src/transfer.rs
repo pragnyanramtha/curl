@@ -17,8 +17,8 @@ use tokio::net::{TcpStream, UdpSocket};
 use tokio::task::JoinSet;
 
 use reqwest::header::{
-    ACCEPT, ACCEPT_ENCODING, ACCEPT_RANGES, AUTHORIZATION, CONTENT_ENCODING, CONTENT_LENGTH,
-    CONTENT_RANGE, CONTENT_TYPE, COOKIE, ETAG, HeaderMap, HeaderName, HeaderValue,
+    ACCEPT, ACCEPT_ENCODING, ACCEPT_RANGES, AUTHORIZATION, CONNECTION, CONTENT_ENCODING,
+    CONTENT_LENGTH, CONTENT_RANGE, CONTENT_TYPE, COOKIE, ETAG, HeaderMap, HeaderName, HeaderValue,
     IF_MODIFIED_SINCE, IF_NONE_MATCH, IF_UNMODIFIED_SINCE, LAST_MODIFIED, LOCATION, RANGE, REFERER,
     RETRY_AFTER, TRANSFER_ENCODING, USER_AGENT,
 };
@@ -118,6 +118,22 @@ struct RawHttpDirectContext<'a> {
     custom_host_allowed: bool,
 }
 
+#[derive(Default)]
+struct TransferSession {
+    raw_http: RawHttpConnectionPool,
+}
+
+#[derive(Default)]
+struct RawHttpConnectionPool {
+    direct: Option<RawHttpConnection>,
+}
+
+struct RawHttpConnection {
+    host: String,
+    port: u16,
+    stream: TcpStream,
+}
+
 struct ConnectToRule<'a> {
     match_host: &'a str,
     match_port: Option<u16>,
@@ -165,9 +181,17 @@ pub async fn run(config: Config) -> Result<i32> {
         let cookie_jar = build_cookie_jar(transfer)?;
         let client = build_client(transfer, cookie_jar.clone())?;
         let expanded_urls = expand_urls(transfer)?;
+        let mut session = TransferSession::default();
 
         for expanded in expanded_urls {
-            let code = run_expanded_url(transfer, &client, cookie_jar.as_ref(), expanded).await?;
+            let code = run_expanded_url(
+                transfer,
+                &client,
+                cookie_jar.as_ref(),
+                &mut session,
+                expanded,
+            )
+            .await?;
             final_code = code;
         }
 
@@ -298,10 +322,12 @@ fn remaining_timeout(timeout: Option<Duration>, started: Instant) -> Option<Dura
 
 fn spawn_parallel_job(active: &mut JoinSet<Result<(usize, i32)>>, job: ParallelJob) {
     active.spawn(async move {
+        let mut session = TransferSession::default();
         let code = run_expanded_url(
             &job.transfer,
             &job.client,
             job.cookie_jar.as_ref(),
+            &mut session,
             job.expanded,
         )
         .await?;
@@ -588,6 +614,7 @@ async fn run_expanded_url(
     transfer: &TransferConfig,
     client: &Client,
     cookie_jar: Option<&Arc<CookieJar>>,
+    session: &mut TransferSession,
     expanded: ExpandedTransferUrl,
 ) -> Result<i32> {
     let output_target = expanded.output;
@@ -745,7 +772,16 @@ async fn run_expanded_url(
         if method_label == Method::PUT.as_str() && transfer.method.is_none() {
             method = Method::PUT;
         }
-        run_http_with_retries(transfer, client, &expanded, method, &mut metrics, started).await
+        run_http_with_retries(
+            transfer,
+            client,
+            &expanded,
+            method,
+            &mut metrics,
+            started,
+            session,
+        )
+        .await
     } else if let Some((scheme, _)) = expanded.url.split_once("://") {
         Err(CurlError::UnsupportedProtocol(scheme.to_string()))
     } else {
@@ -753,7 +789,16 @@ async fn run_expanded_url(
         if method_label == Method::PUT.as_str() && transfer.method.is_none() {
             method = Method::PUT;
         }
-        run_http_with_retries(transfer, client, &expanded, method, &mut metrics, started).await
+        run_http_with_retries(
+            transfer,
+            client,
+            &expanded,
+            method,
+            &mut metrics,
+            started,
+            session,
+        )
+        .await
     };
 
     metrics.time_total = started.elapsed();
@@ -8013,6 +8058,7 @@ async fn run_http_transfer(
     expanded: &glob::ExpandedUrl,
     method: Method,
     metrics: &mut writeout::Metrics,
+    session: &mut TransferSession,
 ) -> Result<HttpAttempt> {
     let prepared_query = data::prepare_body(&transfer.url_query)?;
     let prepared_body = data::prepare_body(&transfer.data)?;
@@ -8130,19 +8176,22 @@ async fn run_http_transfer(
             let sensitive_headers_allowed =
                 transfer.location_trusted || same_redirect_origin(&initial_url, &url);
             let custom_host_allowed = same_redirect_origin(&initial_url, &url);
-            let attempt = run_raw_http_direct_transfer(RawHttpDirectContext {
-                transfer,
-                url: &url,
-                connect_host: &connect_host,
-                connect_port,
-                method: &current_method,
-                prepared_body: request_body,
-                upload_body: upload,
-                resume_from,
-                referer: custom_referer.as_deref().or(current_referer.as_deref()),
-                sensitive_headers_allowed,
-                custom_host_allowed,
-            })
+            let attempt = run_raw_http_direct_transfer(
+                RawHttpDirectContext {
+                    transfer,
+                    url: &url,
+                    connect_host: &connect_host,
+                    connect_port,
+                    method: &current_method,
+                    prepared_body: request_body,
+                    upload_body: upload,
+                    resume_from,
+                    referer: custom_referer.as_deref().or(current_referer.as_deref()),
+                    sensitive_headers_allowed,
+                    custom_host_allowed,
+                },
+                session,
+            )
             .await?;
 
             if attempt.status.is_some_and(is_followed_redirect)
@@ -8253,19 +8302,22 @@ async fn run_http_transfer(
                     .to_string(),
             ));
         }
-        let attempt = run_raw_http_direct_transfer(RawHttpDirectContext {
-            transfer,
-            url: &url,
-            connect_host: &connect_to.host,
-            connect_port: connect_to.port,
-            method: &method,
-            prepared_body: prepared_body.as_ref(),
-            upload_body: upload_body.as_deref(),
-            resume_from,
-            referer: custom_referer.as_deref().or(current_referer.as_deref()),
-            sensitive_headers_allowed: true,
-            custom_host_allowed: true,
-        })
+        let attempt = run_raw_http_direct_transfer(
+            RawHttpDirectContext {
+                transfer,
+                url: &url,
+                connect_host: &connect_to.host,
+                connect_port: connect_to.port,
+                method: &method,
+                prepared_body: prepared_body.as_ref(),
+                upload_body: upload_body.as_deref(),
+                resume_from,
+                referer: custom_referer.as_deref().or(current_referer.as_deref()),
+                sensitive_headers_allowed: true,
+                custom_host_allowed: true,
+            },
+            session,
+        )
         .await?;
         metrics.url_effective = attempt.final_url.to_string();
         metrics.response_code = attempt.status.map(|status| status.as_u16());
@@ -8429,25 +8481,29 @@ async fn run_http_transfer(
     if explicit_proxy.is_none()
         && raw_http_direct_supported(transfer, &url, has_multipart)
         && (transfer.request_target.is_some()
+            || transfer.compressed
             || raw_custom_header_wire_semantics
             || method == Method::HEAD
             || (method != Method::HEAD && max_filesize_limit(transfer).is_some()))
     {
-        let attempt = run_raw_http_direct_transfer(RawHttpDirectContext {
-            transfer,
-            url: &url,
-            connect_host: url
-                .host_str()
-                .ok_or_else(|| CurlError::Url("URL is missing a host".to_string()))?,
-            connect_port: url.port_or_known_default().unwrap_or(80),
-            method: &method,
-            prepared_body: prepared_body.as_ref(),
-            upload_body: upload_body.as_deref(),
-            resume_from,
-            referer: custom_referer.as_deref().or(current_referer.as_deref()),
-            sensitive_headers_allowed: true,
-            custom_host_allowed: true,
-        })
+        let attempt = run_raw_http_direct_transfer(
+            RawHttpDirectContext {
+                transfer,
+                url: &url,
+                connect_host: url
+                    .host_str()
+                    .ok_or_else(|| CurlError::Url("URL is missing a host".to_string()))?,
+                connect_port: url.port_or_known_default().unwrap_or(80),
+                method: &method,
+                prepared_body: prepared_body.as_ref(),
+                upload_body: upload_body.as_deref(),
+                resume_from,
+                referer: custom_referer.as_deref().or(current_referer.as_deref()),
+                sensitive_headers_allowed: true,
+                custom_host_allowed: true,
+            },
+            session,
+        )
         .await?;
         metrics.url_effective = attempt.final_url.to_string();
         metrics.response_code = attempt.status.map(|status| status.as_u16());
@@ -8788,21 +8844,141 @@ async fn run_raw_http_proxy_transfer(context: RawHttpProxyContext<'_>) -> Result
     Ok(attempt)
 }
 
-async fn run_raw_http_direct_transfer(context: RawHttpDirectContext<'_>) -> Result<HttpAttempt> {
+impl RawHttpConnectionPool {
+    async fn open_direct(
+        &mut self,
+        host: &str,
+        port: u16,
+        transfer: &TransferConfig,
+        reuse_allowed: bool,
+    ) -> Result<(TcpStream, bool)> {
+        if reuse_allowed {
+            if let Some(connection) = self.direct.take()
+                && connection.host == host
+                && connection.port == port
+            {
+                return Ok((connection.stream, true));
+            }
+        } else {
+            self.direct = None;
+        }
+
+        Ok((connect_tcp(host, port, transfer).await?, false))
+    }
+
+    fn store_direct(&mut self, host: &str, port: u16, stream: TcpStream) {
+        self.direct = Some(RawHttpConnection {
+            host: host.to_string(),
+            port,
+            stream,
+        });
+    }
+}
+
+async fn run_raw_http_direct_transfer(
+    context: RawHttpDirectContext<'_>,
+    session: &mut TransferSession,
+) -> Result<HttpAttempt> {
     let request = raw_http_direct_request(&context)?;
-    let mut stream =
-        connect_tcp(context.connect_host, context.connect_port, context.transfer).await?;
-    stream.write_all(&request).await.map_err(tcp_io_error)?;
-    let mut attempt = raw_http_read_response(
-        &mut stream,
+    let reuse_allowed = raw_http_direct_request_allows_reuse(context.transfer, context.method)?;
+    let (mut stream, reused) = session
+        .raw_http
+        .open_direct(
+            context.connect_host,
+            context.connect_port,
+            context.transfer,
+            reuse_allowed,
+        )
+        .await?;
+
+    let mut attempt = match raw_http_send_direct_request(&mut stream, &request, &context).await {
+        Ok(attempt) => attempt,
+        Err(_) if reused => {
+            drop(stream);
+            let (mut fresh, _) = session
+                .raw_http
+                .open_direct(
+                    context.connect_host,
+                    context.connect_port,
+                    context.transfer,
+                    false,
+                )
+                .await?;
+            let mut attempt = raw_http_send_direct_request(&mut fresh, &request, &context).await?;
+            decode_http_attempt_body(context.transfer, &mut attempt)?;
+            if raw_http_direct_response_allows_reuse(reuse_allowed, &attempt) {
+                session
+                    .raw_http
+                    .store_direct(context.connect_host, context.connect_port, fresh);
+            }
+            return Ok(attempt);
+        }
+        Err(error) => return Err(error),
+    };
+    decode_http_attempt_body(context.transfer, &mut attempt)?;
+    if raw_http_direct_response_allows_reuse(reuse_allowed, &attempt) {
+        session
+            .raw_http
+            .store_direct(context.connect_host, context.connect_port, stream);
+    }
+    Ok(attempt)
+}
+
+async fn raw_http_send_direct_request(
+    stream: &mut TcpStream,
+    request: &[u8],
+    context: &RawHttpDirectContext<'_>,
+) -> Result<HttpAttempt> {
+    stream.write_all(request).await.map_err(tcp_io_error)?;
+    raw_http_read_response(
+        stream,
         context.method,
         context.url,
         context.resume_from,
         context.transfer.http09_allowed,
     )
-    .await?;
-    decode_http_attempt_body(context.transfer, &mut attempt)?;
-    Ok(attempt)
+    .await
+}
+
+fn raw_http_direct_request_allows_reuse(
+    transfer: &TransferConfig,
+    method: &Method,
+) -> Result<bool> {
+    if *method != Method::HEAD {
+        return Ok(false);
+    }
+
+    Ok(!parse_headers(&transfer.headers)?
+        .iter()
+        .any(|(name, value)| {
+            name.as_str().eq_ignore_ascii_case(CONNECTION.as_str())
+                && value
+                    .as_ref()
+                    .is_some_and(|value| header_value_has_token(value, "close"))
+        }))
+}
+
+fn raw_http_direct_response_allows_reuse(reuse_allowed: bool, attempt: &HttpAttempt) -> bool {
+    reuse_allowed
+        && attempt.version != Version::HTTP_09
+        && !header_map_has_token(&attempt.headers, CONNECTION, "close")
+        && (attempt.version != Version::HTTP_10
+            || header_map_has_token(&attempt.headers, CONNECTION, "keep-alive"))
+}
+
+fn header_map_has_token(headers: &HeaderMap, name: HeaderName, token: &str) -> bool {
+    headers
+        .get_all(name)
+        .iter()
+        .any(|value| header_value_has_token(value, token))
+}
+
+fn header_value_has_token(value: &HeaderValue, token: &str) -> bool {
+    value.to_str().ok().is_some_and(|value| {
+        value
+            .split(',')
+            .any(|entry| entry.trim().eq_ignore_ascii_case(token))
+    })
 }
 
 fn raw_http_direct_request(context: &RawHttpDirectContext<'_>) -> Result<Vec<u8>> {
@@ -9445,11 +9621,13 @@ async fn run_http_with_retries(
     method: Method,
     metrics: &mut writeout::Metrics,
     retry_started: Instant,
+    session: &mut TransferSession,
 ) -> Result<()> {
     loop {
         reset_attempt_metrics(metrics);
 
-        let attempt = run_http_transfer(transfer, client, expanded, method.clone(), metrics);
+        let attempt =
+            run_http_transfer(transfer, client, expanded, method.clone(), metrics, session);
         let attempt = if let Some(timeout) = remaining_timeout(transfer.max_time, retry_started) {
             tokio::time::timeout(timeout, attempt)
                 .await
@@ -9560,6 +9738,8 @@ fn write_http_attempt_output(
         (&[][..], false)
     };
     metrics.size_download = body_bytes.len() as u64;
+    metrics.size_delivered =
+        delivered_http_bytes(write_headers, &header_bytes, write_body, body_bytes);
 
     if write_headers || write_body {
         let mut bytes = Vec::new();
@@ -9581,6 +9761,17 @@ fn write_http_attempt_output(
     }
 
     Ok(max_filesize_exceeded)
+}
+
+fn delivered_http_bytes(
+    write_headers: bool,
+    header_bytes: &[u8],
+    write_body: bool,
+    body_bytes: &[u8],
+) -> u64 {
+    let header_len = if write_headers { header_bytes.len() } else { 0 };
+    let body_len = if write_body { body_bytes.len() } else { 0 };
+    (header_len + body_len) as u64
 }
 
 async fn schedule_retry(

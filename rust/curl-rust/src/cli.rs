@@ -2414,7 +2414,7 @@ pub fn print_version() {
     println!(
         "Protocols: DICT FILE FTP GOPHER HTTP HTTPS IMAP IPFS IPNS LDAP MQTT POP3 RTSP SCP SFTP SMB SMTP TELNET TFTP WS"
     );
-    println!("Features: AsynchDNS IPv6 Largefile SSL threadsafe");
+    println!("Features: AsynchDNS IPv6 Largefile SSL libz threadsafe");
 }
 
 fn curl_compat_version() -> &'static str {
