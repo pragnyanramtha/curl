@@ -54,6 +54,10 @@ pub fn write_response(
     bytes: &[u8],
     append: bool,
 ) -> Result<Option<PathBuf>> {
+    if transfer.out_null {
+        return Ok(None);
+    }
+
     let path = output_path(transfer, url, headers, variables)?;
     match path {
         Some(path) => {
@@ -92,6 +96,9 @@ pub fn write_response(
 }
 
 pub fn validate_output_target(transfer: &TransferConfig, url: &Url) -> Result<()> {
+    if transfer.out_null {
+        return Ok(());
+    }
     if transfer.remote_name && !transfer.remote_header_name {
         remote_url_filename(url)?;
     }
@@ -187,6 +194,10 @@ pub fn output_path(
     headers: &HeaderMap,
     variables: &[String],
 ) -> Result<Option<PathBuf>> {
+    if transfer.out_null {
+        return Ok(None);
+    }
+
     if let Some(output) = &transfer.output {
         if output == "-" {
             return Ok(None);

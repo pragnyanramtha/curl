@@ -66,6 +66,8 @@ pub struct TransferConfig {
     pub ipfs_gateway: Option<String>,
     pub proto_default: Option<String>,
     pub output: Option<String>,
+    pub output_slots: Vec<OutputTarget>,
+    pub out_null: bool,
     pub output_dir: Option<PathBuf>,
     pub remote_name: bool,
     pub remote_header_name: bool,
@@ -127,6 +129,12 @@ pub struct TransferConfig {
 pub enum ContinueAt {
     Offset(u64),
     Auto,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum OutputTarget {
+    File(String),
+    Null,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -393,6 +401,8 @@ impl Default for TransferConfig {
             ipfs_gateway: None,
             proto_default: None,
             output: None,
+            output_slots: Vec::new(),
+            out_null: false,
             output_dir: None,
             remote_name: false,
             remote_header_name: false,
@@ -755,8 +765,9 @@ impl Parser {
             }
             "output" => {
                 let value = self.value_for(name, inline_value)?;
-                self.current().output = Some(value);
+                self.set_output_file(value);
             }
+            "out-null" => self.set_output_null(),
             "output-dir" => {
                 let value = self.value_for(name, inline_value)?;
                 self.current().output_dir = Some(PathBuf::from(value));
@@ -977,6 +988,7 @@ impl Parser {
             "compressed-ssh" => self.current().compressed_ssh = false,
             "tftp-no-options" => self.current().tftp_no_options = false,
             "proto-default" => self.current().proto_default = None,
+            "out-null" => self.set_output_null(),
             "compressed" => self.current().compressed = false,
             "verbose" => self.current().verbose = false,
             "progress-meter" => self.current().silent = true,
@@ -1085,7 +1097,7 @@ impl Parser {
                 }
                 'o' => {
                     let value = self.short_value('o', rest)?;
-                    self.current().output = Some(value);
+                    self.set_output_file(value);
                     break;
                 }
                 'O' => self.current().remote_name = true,
@@ -1253,6 +1265,20 @@ impl Parser {
             transfer.auto_referer = false;
             transfer.referer = (!value.is_empty()).then_some(value);
         }
+    }
+
+    fn set_output_file(&mut self, value: String) {
+        let transfer = self.current();
+        transfer.output = Some(value.clone());
+        transfer.out_null = false;
+        transfer.output_slots.push(OutputTarget::File(value));
+    }
+
+    fn set_output_null(&mut self) {
+        let transfer = self.current();
+        transfer.out_null = true;
+        transfer.output = None;
+        transfer.output_slots.push(OutputTarget::Null);
     }
 
     fn push_url(&mut self, url: String, remote_name: bool, globoff: bool) {
@@ -1483,6 +1509,8 @@ impl TransferConfig {
             || self.ipfs_gateway.is_some()
             || self.proto_default.is_some()
             || self.output.is_some()
+            || !self.output_slots.is_empty()
+            || self.out_null
             || self.output_dir.is_some()
             || self.remote_name
             || self.remote_header_name
@@ -2052,7 +2080,7 @@ fn print_common_help() {
                --tftp-blksize <value>  Set TFTP BLKSIZE option\n\
                --tftp-no-options       Do not send TFTP options\n\
           -B, --use-ascii             Use ASCII/text transfer\n\
-           -t, --telnet-option <opt>   Set telnet option\n\
+          -t, --telnet-option <opt>    Set telnet option\n\
                --ipfs-gateway <URL>    Gateway for IPFS/IPNS URLs\n\
                --proto-default <proto> Default protocol for schemeless URLs\n\
                --url-query <data>      Add URL query data\n\
@@ -2072,8 +2100,9 @@ fn print_common_help() {
                --retry <num>           Retry transient transfer problems\n\
                --retry-delay <seconds> Wait time between retries\n\
                --retry-max-time <sec>  Retry only within this period\n\
-              --max-filesize <bytes> Maximum file size to download\n\
+               --max-filesize <bytes> Maximum file size to download\n\
            -o, --output <file>         Write output to file\n\
+               --out-null              Discard response data\n\
            -O, --remote-name           Write output to remote filename\n\
                --etag-compare <file>   Load ETag from file\n\
                --etag-save <file>      Save response ETag to file\n\
@@ -2408,7 +2437,41 @@ mod tests {
         assert_eq!(transfer.headers, ["Accept: text/plain"]);
         assert_eq!(transfer.data[0].value, "a=b");
         assert_eq!(transfer.output.as_deref(), Some("out.txt"));
+        assert_eq!(
+            transfer.output_slots,
+            [OutputTarget::File("out.txt".to_string())]
+        );
         assert_eq!(transfer.urls, ["https://example.com"]);
+    }
+
+    #[test]
+    fn parses_out_null_as_output_slot() {
+        let config = parse_args([
+            "-q",
+            "https://example.com/one",
+            "https://example.com/two",
+            "--out-null",
+            "-o",
+            "-",
+        ])
+        .unwrap();
+
+        let transfer = &config.transfers[0];
+        assert!(!transfer.out_null);
+        assert_eq!(transfer.output.as_deref(), Some("-"));
+        assert_eq!(
+            transfer.output_slots,
+            [OutputTarget::Null, OutputTarget::File("-".to_string())]
+        );
+    }
+
+    #[test]
+    fn parses_no_out_null_as_output_slot() {
+        let config = parse_args(["-q", "--no-out-null", "https://example.com"]).unwrap();
+
+        let transfer = &config.transfers[0];
+        assert!(transfer.out_null);
+        assert_eq!(transfer.output_slots, [OutputTarget::Null]);
     }
 
     #[test]

@@ -25,8 +25,8 @@ use reqwest::header::{
 use reqwest::{Client, Method, StatusCode, Url, Version};
 
 use crate::cli::{
-    Config, ContinueAt, HttpVersionPreference, IpVersionPreference, SslVersionPreference,
-    TransferConfig,
+    Config, ContinueAt, HttpVersionPreference, IpVersionPreference, OutputTarget,
+    SslVersionPreference, TransferConfig,
 };
 use crate::cookie::CookieJar;
 use crate::data::{self, PreparedBody};
@@ -184,7 +184,13 @@ struct ParallelJob {
     transfer: TransferConfig,
     client: Client,
     cookie_jar: Option<Arc<CookieJar>>,
+    expanded: ExpandedTransferUrl,
+}
+
+#[derive(Clone)]
+struct ExpandedTransferUrl {
     expanded: glob::ExpandedUrl,
+    output: Option<OutputTarget>,
 }
 
 struct CookieSave {
@@ -290,7 +296,7 @@ fn spawn_parallel_job(active: &mut JoinSet<Result<(usize, i32)>>, job: ParallelJ
     });
 }
 
-fn expand_urls(transfer: &TransferConfig) -> Result<Vec<glob::ExpandedUrl>> {
+fn expand_urls(transfer: &TransferConfig) -> Result<Vec<ExpandedTransferUrl>> {
     let mut expanded = Vec::new();
     for (index, url) in transfer.urls.iter().enumerate() {
         let url = glob::apply_default_protocol(url, transfer.proto_default.as_deref());
@@ -301,12 +307,16 @@ fn expand_urls(transfer: &TransferConfig) -> Result<Vec<glob::ExpandedUrl>> {
             .get(index)
             .copied()
             .unwrap_or(false);
+        let output = transfer.output_slots.get(index).cloned();
         expanded.extend(
             glob::expand_url(&url, globoff)?
                 .into_iter()
                 .map(|mut expanded_url| {
                     expanded_url.remote_name = remote_name;
-                    expanded_url
+                    ExpandedTransferUrl {
+                        expanded: expanded_url,
+                        output: output.clone(),
+                    }
                 }),
         );
     }
@@ -549,8 +559,10 @@ async fn run_expanded_url(
     transfer: &TransferConfig,
     client: &Client,
     cookie_jar: Option<&Arc<CookieJar>>,
-    expanded: glob::ExpandedUrl,
+    expanded: ExpandedTransferUrl,
 ) -> Result<i32> {
+    let output_target = expanded.output;
+    let expanded = expanded.expanded;
     let mut method_label = effective_method_label(transfer);
     let mut metrics = writeout::Metrics::empty(&expanded.url, &method_label);
     let started = Instant::now();
@@ -580,16 +592,31 @@ async fn run_expanded_url(
     }
 
     let owned_transfer;
-    let transfer = if expanded.remote_name && !transfer.remote_name {
-        owned_transfer = {
-            let mut transfer = transfer.clone();
-            transfer.remote_name = true;
+    let transfer =
+        if expanded.remote_name || output_target.is_some() || !transfer.output_slots.is_empty() {
+            owned_transfer = {
+                let mut transfer = transfer.clone();
+                if !transfer.output_slots.is_empty() {
+                    transfer.output = None;
+                    transfer.out_null = false;
+                }
+                if expanded.remote_name {
+                    transfer.remote_name = true;
+                }
+                if let Some(output_target) = output_target {
+                    transfer.remote_name = false;
+                    transfer.remote_header_name = false;
+                    match output_target {
+                        OutputTarget::File(path) => transfer.output = Some(path),
+                        OutputTarget::Null => transfer.out_null = true,
+                    }
+                }
+                transfer
+            };
+            &owned_transfer
+        } else {
             transfer
         };
-        &owned_transfer
-    } else {
-        transfer
-    };
 
     if let Some(cookie_jar) = cookie_jar
         && transfer.cookie.is_some()

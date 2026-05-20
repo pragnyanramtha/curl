@@ -2081,6 +2081,44 @@ fn downloads_http_and_renders_writeout() {
 }
 
 #[test]
+fn out_null_discards_one_url_and_keeps_later_output_slot() {
+    let (url, rx) = spawn_sequence_server(vec![
+        b"HTTP/1.1 200 OK\r\nContent-Length: 3\r\nConnection: close\r\n\r\none",
+        b"HTTP/1.1 200 OK\r\nContent-Length: 3\r\nConnection: close\r\n\r\ntwo",
+    ]);
+    let origin = gateway_origin(&url);
+    let first = format!("{origin}/first");
+    let second = format!("{origin}/second");
+
+    let mut command = Command::cargo_bin("curl").unwrap();
+    command.args(["-q", "-sS", &first, &second, "--out-null", "-o", "-"]);
+    command.assert().success().stdout("two");
+
+    let first_request = rx.recv().unwrap();
+    let second_request = rx.recv().unwrap();
+    assert!(first_request.start_line.starts_with("GET /first HTTP/1.1"));
+    assert!(
+        second_request
+            .start_line
+            .starts_with("GET /second HTTP/1.1")
+    );
+}
+
+#[test]
+fn out_null_discards_included_headers_and_body() {
+    let (url, rx) = spawn_server(
+        b"HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: 5\r\n\r\nhello",
+    );
+
+    let mut command = Command::cargo_bin("curl").unwrap();
+    command.args(["-q", "-sS", "-i", "--out-null", &url]);
+    command.assert().success().stdout("");
+
+    let request = rx.recv().unwrap();
+    assert!(request.start_line.starts_with("GET /resource HTTP/1.1"));
+}
+
+#[test]
 fn duplicate_location_headers_accept_exact_repeat() {
     let (url, rx) = spawn_server(
         b"HTTP/1.1 200 OK\r\nLocation: this\r\nLocation: this\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok",
