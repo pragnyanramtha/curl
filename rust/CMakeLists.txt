@@ -19,13 +19,15 @@ file(GLOB_RECURSE _curl_rust_sources CONFIGURE_DEPENDS
 
 add_custom_command(
   OUTPUT "${_curl_rust_sidecar}"
+  COMMAND ${CMAKE_COMMAND} -E make_directory
+    "${_curl_rust_target_dir}"
+    "${CMAKE_CURRENT_BINARY_DIR}/bin"
   COMMAND ${CMAKE_COMMAND} -E env
     "CARGO_TARGET_DIR=${_curl_rust_target_dir}"
     "${CARGO_EXECUTABLE}" build
       --locked
       --manifest-path "${CMAKE_CURRENT_SOURCE_DIR}/curl-rust/Cargo.toml"
       --bin curl
-  COMMAND ${CMAKE_COMMAND} -E make_directory "${CMAKE_CURRENT_BINARY_DIR}/bin"
   COMMAND ${CMAKE_COMMAND} -E copy "${_curl_rust_binary}" "${_curl_rust_sidecar}"
   DEPENDS ${_curl_rust_sources}
   WORKING_DIRECTORY "${PROJECT_SOURCE_DIR}"
@@ -313,6 +315,7 @@ set(_curl_rust_corpus_tests
 )
 
 add_custom_target(curl-rust-test
+  COMMAND ${CMAKE_COMMAND} -E make_directory "${_curl_rust_target_dir}"
   COMMAND ${CMAKE_COMMAND} -E env
     "CARGO_TARGET_DIR=${_curl_rust_target_dir}"
     "${CARGO_EXECUTABLE}" test
