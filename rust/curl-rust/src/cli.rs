@@ -720,7 +720,7 @@ impl Parser {
                         "--range is mutually exclusive with --continue-at".to_string(),
                     ));
                 }
-                self.current().range = Some(value);
+                self.current().range = Some(parse_range_value(name, value)?);
             }
             "continue-at" => {
                 let value = self.value_for(name, inline_value)?;
@@ -1159,7 +1159,7 @@ impl Parser {
                             "--range is mutually exclusive with --continue-at".to_string(),
                         ));
                     }
-                    self.current().range = Some(value);
+                    self.current().range = Some(parse_range_value("range", value)?);
                     break;
                 }
                 'C' => {
@@ -2217,6 +2217,27 @@ fn parse_continue_at(name: &str, value: &str) -> Result<ContinueAt> {
     }
 }
 
+fn parse_range_value(name: &str, value: String) -> Result<String> {
+    let value = parse_nonempty_string(name, value)?;
+    if value.bytes().all(|byte| byte.is_ascii_digit()) {
+        let offset = parse_u64(name, &value)?;
+        eprintln!(
+            "Warning: A specified range MUST include at least one dash (-). Appending one for you"
+        );
+        return Ok(format!("{offset}-"));
+    }
+    if value
+        .bytes()
+        .any(|byte| !byte.is_ascii_digit() && byte != b'-' && byte != b',')
+    {
+        eprintln!(
+            "Warning: Invalid character is found in given range. A specified range MUST have only \
+             digits in 'start'-'stop'. The server's response to this request is uncertain."
+        );
+    }
+    Ok(value)
+}
+
 fn parse_tftp_blksize(name: &str, value: &str) -> Result<u16> {
     const MIN_BLKSIZE: u64 = 8;
     const MAX_BLKSIZE: u64 = 65_464;
@@ -2832,6 +2853,15 @@ mod tests {
             [OutputTarget::File("out.txt".to_string())]
         );
         assert_eq!(transfer.urls, ["https://example.com"]);
+    }
+
+    #[test]
+    fn appends_dash_to_bare_numeric_range_like_c_curl() {
+        let config = parse_args(["-q", "--range", "5", "https://example.com"]).unwrap();
+        assert_eq!(config.transfers[0].range.as_deref(), Some("5-"));
+
+        let config = parse_args(["-q", "-r07", "https://example.com"]).unwrap();
+        assert_eq!(config.transfers[0].range.as_deref(), Some("7-"));
     }
 
     #[test]

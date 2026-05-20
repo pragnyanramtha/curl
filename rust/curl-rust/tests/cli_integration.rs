@@ -5330,6 +5330,39 @@ fn ftp_range_download_without_size_still_sends_rest() {
 }
 
 #[test]
+fn ftp_range_short_data_without_size_succeeds_with_partial_body() {
+    let mut options = ftp_options(b"abcdef");
+    options.size = None;
+    let (url, rx) = spawn_ftp_server("/file.txt", options);
+
+    let mut command = Command::cargo_bin("curl").unwrap();
+    command.args(["-q", "-sS", "--range", "2-8", &url]);
+    command.assert().success().stdout("cdef");
+
+    let record = rx.recv().unwrap();
+    assert_eq!(
+        record.commands,
+        b"USER anonymous\r\nPASS ftp@example.com\r\nPWD\r\nEPSV\r\nTYPE I\r\nSIZE file.txt\r\nREST 2\r\nRETR file.txt\r\nQUIT\r\n"
+    );
+}
+
+#[test]
+fn ftp_range_rejects_bytes_prefix_like_c_curl() {
+    let (url, rx) = spawn_ftp_server("/file.txt", ftp_options(b"abcdef"));
+
+    let mut command = Command::cargo_bin("curl").unwrap();
+    command.args(["-q", "-sS", "--range", "bytes=2-8", &url]);
+    command.assert().failure().code(33).stdout("");
+
+    let record = rx.recv().unwrap();
+    assert_eq!(
+        record.commands,
+        b"USER anonymous\r\nPASS ftp@example.com\r\nPWD\r\nEPSV\r\nTYPE I\r\nSIZE file.txt\r\nQUIT\r\n"
+    );
+    assert_eq!(record.data_connections, 0);
+}
+
+#[test]
 fn ftp_range_short_data_writes_partial_body_then_fails() {
     let mut options = ftp_options(b"abcdef");
     options.size_reply = Some(b"213 20\r\n");

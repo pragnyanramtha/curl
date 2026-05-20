@@ -1500,9 +1500,10 @@ async fn ftp_download_body(
             }
             let response = ftp_read_response(stream, metrics, control_headers).await?;
             ftp_require_positive(&response, CurlError::FtpCouldntRetrFile)?;
+            let deferred_error = remote_size.map(|_| CurlError::PartialFile);
             return Ok(FtpDownloadBody {
                 body,
-                deferred_error: Some(CurlError::PartialFile),
+                deferred_error,
             });
         }
 
@@ -1556,10 +1557,6 @@ struct FtpDownloadRangePlan {
 }
 
 fn ftp_download_range_plan(range: &str, remote_size: Option<u64>) -> Result<FtpDownloadRangePlan> {
-    let range = range
-        .strip_prefix("bytes=")
-        .or_else(|| range.strip_prefix("BYTES="))
-        .unwrap_or(range);
     if range.contains(',') {
         return Err(CurlError::RangeError);
     }
