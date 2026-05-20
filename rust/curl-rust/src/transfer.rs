@@ -8503,6 +8503,7 @@ async fn run_http_transfer(
             || transfer.compressed
             || transfer.tr_encoding
             || raw_custom_header_wire_semantics
+            || raw_http_output_slot_wire_semantics(transfer)
             || method == Method::HEAD
             || (method != Method::HEAD && max_filesize_limit(transfer).is_some()))
     {
@@ -8752,6 +8753,14 @@ fn raw_http_proxy_supported(transfer: &TransferConfig, url: &Url, has_multipart:
 
 fn raw_http_direct_supported(transfer: &TransferConfig, url: &Url, has_multipart: bool) -> bool {
     raw_http_proxy_supported(transfer, url, has_multipart)
+}
+
+fn raw_http_output_slot_wire_semantics(transfer: &TransferConfig) -> bool {
+    !transfer.output_slots.is_empty()
+        && !transfer.verbose
+        && transfer.resolve.is_empty()
+        && transfer.proxy.is_none()
+        && transfer.http_version == HttpVersionPreference::Any
 }
 
 fn raw_http_direct_endpoint(transfer: &TransferConfig, url: &Url) -> Result<(String, u16)> {

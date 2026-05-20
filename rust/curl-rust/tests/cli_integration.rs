@@ -2428,6 +2428,37 @@ fn out_null_discards_included_headers_and_body() {
 }
 
 #[test]
+fn output_slot_with_resolve_uses_resolver_override() {
+    let (url, rx) = spawn_server(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok");
+    let port = Url::parse(&url).unwrap().port().unwrap();
+    let target = format!("http://example.test:{port}/resource");
+    let resolve = format!("example.test:{port}:127.0.0.1");
+
+    let mut command = Command::cargo_bin("curl").unwrap();
+    command.args(["-q", "-sS", "--resolve", &resolve, "-o", "-", &target]);
+    command.assert().success().stdout("ok");
+
+    let request = rx.recv().unwrap();
+    assert!(request.start_line.starts_with("GET /resource HTTP/1.1"));
+    assert_eq!(
+        header(&request, "host"),
+        Some(format!("example.test:{port}").as_str())
+    );
+}
+
+#[test]
+fn output_slot_with_http10_uses_requested_version() {
+    let (url, rx) = spawn_server(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok");
+
+    let mut command = Command::cargo_bin("curl").unwrap();
+    command.args(["-q", "-sS", "--http1.0", "-o", "-", &url]);
+    command.assert().success().stdout("ok");
+
+    let request = rx.recv().unwrap();
+    assert_eq!(request.start_line, "GET /resource HTTP/1.0");
+}
+
+#[test]
 fn remote_name_output_slot_precedes_out_null() {
     let temp = tempdir().unwrap();
     let (url, rx) = spawn_sequence_server(vec![
