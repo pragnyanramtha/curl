@@ -2119,6 +2119,94 @@ fn out_null_discards_included_headers_and_body() {
 }
 
 #[test]
+fn remote_name_output_slot_precedes_out_null() {
+    let temp = tempdir().unwrap();
+    let (url, rx) = spawn_sequence_server(vec![
+        b"HTTP/1.1 200 OK\r\nContent-Length: 3\r\nConnection: close\r\n\r\none",
+        b"HTTP/1.1 200 OK\r\nContent-Length: 3\r\nConnection: close\r\n\r\ntwo",
+    ]);
+    let origin = gateway_origin(&url);
+    let first = format!("{origin}/one.txt");
+    let second = format!("{origin}/two.txt");
+
+    let mut command = Command::cargo_bin("curl").unwrap();
+    command
+        .current_dir(temp.path())
+        .args(["-q", "-sS", &first, &second, "-O", "--out-null"]);
+    command.assert().success().stdout("");
+
+    assert_eq!(
+        std::fs::read_to_string(temp.path().join("one.txt")).unwrap(),
+        "one"
+    );
+    assert!(!temp.path().join("two.txt").exists());
+    let first_request = rx.recv().unwrap();
+    let second_request = rx.recv().unwrap();
+    assert!(
+        first_request
+            .start_line
+            .starts_with("GET /one.txt HTTP/1.1")
+    );
+    assert!(
+        second_request
+            .start_line
+            .starts_with("GET /two.txt HTTP/1.1")
+    );
+}
+
+#[test]
+fn out_null_output_slot_precedes_remote_name() {
+    let temp = tempdir().unwrap();
+    let (url, rx) = spawn_sequence_server(vec![
+        b"HTTP/1.1 200 OK\r\nContent-Length: 3\r\nConnection: close\r\n\r\none",
+        b"HTTP/1.1 200 OK\r\nContent-Length: 3\r\nConnection: close\r\n\r\ntwo",
+    ]);
+    let origin = gateway_origin(&url);
+    let first = format!("{origin}/one.txt");
+    let second = format!("{origin}/two.txt");
+
+    let mut command = Command::cargo_bin("curl").unwrap();
+    command
+        .current_dir(temp.path())
+        .args(["-q", "-sS", &first, &second, "--out-null", "-O"]);
+    command.assert().success().stdout("");
+
+    assert!(!temp.path().join("one.txt").exists());
+    assert_eq!(
+        std::fs::read_to_string(temp.path().join("two.txt")).unwrap(),
+        "two"
+    );
+    let first_request = rx.recv().unwrap();
+    let second_request = rx.recv().unwrap();
+    assert!(
+        first_request
+            .start_line
+            .starts_with("GET /one.txt HTTP/1.1")
+    );
+    assert!(
+        second_request
+            .start_line
+            .starts_with("GET /two.txt HTTP/1.1")
+    );
+}
+
+#[test]
+fn extra_output_slots_emit_warning() {
+    let temp = tempdir().unwrap();
+    let file = temp.path().join("plain.txt");
+    std::fs::write(&file, "hello").unwrap();
+    let url = Url::from_file_path(&file).unwrap().to_string();
+
+    let mut command = Command::cargo_bin("curl").unwrap();
+    command.args(["-q", "-sS", &url, "--out-null", "--out-null"]);
+    command
+        .assert()
+        .success()
+        .stdout("")
+        .stderr("Warning: Got more output options than URLs\n");
+}
+
+#[test]
 fn duplicate_location_headers_accept_exact_repeat() {
     let (url, rx) = spawn_server(
         b"HTTP/1.1 200 OK\r\nLocation: this\r\nLocation: this\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok",

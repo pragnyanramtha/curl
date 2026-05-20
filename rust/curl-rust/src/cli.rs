@@ -135,6 +135,7 @@ pub enum ContinueAt {
 pub enum OutputTarget {
     File(String),
     Null,
+    RemoteName,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -772,7 +773,7 @@ impl Parser {
                 let value = self.value_for(name, inline_value)?;
                 self.current().output_dir = Some(PathBuf::from(value));
             }
-            "remote-name" => self.current().remote_name = true,
+            "remote-name" => self.set_output_remote_name(),
             "remote-header-name" => self.current().remote_header_name = true,
             "dump-header" => {
                 let value = self.value_for(name, inline_value)?;
@@ -1100,7 +1101,7 @@ impl Parser {
                     self.set_output_file(value);
                     break;
                 }
-                'O' => self.current().remote_name = true,
+                'O' => self.set_output_remote_name(),
                 'J' => self.current().remote_header_name = true,
                 'D' => {
                     let value = self.short_value('D', rest)?;
@@ -1279,6 +1280,14 @@ impl Parser {
         transfer.out_null = true;
         transfer.output = None;
         transfer.output_slots.push(OutputTarget::Null);
+    }
+
+    fn set_output_remote_name(&mut self) {
+        let transfer = self.current();
+        transfer.remote_name = true;
+        transfer.output = None;
+        transfer.out_null = false;
+        transfer.output_slots.push(OutputTarget::RemoteName);
     }
 
     fn push_url(&mut self, url: String, remote_name: bool, globoff: bool) {
@@ -2472,6 +2481,47 @@ mod tests {
         let transfer = &config.transfers[0];
         assert!(transfer.out_null);
         assert_eq!(transfer.output_slots, [OutputTarget::Null]);
+    }
+
+    #[test]
+    fn parses_remote_name_as_ordered_output_slot() {
+        let config = parse_args([
+            "-q",
+            "https://example.com/one",
+            "-O",
+            "https://example.com/two",
+            "--out-null",
+        ])
+        .unwrap();
+
+        let transfer = &config.transfers[0];
+        assert_eq!(
+            transfer.urls,
+            ["https://example.com/one", "https://example.com/two"]
+        );
+        assert_eq!(
+            transfer.output_slots,
+            [OutputTarget::RemoteName, OutputTarget::Null]
+        );
+    }
+
+    #[test]
+    fn parses_remote_name_as_output_slot() {
+        let config = parse_args([
+            "-q",
+            "https://example.com/one.txt",
+            "https://example.com/two.txt",
+            "-O",
+            "--out-null",
+        ])
+        .unwrap();
+
+        let transfer = &config.transfers[0];
+        assert!(transfer.remote_name);
+        assert_eq!(
+            transfer.output_slots,
+            [OutputTarget::RemoteName, OutputTarget::Null]
+        );
     }
 
     #[test]

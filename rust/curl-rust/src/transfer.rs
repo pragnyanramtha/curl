@@ -298,6 +298,9 @@ fn spawn_parallel_job(active: &mut JoinSet<Result<(usize, i32)>>, job: ParallelJ
 
 fn expand_urls(transfer: &TransferConfig) -> Result<Vec<ExpandedTransferUrl>> {
     let mut expanded = Vec::new();
+    if transfer.output_slots.len() > transfer.urls.len() {
+        eprintln!("Warning: Got more output options than URLs");
+    }
     for (index, url) in transfer.urls.iter().enumerate() {
         let url = glob::apply_default_protocol(url, transfer.proto_default.as_deref());
         let globoff =
@@ -599,16 +602,26 @@ async fn run_expanded_url(
                 if !transfer.output_slots.is_empty() {
                     transfer.output = None;
                     transfer.out_null = false;
+                    transfer.remote_name = false;
                 }
                 if expanded.remote_name {
                     transfer.remote_name = true;
                 }
                 if let Some(output_target) = output_target {
-                    transfer.remote_name = false;
-                    transfer.remote_header_name = false;
                     match output_target {
-                        OutputTarget::File(path) => transfer.output = Some(path),
-                        OutputTarget::Null => transfer.out_null = true,
+                        OutputTarget::File(path) => {
+                            transfer.remote_name = false;
+                            transfer.remote_header_name = false;
+                            transfer.output = Some(path);
+                        }
+                        OutputTarget::Null => {
+                            transfer.remote_name = false;
+                            transfer.remote_header_name = false;
+                            transfer.out_null = true;
+                        }
+                        OutputTarget::RemoteName => {
+                            transfer.remote_name = true;
+                        }
                     }
                 }
                 transfer
