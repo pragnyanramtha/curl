@@ -287,6 +287,15 @@ fn active_timeout(timeout: Option<Duration>) -> Option<Duration> {
     timeout.filter(|timeout| !timeout.is_zero())
 }
 
+fn remaining_timeout(timeout: Option<Duration>, started: Instant) -> Option<Duration> {
+    let timeout = active_timeout(timeout)?;
+    Some(
+        timeout
+            .checked_sub(started.elapsed())
+            .unwrap_or(Duration::ZERO),
+    )
+}
+
 fn spawn_parallel_job(active: &mut JoinSet<Result<(usize, i32)>>, job: ParallelJob) {
     active.spawn(async move {
         let code = run_expanded_url(
@@ -9434,7 +9443,16 @@ async fn run_http_with_retries(
     loop {
         reset_attempt_metrics(metrics);
 
-        match run_http_transfer(transfer, client, expanded, method.clone(), metrics).await {
+        let attempt = run_http_transfer(transfer, client, expanded, method.clone(), metrics);
+        let attempt = if let Some(timeout) = remaining_timeout(transfer.max_time, retry_started) {
+            tokio::time::timeout(timeout, attempt)
+                .await
+                .map_err(|_| CurlError::Timeout)?
+        } else {
+            attempt.await
+        };
+
+        match attempt {
             Ok(attempt) => {
                 if should_retry_http_attempt(transfer, &attempt)
                     && retry_delay_for_next(transfer, metrics, retry_started, attempt.retry_after)

@@ -2254,6 +2254,60 @@ fn http_max_time_timeout_returns_28() {
 }
 
 #[test]
+fn raw_http_max_time_timeout_returns_28() {
+    let (url, rx) = spawn_timed_server(
+        b"HTTP/1.1 200 OK\r\nContent-Length: 4\r\nConnection: close\r\n\r\nslow",
+        Duration::from_millis(250),
+    );
+
+    let mut command = Command::cargo_bin("curl").unwrap();
+    command.args([
+        "-q",
+        "-sS",
+        "--request-target",
+        "/raw",
+        "--max-time",
+        "0.1",
+        &url,
+    ]);
+    command
+        .assert()
+        .failure()
+        .code(28)
+        .stdout("")
+        .stderr("curl: (28) Operation timed out\n");
+
+    let _ = rx.recv().unwrap();
+}
+
+#[test]
+fn raw_proxy_max_time_timeout_returns_28() {
+    let (proxy_url, rx) = spawn_timed_server(
+        b"HTTP/1.1 200 OK\r\nContent-Length: 4\r\nConnection: close\r\n\r\nslow",
+        Duration::from_millis(250),
+    );
+
+    let mut command = Command::cargo_bin("curl").unwrap();
+    command.args([
+        "-q",
+        "-sS",
+        "-x",
+        &proxy_url,
+        "--max-time",
+        "0.1",
+        "http://example.test/resource",
+    ]);
+    command
+        .assert()
+        .failure()
+        .code(28)
+        .stdout("")
+        .stderr("curl: (28) Operation timed out\n");
+
+    let _ = rx.recv().unwrap();
+}
+
+#[test]
 fn legacy_tls_max_values_do_not_break_plain_http() {
     for version in ["1.0", "1.1"] {
         let (url, rx) =
