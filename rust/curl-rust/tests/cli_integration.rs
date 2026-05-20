@@ -9702,6 +9702,174 @@ fn custom_method_post_redirect_drops_body_when_post_flag_does_not_apply() {
 }
 
 #[test]
+fn mismatched_post_redirect_flag_rewrites_post_to_get() {
+    let (url, rx) = spawn_sequence_server(vec![
+        b"HTTP/1.1 302 Found\r\nLocation: /next\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+        b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok",
+    ]);
+
+    let mut command = Command::cargo_bin("curl").unwrap();
+    command.args([
+        "-q",
+        "-sS",
+        "-L",
+        "--post301",
+        "-d",
+        "body",
+        "-w",
+        " %{method}",
+        &url,
+    ]);
+    command.assert().success().stdout("ok GET");
+
+    let first = rx.recv().unwrap();
+    let second = rx.recv().unwrap();
+    assert!(first.start_line.starts_with("POST /resource HTTP/1.1"));
+    assert_eq!(first.body, b"body");
+    assert!(second.start_line.starts_with("GET /next HTTP/1.1"));
+    assert!(second.body.is_empty());
+    assert_eq!(header(&second, "content-length"), None);
+}
+
+#[test]
+fn post301_auto_referer_preserves_body_and_updates_referer() {
+    let (url, rx) = spawn_sequence_server(vec![
+        b"HTTP/1.1 301 Moved Permanently\r\nLocation: /next\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+        b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok",
+    ]);
+
+    let mut command = Command::cargo_bin("curl").unwrap();
+    command.args([
+        "-q",
+        "-sS",
+        "-L",
+        "--post301",
+        "-e",
+        ";auto",
+        "-d",
+        "body",
+        "-w",
+        " %{method} %{referer}",
+        &url,
+    ]);
+    command.assert().success().stdout(format!("ok POST {url}"));
+
+    let first = rx.recv().unwrap();
+    let second = rx.recv().unwrap();
+    assert!(first.start_line.starts_with("POST /resource HTTP/1.1"));
+    assert_eq!(header(&first, "referer"), None);
+    assert_eq!(first.body, b"body");
+    assert!(second.start_line.starts_with("POST /next HTTP/1.1"));
+    assert_eq!(header(&second, "referer"), Some(url.as_str()));
+    assert_eq!(second.body, b"body");
+}
+
+#[test]
+fn post301_file_data_redirect_replays_body() {
+    let temp = tempdir().unwrap();
+    let data = temp.path().join("data.txt");
+    std::fs::write(&data, "from file").unwrap();
+    let (url, rx) = spawn_sequence_server(vec![
+        b"HTTP/1.1 301 Moved Permanently\r\nLocation: /next\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+        b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok",
+    ]);
+
+    let mut command = Command::cargo_bin("curl").unwrap();
+    command.args([
+        "-q",
+        "-sS",
+        "-L",
+        "--post301",
+        "-d",
+        &format!("@{}", data.display()),
+        "-w",
+        " %{method}",
+        &url,
+    ]);
+    command.assert().success().stdout("ok POST");
+
+    let first = rx.recv().unwrap();
+    let second = rx.recv().unwrap();
+    assert!(first.start_line.starts_with("POST /resource HTTP/1.1"));
+    assert_eq!(first.body, b"from file");
+    assert!(second.start_line.starts_with("POST /next HTTP/1.1"));
+    assert_eq!(second.body, b"from file");
+}
+
+#[test]
+fn post301_multipart_redirect_replays_body() {
+    let (url, rx) = spawn_sequence_server(vec![
+        b"HTTP/1.1 301 Moved Permanently\r\nLocation: /next\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+        b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok",
+    ]);
+
+    let mut command = Command::cargo_bin("curl").unwrap();
+    command.args([
+        "-q",
+        "-sS",
+        "-L",
+        "--post301",
+        "-F",
+        "field=value",
+        "-w",
+        " %{method}",
+        &url,
+    ]);
+    command.assert().success().stdout("ok POST");
+
+    let first = rx.recv().unwrap();
+    let second = rx.recv().unwrap();
+    assert!(first.start_line.starts_with("POST /resource HTTP/1.1"));
+    assert!(second.start_line.starts_with("POST /next HTTP/1.1"));
+    assert!(
+        header(&first, "content-type")
+            .unwrap()
+            .starts_with("multipart/form-data; boundary=")
+    );
+    assert!(
+        header(&second, "content-type")
+            .unwrap()
+            .starts_with("multipart/form-data; boundary=")
+    );
+    let body = String::from_utf8_lossy(&second.body);
+    assert!(body.contains("name=\"field\""));
+    assert!(body.contains("value"));
+}
+
+#[test]
+fn upload_file_post303_redirect_switches_to_get_without_body() {
+    let temp = tempdir().unwrap();
+    let upload = temp.path().join("upload.txt");
+    std::fs::write(&upload, "body").unwrap();
+    let (url, rx) = spawn_sequence_server(vec![
+        b"HTTP/1.1 303 See Other\r\nLocation: /next\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+        b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok",
+    ]);
+
+    let mut command = Command::cargo_bin("curl").unwrap();
+    command.args([
+        "-q",
+        "-sS",
+        "-L",
+        "--post303",
+        "-T",
+        upload.to_str().unwrap(),
+        "-w",
+        " %{method}",
+        &url,
+    ]);
+    command.assert().success().stdout("ok GET");
+
+    let first = rx.recv().unwrap();
+    let second = rx.recv().unwrap();
+    assert!(first.start_line.starts_with("PUT /resource HTTP/1.1"));
+    assert_eq!(first.body, b"body");
+    assert!(second.start_line.starts_with("GET /next HTTP/1.1"));
+    assert!(second.body.is_empty());
+    assert_eq!(header(&second, "content-length"), None);
+}
+
+#[test]
 fn auto_referer_respects_max_redirs_limit() {
     let (url, rx) = spawn_sequence_server(vec![
         b"HTTP/1.1 302 Found\r\nLocation: /next\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
