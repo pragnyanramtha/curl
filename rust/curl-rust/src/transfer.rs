@@ -671,6 +671,12 @@ async fn run_expanded_url(
                 }
                 if let Some(output_target) = output_target {
                     match output_target {
+                        OutputTarget::Default => {
+                            transfer.remote_name = false;
+                            transfer.remote_header_name = false;
+                            transfer.output = None;
+                            transfer.out_null = false;
+                        }
                         OutputTarget::File(path) => {
                             transfer.remote_name = false;
                             transfer.remote_header_name = false;

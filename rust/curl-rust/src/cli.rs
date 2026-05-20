@@ -72,6 +72,7 @@ pub struct TransferConfig {
     pub out_null: bool,
     pub output_dir: Option<PathBuf>,
     pub remote_name: bool,
+    pub remote_name_all: bool,
     pub remote_header_name: bool,
     pub dump_header: Option<PathBuf>,
     pub etag_compare: Option<PathBuf>,
@@ -154,6 +155,7 @@ pub enum ContinueAt {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum OutputTarget {
+    Default,
     File(String),
     Null,
     RemoteName,
@@ -461,6 +463,7 @@ impl Default for TransferConfig {
             out_null: false,
             output_dir: None,
             remote_name: false,
+            remote_name_all: false,
             remote_header_name: false,
             dump_header: None,
             etag_compare: None,
@@ -835,6 +838,7 @@ impl Parser {
                 self.set_output_file(value);
             }
             "out-null" => self.set_output_null(),
+            "remote-name-all" => self.current().remote_name_all = true,
             "output-dir" => {
                 let value = self.value_for(name, inline_value)?;
                 self.current().output_dir = Some(PathBuf::from(value));
@@ -1045,7 +1049,8 @@ impl Parser {
             "parallel" => self.config.parallel = false,
             "parallel-immediate" => self.config.parallel_immediate = false,
             "fail-early" => self.config.fail_early = false,
-            "remote-name" => self.current().remote_name = false,
+            "remote-name" => self.set_output_default_if_remote_name_all(),
+            "remote-name-all" => self.current().remote_name_all = false,
             "remote-header-name" => self.current().remote_header_name = false,
             "location" => self.current().follow_location = false,
             "location-trusted" => {
@@ -1438,6 +1443,16 @@ impl Parser {
         transfer.output_slots.push(OutputTarget::RemoteName);
     }
 
+    fn set_output_default_if_remote_name_all(&mut self) {
+        let transfer = self.current();
+        transfer.remote_name = false;
+        if transfer.remote_name_all {
+            transfer.output = None;
+            transfer.out_null = false;
+            transfer.output_slots.push(OutputTarget::Default);
+        }
+    }
+
     fn push_url(&mut self, url: String, remote_name: bool, globoff: bool) {
         let transfer = self.current();
         transfer.urls.push(url);
@@ -1451,7 +1466,8 @@ impl Parser {
                 self.push_url(line, true, true);
             }
         } else {
-            self.push_url(value, false, false);
+            let remote_name = self.current().remote_name_all;
+            self.push_url(value, remote_name, false);
         }
         Ok(())
     }
@@ -1670,6 +1686,7 @@ impl TransferConfig {
             || self.out_null
             || self.output_dir.is_some()
             || self.remote_name
+            || self.remote_name_all
             || self.remote_header_name
             || self.dump_header.is_some()
             || self.etag_compare.is_some()
@@ -2469,6 +2486,7 @@ fn print_common_help() {
            -o, --output <file>         Write output to file\n\
                --out-null              Discard response data\n\
            -O, --remote-name           Write output to remote filename\n\
+               --remote-name-all       Use remote filename for all URLs\n\
                --etag-compare <file>   Load ETag from file\n\
                --etag-save <file>      Save response ETag to file\n\
            -z, --time-cond <time>      Transfer based on time condition\n\
@@ -2885,6 +2903,53 @@ mod tests {
             transfer.output_slots,
             [OutputTarget::RemoteName, OutputTarget::Null]
         );
+    }
+
+    #[test]
+    fn parses_remote_name_all_as_url_default() {
+        let config = parse_args([
+            "-q",
+            "--remote-name-all",
+            "https://example.com/one.txt",
+            "https://example.com/two.txt",
+        ])
+        .unwrap();
+        let transfer = &config.transfers[0];
+        assert!(transfer.remote_name_all);
+        assert_eq!(transfer.url_remote_names, [true, true]);
+        assert!(transfer.output_slots.is_empty());
+
+        let config = parse_args([
+            "-q",
+            "https://example.com/one.txt",
+            "--remote-name-all",
+            "https://example.com/two.txt",
+        ])
+        .unwrap();
+        assert_eq!(config.transfers[0].url_remote_names, [false, true]);
+
+        let config = parse_args([
+            "-q",
+            "--remote-name-all",
+            "--no-remote-name-all",
+            "https://example.com/one.txt",
+        ])
+        .unwrap();
+        assert_eq!(config.transfers[0].url_remote_names, [false]);
+    }
+
+    #[test]
+    fn no_remote_name_adds_default_slot_when_remote_name_all_is_active() {
+        let config = parse_args([
+            "-q",
+            "--remote-name-all",
+            "--no-remote-name",
+            "https://example.com/one.txt",
+        ])
+        .unwrap();
+        let transfer = &config.transfers[0];
+        assert_eq!(transfer.url_remote_names, [true]);
+        assert_eq!(transfer.output_slots, [OutputTarget::Default]);
     }
 
     #[test]

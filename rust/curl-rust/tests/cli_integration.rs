@@ -2500,6 +2500,70 @@ fn out_null_output_slot_precedes_remote_name() {
 }
 
 #[test]
+fn remote_name_all_writes_each_url_to_remote_filename() {
+    let temp = tempdir().unwrap();
+    let (url, rx) = spawn_sequence_server(vec![
+        b"HTTP/1.1 200 OK\r\nContent-Length: 3\r\nConnection: close\r\n\r\none",
+        b"HTTP/1.1 200 OK\r\nContent-Length: 3\r\nConnection: close\r\n\r\ntwo",
+    ]);
+    let origin = gateway_origin(&url);
+    let first = format!("{origin}/one.txt");
+    let second = format!("{origin}/two.txt");
+
+    let mut command = Command::cargo_bin("curl").unwrap();
+    command
+        .current_dir(temp.path())
+        .args(["-q", "-sS", "--remote-name-all", &first, &second]);
+    command.assert().success().stdout("");
+
+    assert_eq!(
+        std::fs::read_to_string(temp.path().join("one.txt")).unwrap(),
+        "one"
+    );
+    assert_eq!(
+        std::fs::read_to_string(temp.path().join("two.txt")).unwrap(),
+        "two"
+    );
+    let first_request = rx.recv().unwrap();
+    let second_request = rx.recv().unwrap();
+    assert!(
+        first_request
+            .start_line
+            .starts_with("GET /one.txt HTTP/1.1")
+    );
+    assert!(
+        second_request
+            .start_line
+            .starts_with("GET /two.txt HTTP/1.1")
+    );
+}
+
+#[test]
+fn remote_name_all_no_remote_name_outputs_stdout() {
+    let temp = tempdir().unwrap();
+    let (url, rx) =
+        spawn_server(b"HTTP/1.1 200 OK\r\nContent-Length: 3\r\nConnection: close\r\n\r\none");
+    let target = format!("{}/one.txt", gateway_origin(&url));
+
+    let mut command = Command::cargo_bin("curl").unwrap();
+    command.current_dir(temp.path()).args([
+        "-q",
+        "-sS",
+        "--remote-name-all",
+        "--no-remote-name",
+        "--output-dir",
+        "log",
+        &target,
+    ]);
+    command.assert().success().stdout("one");
+
+    assert!(!temp.path().join("one.txt").exists());
+    assert!(!temp.path().join("log").join("one.txt").exists());
+    let request = rx.recv().unwrap();
+    assert!(request.start_line.starts_with("GET /one.txt HTTP/1.1"));
+}
+
+#[test]
 fn extra_output_slots_emit_warning() {
     let temp = tempdir().unwrap();
     let file = temp.path().join("plain.txt");
