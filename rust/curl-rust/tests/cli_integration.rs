@@ -2723,7 +2723,35 @@ fn tr_encoding_rejects_chunked_not_last() {
         .unwrap();
     assert_eq!(output.status.code(), Some(61));
     assert_eq!(output.stdout, b"");
-    assert!(String::from_utf8_lossy(&output.stderr).contains("transfer encoding"));
+    assert!(String::from_utf8_lossy(&output.stderr).contains("Transfer-Encoding"));
+}
+
+#[test]
+fn tr_encoding_rejects_overlong_transfer_encoding_chain_with_curl_message() {
+    let mut response = b"HTTP/1.1 200 OK\r\nContent-Length: 6\r\n".to_vec();
+    for _ in 0..6 {
+        response.extend_from_slice(b"Transfer-Encoding: gzip\r\n");
+    }
+    response.extend_from_slice(b"\r\n-foo-\n");
+    let (url, _rx) = spawn_server_bytes(response);
+
+    let output = Command::cargo_bin("curl")
+        .unwrap()
+        .args(["-q", "-sS", "--tr-encoding", &url])
+        .output()
+        .unwrap();
+    assert_eq!(
+        output.status.code(),
+        Some(61),
+        "stdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(output.stdout, b"");
+    assert_eq!(
+        String::from_utf8_lossy(&output.stderr),
+        "curl: (61) Reject response due to more than 5 content encodings\n"
+    );
 }
 
 #[test]

@@ -9572,15 +9572,15 @@ fn decode_http_body_if_transfer_encoded(
         return Ok(body);
     }
     if encodings.len() > 5 {
-        return Err(CurlError::BadContentEncoding(
+        return Err(CurlError::ContentEncodingRejected(
             "Reject response due to more than 5 content encodings".to_string(),
         ));
     }
 
     if let Some(position) = encodings.iter().position(|encoding| encoding == "chunked") {
         if position + 1 != encodings.len() {
-            return Err(CurlError::BadContentEncoding(
-                "chunked transfer encoding was not last".to_string(),
+            return Err(CurlError::ContentEncodingRejected(
+                "Reject response due to 'chunked' not being the last Transfer-Encoding".to_string(),
             ));
         }
         encodings.pop();
