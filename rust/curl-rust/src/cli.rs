@@ -701,7 +701,7 @@ impl Parser {
                 let value = self.value_for(name, inline_value)?;
                 self.add_ftp_quote(value);
             }
-            "include" => self.current().include_headers = true,
+            "include" | "show-headers" => self.current().include_headers = true,
             "header" => {
                 let value = self.value_for(name, inline_value)?;
                 self.append_header_value(value)?;
@@ -1041,7 +1041,7 @@ impl Parser {
             "disable-epsv" => self.current().ftp_disable_epsv = false,
             "epsv" => self.current().ftp_disable_epsv = true,
             "ftp-skip-pasv-ip" => self.current().ftp_skip_pasv_ip = Some(false),
-            "include" => self.current().include_headers = false,
+            "include" | "show-headers" => self.current().include_headers = false,
             "parallel" => self.config.parallel = false,
             "parallel-immediate" => self.config.parallel_immediate = false,
             "fail-early" => self.config.fail_early = false,
@@ -2452,6 +2452,7 @@ fn print_common_help() {
            -C, --continue-at <offset>  Resume transfer at offset\n\
            -H, --header <header>       Pass custom header\n\
            -I, --head                  Show document information only\n\
+           -i, --show-headers          Show response headers in output\n\
            -l, --list-only             List only mode\n\
                --tr-encoding           Request compressed transfer encoding\n\
            -L, --location              Follow redirects\n\
@@ -2919,6 +2920,30 @@ mod tests {
     }
 
     #[test]
+    fn parses_show_headers_alias() {
+        let config = parse_args(["-q", "--show-headers", "https://example.com"]).unwrap();
+        assert!(config.transfers[0].include_headers);
+
+        let config = parse_args([
+            "-q",
+            "--include",
+            "--no-show-headers",
+            "https://example.com",
+        ])
+        .unwrap();
+        assert!(!config.transfers[0].include_headers);
+
+        let config = parse_args([
+            "-q",
+            "--show-headers",
+            "--no-include",
+            "https://example.com",
+        ])
+        .unwrap();
+        assert!(!config.transfers[0].include_headers);
+    }
+
+    #[test]
     fn parses_http09_boolean_option() {
         let config = parse_args(["-q", "--http0.9", "https://example.com"]).unwrap();
         assert!(config.transfers[0].http09_allowed);
@@ -2998,6 +3023,20 @@ mod tests {
 
         let config = parse_args(["-q", "--config", config_file.to_str().unwrap()]).unwrap();
         assert_eq!(config.transfers[0].request_target.as_deref(), Some("*"));
+    }
+
+    #[test]
+    fn config_files_parse_show_headers_alias() {
+        let temp = tempdir().unwrap();
+        let config_file = temp.path().join("curlrc");
+        std::fs::write(
+            &config_file,
+            "show-headers\nno-show-headers\nurl = https://example.com\n",
+        )
+        .unwrap();
+
+        let config = parse_args(["-q", "--config", config_file.to_str().unwrap()]).unwrap();
+        assert!(!config.transfers[0].include_headers);
     }
 
     #[test]
