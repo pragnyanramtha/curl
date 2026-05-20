@@ -2822,6 +2822,34 @@ fn tr_encoding_rejects_chunked_not_last() {
 }
 
 #[test]
+fn tr_encoding_include_writes_headers_before_bad_transfer_encoding() {
+    let (url, _rx) = spawn_server(
+        b"HTTP/1.1 200 OK\r\nDate: Mon, 29 Nov 2004 21:56:53 GMT\r\nServer: Apache\r\nTransfer-Encoding: chunked, gzip\r\n\r\n0\r\n\r\n",
+    );
+
+    let output = Command::cargo_bin("curl")
+        .unwrap()
+        .args(["-q", "-sS", "--include", "--tr-encoding", &url])
+        .output()
+        .unwrap();
+    assert_eq!(
+        output.status.code(),
+        Some(61),
+        "stdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(
+        output.stdout,
+        b"HTTP/1.1 200 OK\r\nDate: Mon, 29 Nov 2004 21:56:53 GMT\r\nServer: Apache\r\n"
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&output.stderr),
+        "curl: (61) Reject response due to 'chunked' not being the last Transfer-Encoding\n"
+    );
+}
+
+#[test]
 fn tr_encoding_rejects_overlong_transfer_encoding_chain_with_curl_message() {
     let mut response = b"HTTP/1.1 200 OK\r\nContent-Length: 6\r\n".to_vec();
     for _ in 0..6 {

@@ -78,6 +78,10 @@ const WS_CLOSE: u8 = 0x8;
 const WS_PING: u8 = 0x9;
 const WS_PONG: u8 = 0xA;
 const MQTT_CONNECT: u8 = 0x10;
+const TRANSFER_ENCODING_CHUNKED_NOT_LAST_REJECTION: &str =
+    "Reject response due to 'chunked' not being the last Transfer-Encoding";
+const TRANSFER_ENCODING_TOO_MANY_REJECTION: &str =
+    "Reject response due to more than 5 content encodings";
 const MQTT_CONNACK: u8 = 0x20;
 const MQTT_PUBLISH: u8 = 0x30;
 const MQTT_SUBSCRIBE: u8 = 0x82;
@@ -156,6 +160,7 @@ struct HttpAttempt {
     body: Vec<u8>,
     retry_after: Option<Duration>,
     resume_from: u64,
+    deferred_error: Option<CurlError>,
 }
 
 struct AppliedHttpHeaders {
@@ -8736,6 +8741,7 @@ async fn run_http_transfer(
             body,
             retry_after,
             resume_from,
+            deferred_error: None,
         });
     }
 }
@@ -9474,6 +9480,7 @@ async fn raw_http_read_response(
         body,
         retry_after,
         resume_from,
+        deferred_error: None,
     })
 }
 
@@ -9595,14 +9602,39 @@ fn raw_http09_attempt(
         },
         retry_after: None,
         resume_from,
+        deferred_error: None,
     })
 }
 
 fn decode_http_attempt_body(transfer: &TransferConfig, attempt: &mut HttpAttempt) -> Result<()> {
     let body = std::mem::take(&mut attempt.body);
-    let body = decode_http_body_if_transfer_encoded(transfer, &attempt.headers, body)?;
+    let body = match decode_http_body_if_transfer_encoded(transfer, &attempt.headers, body) {
+        Ok(body) => body,
+        Err(error) => return defer_http_transfer_encoding_error(attempt, error),
+    };
     attempt.body = decode_http_body_if_compressed(transfer, &attempt.headers, body)?;
     Ok(())
+}
+
+fn defer_http_transfer_encoding_error(attempt: &mut HttpAttempt, error: CurlError) -> Result<()> {
+    match error {
+        CurlError::ContentEncodingRejected(message)
+            if message == TRANSFER_ENCODING_CHUNKED_NOT_LAST_REJECTION =>
+        {
+            let Some(header_bytes) = attempt
+                .header_bytes
+                .as_deref()
+                .and_then(accepted_headers_before_bad_transfer_encoding)
+            else {
+                return Err(CurlError::ContentEncodingRejected(message));
+            };
+            attempt.header_bytes = Some(header_bytes);
+            attempt.body.clear();
+            attempt.deferred_error = Some(CurlError::ContentEncodingRejected(message));
+            Ok(())
+        }
+        error => Err(error),
+    }
 }
 
 fn decode_http_body_if_transfer_encoded(
@@ -9620,14 +9652,14 @@ fn decode_http_body_if_transfer_encoded(
     }
     if encodings.len() > 5 {
         return Err(CurlError::ContentEncodingRejected(
-            "Reject response due to more than 5 content encodings".to_string(),
+            TRANSFER_ENCODING_TOO_MANY_REJECTION.to_string(),
         ));
     }
 
     if let Some(position) = encodings.iter().position(|encoding| encoding == "chunked") {
         if position + 1 != encodings.len() {
             return Err(CurlError::ContentEncodingRejected(
-                "Reject response due to 'chunked' not being the last Transfer-Encoding".to_string(),
+                TRANSFER_ENCODING_CHUNKED_NOT_LAST_REJECTION.to_string(),
             ));
         }
         encodings.pop();
@@ -9741,6 +9773,77 @@ fn parse_raw_http_headers(
         headers.append(name, value);
     }
     Ok((version, status, headers))
+}
+
+fn accepted_headers_before_bad_transfer_encoding(header_bytes: &[u8]) -> Option<Vec<u8>> {
+    let (status_line, mut offset) = next_raw_header_line(header_bytes, 0)?;
+    let mut accepted = status_line.to_vec();
+    let mut saw_chunked = false;
+
+    while offset < header_bytes.len() {
+        let (line, next_offset) = next_raw_header_line(header_bytes, offset)?;
+        let line_without_ending = raw_header_line_without_ending(line);
+        if line_without_ending.is_empty() {
+            return None;
+        }
+
+        let (name, value) = raw_header_split(line_without_ending)?;
+
+        if trim_ascii_whitespace(name).eq_ignore_ascii_case(b"transfer-encoding") {
+            for coding in value.split(|byte| *byte == b',') {
+                let coding = trim_ascii_whitespace(coding);
+                if coding.is_empty() {
+                    continue;
+                }
+                if saw_chunked {
+                    return Some(accepted);
+                }
+                if coding.eq_ignore_ascii_case(b"chunked") {
+                    saw_chunked = true;
+                }
+            }
+        }
+
+        accepted.extend_from_slice(line);
+        offset = next_offset;
+    }
+
+    None
+}
+
+fn next_raw_header_line(bytes: &[u8], offset: usize) -> Option<(&[u8], usize)> {
+    if offset >= bytes.len() {
+        return None;
+    }
+    let line_len = bytes[offset..]
+        .iter()
+        .position(|byte| *byte == b'\n')
+        .map(|position| position + 1)?;
+    let next_offset = offset + line_len;
+    Some((&bytes[offset..next_offset], next_offset))
+}
+
+fn raw_header_line_without_ending(line: &[u8]) -> &[u8] {
+    let line = line.strip_suffix(b"\n").unwrap_or(line);
+    line.strip_suffix(b"\r").unwrap_or(line)
+}
+
+fn raw_header_split(line: &[u8]) -> Option<(&[u8], &[u8])> {
+    let colon = line.iter().position(|byte| *byte == b':')?;
+    Some((&line[..colon], &line[colon + 1..]))
+}
+
+fn trim_ascii_whitespace(bytes: &[u8]) -> &[u8] {
+    let start = bytes
+        .iter()
+        .position(|byte| !byte.is_ascii_whitespace())
+        .unwrap_or(bytes.len());
+    let end = bytes
+        .iter()
+        .rposition(|byte| !byte.is_ascii_whitespace())
+        .map(|position| position + 1)
+        .unwrap_or(start);
+    &bytes[start..end]
 }
 
 fn http_send_error(error: reqwest::Error, transfer: &TransferConfig) -> CurlError {
@@ -9899,6 +10002,9 @@ fn finish_http_transfer(
 ) -> Result<()> {
     let max_filesize_exceeded =
         write_http_attempt_output(transfer, expanded, &attempt.method, metrics, &attempt, true)?;
+    if let Some(error) = attempt.deferred_error {
+        return Err(error);
+    }
     if max_filesize_exceeded {
         return Err(CurlError::FileSizeExceeded);
     }
@@ -10015,6 +10121,9 @@ fn is_http_error_status(status: StatusCode) -> bool {
 }
 
 fn should_retry_http_attempt(transfer: &TransferConfig, attempt: &HttpAttempt) -> bool {
+    if attempt.deferred_error.is_some() {
+        return false;
+    }
     let Some(status) = attempt.status else {
         return false;
     };
