@@ -8597,6 +8597,7 @@ async fn run_http_transfer(
             || initial_connect_to.is_some()
             || custom_host_header
             || raw_http_retry_redirect_wire_semantics(transfer)
+            || raw_http_remote_header_redirect_wire_semantics(transfer, &method)
             || (method != Method::HEAD && max_filesize_limit(transfer).is_some()))
     {
         let custom_method = transfer.method.is_some();
@@ -9110,10 +9111,6 @@ async fn run_http_transfer(
                 ));
             }
 
-            response
-                .bytes()
-                .await
-                .map_err(|error| http_send_error(error, transfer))?;
             if transfer.auto_referer && custom_referer.is_none() {
                 current_referer = Some(auto_referer_value(&final_url));
             }
@@ -9223,6 +9220,34 @@ fn raw_http_retry_redirect_wire_semantics(transfer: &TransferConfig) -> bool {
         && transfer.resolve.is_empty()
         && transfer.proxy.is_none()
         && transfer.http_version == HttpVersionPreference::Any
+}
+
+fn raw_http_remote_header_redirect_wire_semantics(
+    transfer: &TransferConfig,
+    method: &Method,
+) -> bool {
+    transfer.remote_name
+        && transfer.remote_header_name
+        && *method == Method::GET
+        && !transfer.include_headers
+        && !transfer.head
+        && transfer.dump_header.is_none()
+        && !transfer.verbose
+        && transfer.headers.is_empty()
+        && transfer.resolve.is_empty()
+        && transfer.proxy.is_none()
+        && transfer.http_version == HttpVersionPreference::Any
+        && transfer.data.is_empty()
+        && transfer.forms.is_empty()
+        && transfer.upload_file.is_none()
+        && transfer.user.is_none()
+        && transfer.oauth2_bearer.is_none()
+        && transfer.aws_sigv4.is_none()
+        && transfer.cookie.is_none()
+        && transfer.referer.is_none()
+        && transfer.range.is_none()
+        && transfer.time_cond.is_none()
+        && transfer.etag_compare.is_none()
 }
 
 fn raw_http_default_get_version_wire_semantics(transfer: &TransferConfig, method: &Method) -> bool {
@@ -9361,9 +9386,12 @@ async fn run_raw_http_proxy_transfer(context: RawHttpProxyContext<'_>) -> Result
         context.method,
         context.url,
         context.resume_from,
-        context.transfer.http09_allowed,
-        context.transfer.ignore_content_length,
-        context.transfer.raw,
+        RawHttpReadOptions {
+            http09_allowed: context.transfer.http09_allowed,
+            ignore_content_length: context.transfer.ignore_content_length,
+            raw_transfer_decoding: context.transfer.raw,
+            skip_unbounded_redirect_body: context.transfer.follow_location,
+        },
     )
     .await?;
     decode_http_attempt_body(context.transfer, &mut attempt)?;
@@ -9461,9 +9489,12 @@ async fn raw_http_send_direct_request(
         context.method,
         context.url,
         context.resume_from,
-        context.transfer.http09_allowed,
-        context.transfer.ignore_content_length,
-        context.transfer.raw,
+        RawHttpReadOptions {
+            http09_allowed: context.transfer.http09_allowed,
+            ignore_content_length: context.transfer.ignore_content_length,
+            raw_transfer_decoding: context.transfer.raw,
+            skip_unbounded_redirect_body: context.transfer.follow_location,
+        },
     )
     .await
 }
@@ -9884,14 +9915,20 @@ fn append_raw_http_transfer_connection(
     }
 }
 
+#[derive(Clone, Copy)]
+struct RawHttpReadOptions {
+    http09_allowed: bool,
+    ignore_content_length: bool,
+    raw_transfer_decoding: bool,
+    skip_unbounded_redirect_body: bool,
+}
+
 async fn raw_http_read_response(
     stream: &mut TcpStream,
     method: &Method,
     final_url: &Url,
     resume_from: u64,
-    http09_allowed: bool,
-    ignore_content_length: bool,
-    raw_transfer_decoding: bool,
+    options: RawHttpReadOptions,
 ) -> Result<HttpAttempt> {
     let mut header_bytes = Vec::new();
     let mut byte = [0_u8; 1];
@@ -9903,7 +9940,7 @@ async fn raw_http_read_response(
                     method,
                     final_url,
                     resume_from,
-                    http09_allowed,
+                    options.http09_allowed,
                     header_bytes,
                 );
             }
@@ -9911,7 +9948,7 @@ async fn raw_http_read_response(
         }
         header_bytes.push(byte[0]);
         if !raw_http_header_prefix_possible(&header_bytes) {
-            if http09_allowed {
+            if options.http09_allowed {
                 let mut body = header_bytes;
                 stream.read_to_end(&mut body).await.map_err(tcp_io_error)?;
                 return raw_http09_attempt(method, final_url, resume_from, true, body);
@@ -9930,14 +9967,22 @@ async fn raw_http_read_response(
     validate_redirect_location_headers(&headers)?;
     let retry_after = retry_after_delay(&headers);
     let resume_action = http_resume_action(method, resume_from, status, &headers)?;
+    let unbounded_redirect_body = options.skip_unbounded_redirect_body
+        && is_followed_redirect(status)
+        && redirect_location_value(&headers)?.is_some()
+        && !raw_http_response_is_chunked(&headers)
+        && !headers.contains_key(CONTENT_LENGTH);
     let mut deferred_error = None;
-    let body = if method == Method::HEAD || resume_action == HttpResumeAction::AlreadyComplete {
+    let body = if method == Method::HEAD
+        || resume_action == HttpResumeAction::AlreadyComplete
+        || unbounded_redirect_body
+    {
         Vec::new()
-    } else if raw_transfer_decoding && raw_http_response_is_chunked(&headers) {
+    } else if options.raw_transfer_decoding && raw_http_response_is_chunked(&headers) {
         raw_http_read_chunked_wire_body(stream).await?
     } else if raw_http_response_is_chunked(&headers) {
         raw_http_read_chunked_body(stream).await?
-    } else if !ignore_content_length
+    } else if !options.ignore_content_length
         && let Some(length) = headers
             .get(CONTENT_LENGTH)
             .and_then(|value| value.to_str().ok())

@@ -326,17 +326,59 @@ fn remote_header_filename(headers: &HeaderMap) -> Option<String> {
 }
 
 fn parse_content_disposition_filename(value: &str) -> Option<String> {
-    for part in value.split(';').map(str::trim) {
-        let Some(raw) = part.strip_prefix("filename=") else {
+    let mut index = 0;
+    let bytes = value.as_bytes();
+
+    while index < bytes.len() {
+        while index < bytes.len() && !bytes[index].is_ascii_alphabetic() {
+            index += 1;
+        }
+        if index + "filename=".len() > bytes.len() {
+            break;
+        }
+
+        if !bytes[index..].starts_with(b"filename=") {
+            while index < bytes.len() && bytes[index] != b';' {
+                index += 1;
+            }
             continue;
-        };
-        let trimmed = raw.trim_matches('"');
-        let filename = trimmed.rsplit(['/', '\\']).next().unwrap_or_default();
+        }
+
+        index += "filename=".len();
+        while index < bytes.len() && matches!(bytes[index], b' ' | b'\t') {
+            index += 1;
+        }
+
+        let raw_filename = parse_content_disposition_filename_value(&value[index..]);
+        let filename = raw_filename.rsplit(['/', '\\']).next().unwrap_or_default();
         if !matches!(filename, "" | "." | "..") {
             return Some(filename.to_string());
         }
+        return None;
     }
     None
+}
+
+fn parse_content_disposition_filename_value(raw: &str) -> &str {
+    let raw = raw.trim_start_matches([' ', '\t']);
+    let Some(first) = raw.as_bytes().first().copied() else {
+        return raw;
+    };
+
+    let value = if first == b'\'' || first == b'"' {
+        let rest = &raw[1..];
+        let quote = first as char;
+        match rest.find(quote) {
+            Some(end) => &rest[..end],
+            None => rest,
+        }
+    } else {
+        let end = raw.find(';').unwrap_or(raw.len());
+        &raw[..end]
+    };
+
+    let end = value.find(['\r', '\n']).unwrap_or(value.len());
+    &value[..end]
 }
 
 #[cfg(test)]
@@ -379,6 +421,14 @@ mod tests {
         assert_eq!(
             parse_content_disposition_filename("attachment; filename=log\\server\\archive.bin"),
             Some("archive.bin".to_string())
+        );
+        assert_eq!(
+            parse_content_disposition_filename("inline; filename=\"name1312;weird\""),
+            Some("name1312;weird".to_string())
+        );
+        assert_eq!(
+            parse_content_disposition_filename("inline; filename='name1313"),
+            Some("name1313".to_string())
         );
     }
 

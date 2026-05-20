@@ -23,10 +23,20 @@ pub fn apply_default_protocol(input: &str, default_protocol: Option<&str>) -> St
     if input.contains("://") {
         return input.to_string();
     }
-    let Some(default_protocol) = default_protocol else {
+    let Some(protocol) = default_protocol.or_else(|| guess_default_protocol(input)) else {
         return input.to_string();
     };
-    format!("{default_protocol}://{input}")
+    format!("{protocol}://{input}")
+}
+
+fn guess_default_protocol(input: &str) -> Option<&'static str> {
+    let colon = input.find(':')?;
+    let first_path_separator = input.find('/').unwrap_or(input.len());
+    if colon < first_path_separator && input[..colon].contains('.') {
+        Some("http")
+    } else {
+        None
+    }
 }
 
 fn expand_recursive(input: &str, variables: Vec<String>) -> Result<Vec<ExpandedUrl>> {
@@ -153,8 +163,13 @@ fn numeric_range(left: &str, right: &str) -> Result<Vec<String>> {
     let end: i64 = right
         .parse()
         .map_err(|_| CurlError::Url("invalid numeric range".to_string()))?;
+    if start > end {
+        return Err(CurlError::Url("bad numeric range".to_string()));
+    }
+    if end == i64::MAX {
+        return Err(CurlError::Url("range end/step overflow".to_string()));
+    }
     let width = left.len().max(right.len());
-    let step = if start <= end { 1 } else { -1 };
     let mut values = Vec::new();
     let mut current = start;
     loop {
@@ -162,7 +177,7 @@ fn numeric_range(left: &str, right: &str) -> Result<Vec<String>> {
         if current == end {
             break;
         }
-        current += step;
+        current += 1;
     }
     Ok(values)
 }
@@ -218,6 +233,25 @@ mod tests {
     }
 
     #[test]
+    fn rejects_c_curl_numeric_range_edges() {
+        assert!(
+            expand_url("http://host/[2-1]", false)
+                .unwrap_err()
+                .to_string()
+                .contains("bad numeric range")
+        );
+        assert!(
+            expand_url(
+                "http://host/[9223372036854775806-9223372036854775807]",
+                false,
+            )
+            .unwrap_err()
+            .to_string()
+            .contains("range end/step overflow")
+        );
+    }
+
+    #[test]
     fn applies_default_protocol_to_schemeless_urls() {
         assert_eq!(
             apply_default_protocol("/tmp/file.txt", Some("file")),
@@ -232,6 +266,10 @@ mod tests {
             "http://example.com"
         );
         assert_eq!(apply_default_protocol("example.com", None), "example.com");
+        assert_eq!(
+            apply_default_protocol("127.0.0.1:8080/file", None),
+            "http://127.0.0.1:8080/file"
+        );
     }
 
     #[test]
