@@ -105,6 +105,8 @@ pub struct TransferConfig {
     pub local_port: Option<LocalPortRange>,
     pub connect_timeout: Option<Duration>,
     pub max_time: Option<Duration>,
+    pub low_speed_limit: u64,
+    pub low_speed_time: Duration,
     pub max_filesize: Option<u64>,
     pub user_agent: Option<String>,
     pub referer: Option<String>,
@@ -488,6 +490,8 @@ impl Default for TransferConfig {
             local_port: None,
             connect_timeout: None,
             max_time: None,
+            low_speed_limit: 0,
+            low_speed_time: Duration::ZERO,
             max_filesize: None,
             user_agent: None,
             referer: None,
@@ -937,6 +941,14 @@ impl Parser {
                 let value = self.value_for(name, inline_value)?;
                 self.current().max_time = Some(parse_duration(name, &value)?);
             }
+            "speed-limit" => {
+                let value = self.value_for(name, inline_value)?;
+                self.set_low_speed_limit(parse_c_long_u64(name, &value)?);
+            }
+            "speed-time" => {
+                let value = self.value_for(name, inline_value)?;
+                self.set_low_speed_time(parse_c_long_u64(name, &value)?);
+            }
             "max-filesize" => {
                 let value = self.value_for(name, inline_value)?;
                 self.current().max_filesize = Some(parse_size_parameter(name, &value)?);
@@ -1203,6 +1215,16 @@ impl Parser {
                     self.current().max_time = Some(parse_duration("max-time", &value)?);
                     break;
                 }
+                'Y' => {
+                    let value = self.short_value('Y', rest)?;
+                    self.set_low_speed_limit(parse_c_long_u64("speed-limit", &value)?);
+                    break;
+                }
+                'y' => {
+                    let value = self.short_value('y', rest)?;
+                    self.set_low_speed_time(parse_c_long_u64("speed-time", &value)?);
+                    break;
+                }
                 'A' => {
                     let value = self.short_value('A', rest)?;
                     self.current().user_agent = Some(value);
@@ -1256,6 +1278,22 @@ impl Parser {
                 .ok_or_else(|| CurlError::Usage(format!("option -{option} requires a value")))
         } else {
             Ok(rest.to_string())
+        }
+    }
+
+    fn set_low_speed_limit(&mut self, limit: u64) {
+        let transfer = self.current();
+        transfer.low_speed_limit = limit;
+        if transfer.low_speed_time == Duration::ZERO {
+            transfer.low_speed_time = Duration::from_secs(30);
+        }
+    }
+
+    fn set_low_speed_time(&mut self, seconds: u64) {
+        let transfer = self.current();
+        transfer.low_speed_time = Duration::from_secs(seconds);
+        if transfer.low_speed_limit == 0 {
+            transfer.low_speed_limit = 1;
         }
     }
 
@@ -1645,6 +1683,8 @@ impl TransferConfig {
             || self.local_port.is_some()
             || self.connect_timeout.is_some()
             || self.max_time.is_some()
+            || self.low_speed_limit != 0
+            || self.low_speed_time != Duration::ZERO
             || self.max_filesize.is_some()
             || self.user_agent.is_some()
             || self.referer.is_some()
@@ -1729,6 +1769,8 @@ fn option_takes_value(name: &str) -> bool {
             | "noproxy"
             | "connect-timeout"
             | "max-time"
+            | "speed-limit"
+            | "speed-time"
             | "max-filesize"
             | "user-agent"
             | "cookie"
@@ -1904,6 +1946,16 @@ fn parse_u64(name: &str, value: &str) -> Result<u64> {
     value
         .parse()
         .map_err(|_| CurlError::Usage(format!("option --{name} expects an integer")))
+}
+
+fn parse_c_long_u64(name: &str, value: &str) -> Result<u64> {
+    let value = parse_u64(name, value)?;
+    if value > i64::MAX as u64 {
+        return Err(CurlError::Usage(format!(
+            "option --{name} value is too large"
+        )));
+    }
+    Ok(value)
 }
 
 fn parse_local_port_range(name: &str, value: &str) -> Result<LocalPortRange> {
@@ -2307,6 +2359,8 @@ fn print_common_help() {
                --interface <name>      Use network interface\n\
                --local-port <range>    Use a local port number within range\n\
            -k, --insecure              Allow insecure TLS/SSH\n\
+           -Y, --speed-limit <speed>   Stop transfers slower than this\n\
+           -y, --speed-time <seconds>  Trigger speed-limit after this time\n\
            -s, --silent                Silent mode\n\
            -v, --verbose               Verbose transfer trace\n\
                --trace-ascii <file>    Accepted for compatibility\n\
@@ -3611,6 +3665,57 @@ mod tests {
         );
 
         assert!(parse_args(["-q", "--interface", "", "tftp://example.com/file"]).is_err());
+    }
+
+    #[test]
+    fn parses_low_speed_options() {
+        let config = parse_args([
+            "-q",
+            "--speed-limit",
+            "1000",
+            "--speed-time",
+            "2",
+            "tftp://example.com/file",
+        ])
+        .unwrap();
+        let transfer = &config.transfers[0];
+        assert_eq!(transfer.low_speed_limit, 1000);
+        assert_eq!(transfer.low_speed_time, Duration::from_secs(2));
+
+        let config =
+            parse_args(["-q", "--speed-limit", "1000", "tftp://example.com/file"]).unwrap();
+        assert_eq!(config.transfers[0].low_speed_limit, 1000);
+        assert_eq!(config.transfers[0].low_speed_time, Duration::from_secs(30));
+
+        let config = parse_args(["-q", "-Y1000", "-y2", "tftp://example.com/file"]).unwrap();
+        assert_eq!(config.transfers[0].low_speed_limit, 1000);
+        assert_eq!(config.transfers[0].low_speed_time, Duration::from_secs(2));
+
+        let config = parse_args(["-q", "--speed-time", "2", "tftp://example.com/file"]).unwrap();
+        assert_eq!(config.transfers[0].low_speed_limit, 1);
+        assert_eq!(config.transfers[0].low_speed_time, Duration::from_secs(2));
+
+        let config = parse_args(["-q", "-Y1000", "-y0", "tftp://example.com/file"]).unwrap();
+        assert_eq!(config.transfers[0].low_speed_limit, 1000);
+        assert_eq!(config.transfers[0].low_speed_time, Duration::ZERO);
+
+        let config = parse_args(["-q", "-Y0", "-y2", "tftp://example.com/file"]).unwrap();
+        assert_eq!(config.transfers[0].low_speed_limit, 1);
+        assert_eq!(config.transfers[0].low_speed_time, Duration::from_secs(2));
+
+        let config = parse_args(["-q", "-y0", "-Y1000", "tftp://example.com/file"]).unwrap();
+        assert_eq!(config.transfers[0].low_speed_limit, 1000);
+        assert_eq!(config.transfers[0].low_speed_time, Duration::from_secs(30));
+
+        assert!(
+            parse_args([
+                "-q",
+                "--speed-limit",
+                "9223372036854775808",
+                "tftp://example.com/file"
+            ])
+            .is_err()
+        );
     }
 
     #[test]

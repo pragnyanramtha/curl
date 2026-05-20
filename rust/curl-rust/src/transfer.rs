@@ -3726,9 +3726,11 @@ async fn run_tftp_exchange(
     let mut block_size = usize::from(initial_blksize);
     let mut peer = None;
     let mut packet = vec![0; TFTP_MAX_PACKET_SIZE];
+    let low_speed = LowSpeedDeadline::new(transfer);
 
     loop {
-        let (read, addr) = socket.recv_from(&mut packet).await.map_err(tcp_io_error)?;
+        let (read, addr) =
+            recv_tftp_packet(&socket, &mut packet, low_speed.as_ref(), body.len()).await?;
         if let Some(peer) = peer {
             if addr != peer {
                 let error = tftp_error_packet(5, b"Unknown transfer ID");
@@ -3923,6 +3925,59 @@ fn bind_udp_error(error: io::Error, interface: Option<&str>) -> CurlError {
 
 fn interface_failed(message: String) -> CurlError {
     CurlError::InterfaceFailed(message)
+}
+
+struct LowSpeedDeadline {
+    limit: u64,
+    duration: Duration,
+    started: Instant,
+}
+
+impl LowSpeedDeadline {
+    fn new(transfer: &TransferConfig) -> Option<Self> {
+        if transfer.low_speed_limit == 0 || transfer.low_speed_time == Duration::ZERO {
+            return None;
+        }
+        Some(Self {
+            limit: transfer.low_speed_limit,
+            duration: transfer.low_speed_time,
+            started: Instant::now(),
+        })
+    }
+
+    fn remaining_for_downloaded(&self, downloaded: usize) -> Option<Duration> {
+        let tolerated = Duration::from_secs_f64(downloaded as f64 / self.limit as f64);
+        let deadline = self.started + tolerated + self.duration;
+        deadline.checked_duration_since(Instant::now())
+    }
+
+    fn error(&self) -> CurlError {
+        CurlError::LowSpeedTimeout {
+            limit: self.limit,
+            seconds: self.duration.as_secs(),
+        }
+    }
+}
+
+async fn recv_tftp_packet(
+    socket: &UdpSocket,
+    packet: &mut [u8],
+    low_speed: Option<&LowSpeedDeadline>,
+    downloaded: usize,
+) -> Result<(usize, SocketAddr)> {
+    let receive = socket.recv_from(packet);
+    if let Some(low_speed) = low_speed {
+        let Some(deadline) = low_speed.remaining_for_downloaded(downloaded) else {
+            return Err(low_speed.error());
+        };
+        tokio::time::timeout(deadline, receive)
+            .await
+            .map_or(Err(low_speed.error()), |result| {
+                result.map_err(tcp_io_error)
+            })
+    } else {
+        receive.await.map_err(tcp_io_error)
+    }
 }
 
 async fn run_tftp_upload(socket: &UdpSocket, body: &[u8], requested_blksize: u16) -> Result<()> {

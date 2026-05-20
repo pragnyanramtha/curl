@@ -244,6 +244,7 @@ set(_curl_rust_corpus_tests
   1224
   1234
   1236
+  1238
   1242
   1243
   1264

@@ -106,6 +106,10 @@ pub enum CurlError {
     TftpNoSuchUser,
     #[error("RTSP CSeq mismatch or invalid CSeq")]
     RtspCseqError,
+    #[error(
+        "Operation too slow. Less than {limit} bytes/sec transferred the last {seconds} seconds"
+    )]
+    LowSpeedTimeout { limit: u64, seconds: u64 },
     #[error("Operation timed out")]
     Timeout,
 }
@@ -152,6 +156,7 @@ impl CurlError {
             Self::TftpFileExists => 73,
             Self::TftpNoSuchUser => 74,
             Self::RtspCseqError => 85,
+            Self::LowSpeedTimeout { .. } => 28,
             Self::Io(_) => 23,
             Self::ReadError(_) => 26,
             Self::Timeout => 28,

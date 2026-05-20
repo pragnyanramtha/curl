@@ -1,6 +1,7 @@
 use std::fmt::Write as _;
 use std::io::Write as _;
 use std::path::Path;
+use std::time::Duration;
 
 use url::Url;
 
@@ -418,6 +419,20 @@ fn write_request(out: &mut String, render: &RenderTransfer<'_>, url: &str) -> Re
             out,
             "CURLOPT_TIMEOUT_MS",
             &format!("{}L", timeout.as_millis()),
+        );
+    }
+    if transfer.low_speed_limit != 0 {
+        emit_long_setopt(
+            out,
+            "CURLOPT_LOW_SPEED_LIMIT",
+            i64::try_from(transfer.low_speed_limit).unwrap_or(i64::MAX),
+        );
+    }
+    if transfer.low_speed_time != Duration::ZERO {
+        emit_long_setopt(
+            out,
+            "CURLOPT_LOW_SPEED_TIME",
+            i64::try_from(transfer.low_speed_time.as_secs()).unwrap_or(i64::MAX),
         );
     }
     if let Some(max_filesize) = transfer.max_filesize {
@@ -1012,6 +1027,10 @@ mod tests {
             "2",
             "--max-time",
             "3",
+            "--speed-limit",
+            "1000",
+            "--speed-time",
+            "2",
             "--interface",
             "host!127.0.0.1",
             "--local-port",
@@ -1027,6 +1046,8 @@ mod tests {
         assert!(source.contains("CURLOPT_SSL_VERIFYHOST, 0L"));
         assert!(source.contains("CURLOPT_CONNECTTIMEOUT_MS, 2000L"));
         assert!(source.contains("CURLOPT_TIMEOUT_MS, 3000L"));
+        assert!(source.contains("CURLOPT_LOW_SPEED_LIMIT, 1000L"));
+        assert!(source.contains("CURLOPT_LOW_SPEED_TIME, 2L"));
         assert!(source.contains("CURLOPT_INTERFACE, \"host!127.0.0.1\""));
         assert!(source.contains("CURLOPT_LOCALPORT, 4000L"));
         assert!(source.contains("CURLOPT_LOCALPORTRANGE, 3L"));
@@ -1043,6 +1064,18 @@ mod tests {
         let source = render_source(&config).unwrap();
         assert!(!source.contains("CURLOPT_LOCALPORT"));
         assert!(!source.contains("CURLOPT_LOCALPORTRANGE"));
+
+        let config =
+            parse_args(["-q", "--libcurl", "client.c", "-Y0", "https://example.com"]).unwrap();
+        let source = render_source(&config).unwrap();
+        assert!(!source.contains("CURLOPT_LOW_SPEED_LIMIT"));
+        assert!(source.contains("CURLOPT_LOW_SPEED_TIME, 30L"));
+
+        let config =
+            parse_args(["-q", "--libcurl", "client.c", "-y0", "https://example.com"]).unwrap();
+        let source = render_source(&config).unwrap();
+        assert!(source.contains("CURLOPT_LOW_SPEED_LIMIT, 1L"));
+        assert!(!source.contains("CURLOPT_LOW_SPEED_TIME"));
     }
 
     #[test]

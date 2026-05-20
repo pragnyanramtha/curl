@@ -1064,6 +1064,41 @@ fn spawn_tftp_server(blocks: Vec<Vec<u8>>) -> (String, Receiver<TftpRecord>) {
     spawn_tftp_server_with_oack(blocks, None)
 }
 
+fn spawn_slow_tftp_server(delay: Duration) -> (String, Receiver<TftpRecord>) {
+    let socket = UdpSocket::bind("127.0.0.1:0").unwrap();
+    let addr = socket.local_addr().unwrap();
+    let (tx, rx) = mpsc::channel();
+
+    thread::spawn(move || {
+        let mut buffer = vec![0; 70_000];
+        let (read, peer) = socket.recv_from(&mut buffer).unwrap();
+        let request = buffer[..read].to_vec();
+        let mut acknowledgements = Vec::new();
+
+        for block_number in 1..=2_u16 {
+            let mut packet = Vec::with_capacity(516);
+            packet.extend_from_slice(&3_u16.to_be_bytes());
+            packet.extend_from_slice(&block_number.to_be_bytes());
+            packet.extend(std::iter::repeat_n(b'x', 512));
+            socket.send_to(&packet, peer).unwrap();
+
+            let (read, ack_peer) = socket.recv_from(&mut buffer).unwrap();
+            assert_eq!(ack_peer, peer);
+            acknowledgements.push(buffer[..read].to_vec());
+            thread::sleep(delay);
+        }
+
+        tx.send(TftpRecord {
+            request,
+            peer,
+            acknowledgements,
+        })
+        .unwrap();
+    });
+
+    (format!("tftp://{addr}/file.txt"), rx)
+}
+
 fn spawn_tftp_server_with_oack(
     blocks: Vec<Vec<u8>>,
     oack: Option<Vec<u8>>,
@@ -5876,6 +5911,24 @@ fn tftp_interface_name_failure_returns_45() {
         "tftp://127.0.0.1:9/file.txt",
     ]);
     command.assert().code(45).stdout("");
+}
+
+#[test]
+fn tftp_low_speed_timeout_returns_28() {
+    let (url, rx) = spawn_slow_tftp_server(Duration::from_millis(1200));
+
+    let mut command = Command::cargo_bin("curl").unwrap();
+    command.args(["-q", "-sS", "-Y1000", "-y1", &url]);
+    command.assert().failure().code(28).stdout("").stderr(
+        "curl: (28) Operation too slow. Less than 1000 bytes/sec transferred the last 1 seconds\n",
+    );
+
+    let record = rx.recv().unwrap();
+    assert_eq!(record.acknowledgements.len(), 2);
+    assert_eq!(
+        record.request,
+        b"\x00\x01file.txt\x00octet\x00tsize\x000\x00blksize\x00512\x00timeout\x005\x00"
+    );
 }
 
 #[test]
