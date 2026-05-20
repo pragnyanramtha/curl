@@ -1634,7 +1634,14 @@ async fn ftp_upload_body(
         .ok_or_else(|| CurlError::Url("FTP upload requires a remote filename".to_string()))?;
     let mut data_stream =
         ftp_open_passive_data(transfer, stream, host, metrics, control_headers).await?;
-    ftp_set_type(stream, b'I', metrics, control_headers).await?;
+    let ascii = ftp_effective_ascii(transfer, path);
+    ftp_set_type(
+        stream,
+        if ascii { b'A' } else { b'I' },
+        metrics,
+        control_headers,
+    )
+    .await?;
     ftp_run_quote_commands(stream, &transfer.ftp_prequote, metrics, control_headers).await?;
 
     let mut offset = 0_usize;
@@ -1662,6 +1669,13 @@ async fn ftp_upload_body(
         return Ok(0);
     }
     let body = upload.get(offset..).unwrap_or_default();
+    let ascii_body;
+    let body = if ascii {
+        ascii_body = ftp_ascii_upload_body(body);
+        ascii_body.as_slice()
+    } else {
+        body
+    };
     let mut command = Vec::from(if append { &b"APPE "[..] } else { &b"STOR "[..] });
     command.extend_from_slice(file);
     let response = ftp_command(stream, &command, metrics, control_headers).await?;
@@ -1681,6 +1695,19 @@ async fn ftp_upload_body(
         _ => return Err(CurlError::PartialFile),
     }
     Ok(body.len())
+}
+
+fn ftp_ascii_upload_body(body: &[u8]) -> Vec<u8> {
+    let mut converted = Vec::with_capacity(body.len());
+    let mut previous_was_cr = false;
+    for &byte in body {
+        if byte == b'\n' && !previous_was_cr {
+            converted.push(b'\r');
+        }
+        converted.push(byte);
+        previous_was_cr = byte == b'\r';
+    }
+    converted
 }
 
 async fn ftp_open_passive_data(

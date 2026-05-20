@@ -5065,6 +5065,70 @@ fn ftp_upload_file_sends_stor_and_body() {
 }
 
 #[test]
+fn ftp_upload_ascii_url_type_sends_type_a_and_converts_lf() {
+    let temp = tempdir().unwrap();
+    let upload = temp.path().join("payload.txt");
+    std::fs::write(&upload, b"one\ntwo\n").unwrap();
+    let (url, rx) = spawn_ftp_server("/475;type=a", ftp_options(Vec::new()));
+
+    let mut command = Command::cargo_bin("curl").unwrap();
+    command.args(["-q", "-sS", "-T", upload.to_str().unwrap(), &url]);
+    command.assert().success().stdout("");
+
+    let record = rx.recv().unwrap();
+    assert_eq!(
+        record.commands,
+        b"USER anonymous\r\nPASS ftp@example.com\r\nPWD\r\nEPSV\r\nTYPE A\r\nSTOR 475\r\nQUIT\r\n"
+    );
+    assert_eq!(record.upload, b"one\r\ntwo\r\n");
+}
+
+#[test]
+fn ftp_upload_ascii_url_type_preserves_existing_crlf() {
+    let temp = tempdir().unwrap();
+    let upload = temp.path().join("payload.txt");
+    std::fs::write(&upload, b"one\r\ntwo\r\n").unwrap();
+    let (url, rx) = spawn_ftp_server("/476;type=a", ftp_options(Vec::new()));
+
+    let mut command = Command::cargo_bin("curl").unwrap();
+    command.args(["-q", "-sS", "-T", upload.to_str().unwrap(), &url]);
+    command.assert().success().stdout("");
+
+    let record = rx.recv().unwrap();
+    assert_eq!(
+        record.commands,
+        b"USER anonymous\r\nPASS ftp@example.com\r\nPWD\r\nEPSV\r\nTYPE A\r\nSTOR 476\r\nQUIT\r\n"
+    );
+    assert_eq!(record.upload, b"one\r\ntwo\r\n");
+}
+
+#[test]
+fn ftp_upload_use_ascii_sends_type_a_and_converts_lf() {
+    let temp = tempdir().unwrap();
+    let upload = temp.path().join("payload.txt");
+    std::fs::write(&upload, b"one\ntwo\n").unwrap();
+    let (url, rx) = spawn_ftp_server("/ascii.txt", ftp_options(Vec::new()));
+
+    let mut command = Command::cargo_bin("curl").unwrap();
+    command.args([
+        "-q",
+        "-sS",
+        "--use-ascii",
+        "-T",
+        upload.to_str().unwrap(),
+        &url,
+    ]);
+    command.assert().success().stdout("");
+
+    let record = rx.recv().unwrap();
+    assert_eq!(
+        record.commands,
+        b"USER anonymous\r\nPASS ftp@example.com\r\nPWD\r\nEPSV\r\nTYPE A\r\nSTOR ascii.txt\r\nQUIT\r\n"
+    );
+    assert_eq!(record.upload, b"one\r\ntwo\r\n");
+}
+
+#[test]
 fn ftp_upload_to_directory_url_appends_local_filename() {
     let temp = tempdir().unwrap();
     let upload = temp.path().join("client-name.txt");
