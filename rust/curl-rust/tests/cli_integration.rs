@@ -2109,6 +2109,38 @@ fn conflicting_location_headers_return_weird_reply() {
 }
 
 #[test]
+fn location_duplicate_headers_accept_exact_repeat() {
+    let (url, rx) = spawn_sequence_server(vec![
+        b"HTTP/1.1 302 Found\r\nLocation: /next\r\nLocation: /next\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+        b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok",
+    ]);
+
+    let mut command = Command::cargo_bin("curl").unwrap();
+    command.args(["-q", "-sS", "-L", &url]);
+    command.assert().success().stdout("ok");
+
+    let first = rx.recv().unwrap();
+    let second = rx.recv().unwrap();
+    assert!(first.start_line.starts_with("GET /resource HTTP/1.1"));
+    assert!(second.start_line.starts_with("GET /next HTTP/1.1"));
+}
+
+#[test]
+fn location_conflicting_headers_fail_before_follow() {
+    let (url, rx) = spawn_sequence_server(vec![
+        b"HTTP/1.1 302 Found\r\nLocation: /one\r\nLocation: /two\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+    ]);
+
+    let mut command = Command::cargo_bin("curl").unwrap();
+    command.args(["-q", "-sS", "-L", &url]);
+    command.assert().failure().code(8).stdout("");
+
+    let first = rx.recv().unwrap();
+    assert!(first.start_line.starts_with("GET /resource HTTP/1.1"));
+    assert!(rx.try_recv().is_err());
+}
+
+#[test]
 fn compressed_decodes_supported_response_bodies() {
     for (label, encoding, compressed_body) in [
         ("gzip", "gzip", GZIP_COMPRESSED_BODY),
@@ -9030,6 +9062,24 @@ fn cookie_jar_sends_cookie_on_later_url_in_group() {
 }
 
 #[test]
+fn cookie_jar_sends_redirect_cookie_on_followup() {
+    let (url, rx) = spawn_sequence_server(vec![
+        b"HTTP/1.1 302 Found\r\nLocation: /next\r\nSet-Cookie: sid=abc; Path=/\r\nConnection: close\r\nContent-Length: 0\r\n\r\n",
+        b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok",
+    ]);
+    let temp = tempdir().unwrap();
+    let jar = temp.path().join("cookies.txt");
+
+    let mut command = Command::cargo_bin("curl").unwrap();
+    command.args(["-q", "-sS", "-L", "-c", jar.to_str().unwrap(), &url]);
+    command.assert().success().stdout("ok");
+
+    rx.recv().unwrap();
+    let second_request = rx.recv().unwrap();
+    assert_eq!(header(&second_request, "cookie"), Some("sid=abc"));
+}
+
+#[test]
 fn empty_cookie_input_activates_cookie_engine() {
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let addr = listener.local_addr().unwrap();
@@ -10280,6 +10330,78 @@ fn auto_referer_redirect_rewrites_post_to_get() {
     assert_eq!(header(&second, "referer"), Some(url.as_str()));
 }
 
+fn assert_plain_post_redirect_rewrites_to_get(first_response: &'static [u8]) {
+    let (url, rx) = spawn_sequence_server(vec![
+        first_response,
+        b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok",
+    ]);
+
+    let mut command = Command::cargo_bin("curl").unwrap();
+    command.args(["-q", "-sS", "-L", "-d", "body", "-w", " %{method}", &url]);
+    command.assert().success().stdout("ok GET");
+
+    let first = rx.recv().unwrap();
+    let second = rx.recv().unwrap();
+    assert!(first.start_line.starts_with("POST /resource HTTP/1.1"));
+    assert_eq!(first.body, b"body");
+    assert!(second.start_line.starts_with("GET /next HTTP/1.1"));
+    assert!(second.body.is_empty());
+    assert_eq!(header(&second, "content-length"), None);
+}
+
+#[test]
+fn plain_location_post301_rewrites_post_to_get() {
+    assert_plain_post_redirect_rewrites_to_get(
+        b"HTTP/1.1 301 Moved Permanently\r\nLocation: /next\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+    );
+}
+
+#[test]
+fn plain_location_post302_rewrites_post_to_get() {
+    assert_plain_post_redirect_rewrites_to_get(
+        b"HTTP/1.1 302 Found\r\nLocation: /next\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+    );
+}
+
+#[test]
+fn plain_location_post303_rewrites_post_to_get() {
+    assert_plain_post_redirect_rewrites_to_get(
+        b"HTTP/1.1 303 See Other\r\nLocation: /next\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+    );
+}
+
+fn assert_plain_post_redirect_preserves_body(first_response: &'static [u8]) {
+    let (url, rx) = spawn_sequence_server(vec![
+        first_response,
+        b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok",
+    ]);
+
+    let mut command = Command::cargo_bin("curl").unwrap();
+    command.args(["-q", "-sS", "-L", "-d", "body", "-w", " %{method}", &url]);
+    command.assert().success().stdout("ok POST");
+
+    let first = rx.recv().unwrap();
+    let second = rx.recv().unwrap();
+    assert!(first.start_line.starts_with("POST /resource HTTP/1.1"));
+    assert_eq!(first.body, b"body");
+    assert!(second.start_line.starts_with("POST /next HTTP/1.1"));
+    assert_eq!(second.body, b"body");
+}
+
+#[test]
+fn plain_location_post307_preserves_body() {
+    assert_plain_post_redirect_preserves_body(
+        b"HTTP/1.1 307 Temporary Redirect\r\nLocation: /next\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+    );
+}
+
+#[test]
+fn plain_location_post308_preserves_body() {
+    assert_plain_post_redirect_preserves_body(
+        b"HTTP/1.1 308 Permanent Redirect\r\nLocation: /next\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+    );
+}
+
 fn assert_post_redirect_preserves_method(first_response: &'static [u8], option: &str) {
     let (url, rx) = spawn_sequence_server(vec![
         first_response,
@@ -10578,6 +10700,21 @@ fn auto_referer_respects_max_redirs_limit() {
 }
 
 #[test]
+fn plain_location_respects_max_redirs_zero() {
+    let (url, rx) = spawn_sequence_server(vec![
+        b"HTTP/1.1 302 Found\r\nLocation: /next\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+    ]);
+
+    let mut command = Command::cargo_bin("curl").unwrap();
+    command.args(["-q", "-sS", "-L", "--max-redirs", "0", &url]);
+    command.assert().failure().code(47).stdout("");
+
+    let request = rx.recv().unwrap();
+    assert!(request.start_line.starts_with("GET /resource HTTP/1.1"));
+    assert!(rx.try_recv().is_err());
+}
+
+#[test]
 fn initial_referer_auto_replaces_referer_after_redirect() {
     let (url, rx) = spawn_sequence_server(vec![
         b"HTTP/1.1 302 Found\r\nLocation: /next\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
@@ -10698,6 +10835,31 @@ fn dump_header_records_manual_redirect_history() {
     let second = rx.recv().unwrap();
     assert!(first.start_line.starts_with("POST /resource HTTP/1.1"));
     assert!(second.start_line.starts_with("POST /next HTTP/1.1"));
+
+    let headers = std::fs::read_to_string(dump_path).unwrap();
+    assert!(headers.contains("HTTP/1.1 301 Moved Permanently\r\n"));
+    assert!(headers.contains("x-hop: one\r\n"));
+    assert!(headers.contains("HTTP/1.1 200 OK\r\n"));
+    assert!(headers.contains("x-hop: two\r\n"));
+}
+
+#[test]
+fn dump_header_records_plain_location_redirect_history() {
+    let (url, rx) = spawn_sequence_server(vec![
+        b"HTTP/1.1 301 Moved Permanently\r\nLocation: /next\r\nX-Hop: one\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+        b"HTTP/1.1 200 OK\r\nX-Hop: two\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok",
+    ]);
+    let temp = tempdir().unwrap();
+    let dump_path = temp.path().join("headers.txt");
+
+    let mut command = Command::cargo_bin("curl").unwrap();
+    command.args(["-q", "-sS", "-L", "-D", dump_path.to_str().unwrap(), &url]);
+    command.assert().success().stdout("ok");
+
+    let first = rx.recv().unwrap();
+    let second = rx.recv().unwrap();
+    assert!(first.start_line.starts_with("GET /resource HTTP/1.1"));
+    assert!(second.start_line.starts_with("GET /next HTTP/1.1"));
 
     let headers = std::fs::read_to_string(dump_path).unwrap();
     assert!(headers.contains("HTTP/1.1 301 Moved Permanently\r\n"));

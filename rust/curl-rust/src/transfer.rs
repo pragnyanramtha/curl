@@ -9484,7 +9484,8 @@ fn proxy_auth_credentials_configured(transfer: &TransferConfig) -> Result<bool> 
 }
 
 fn manual_http_redirects(transfer: &TransferConfig) -> bool {
-    transfer.auto_referer
+    transfer.follow_location
+        || transfer.auto_referer
         || transfer.post301
         || transfer.post302
         || transfer.post303
