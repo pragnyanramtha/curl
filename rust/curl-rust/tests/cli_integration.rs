@@ -1,6 +1,6 @@
 use std::io::ErrorKind;
 use std::io::{Read, Write};
-use std::net::{Shutdown, SocketAddr, TcpListener, UdpSocket};
+use std::net::{IpAddr, Ipv4Addr, Shutdown, SocketAddr, TcpListener, UdpSocket};
 #[cfg(unix)]
 use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
@@ -5847,6 +5847,35 @@ fn tftp_local_port_binds_udp_socket() {
         record.request,
         b"\x00\x01file.txt\x00octet\x00tsize\x000\x00blksize\x00512\x00timeout\x005\x00"
     );
+}
+
+#[test]
+fn tftp_interface_binds_udp_socket_to_host() {
+    let (url, rx) = spawn_tftp_server(vec![b"bound".to_vec()]);
+
+    let mut command = Command::cargo_bin("curl").unwrap();
+    command.args(["-q", "-sS", "--interface", "host!127.0.0.1", &url]);
+    command.assert().success().stdout("bound");
+
+    let record = rx.recv().unwrap();
+    assert_eq!(record.peer.ip(), IpAddr::V4(Ipv4Addr::LOCALHOST));
+    assert_eq!(
+        record.request,
+        b"\x00\x01file.txt\x00octet\x00tsize\x000\x00blksize\x00512\x00timeout\x005\x00"
+    );
+}
+
+#[test]
+fn tftp_interface_name_failure_returns_45() {
+    let mut command = Command::cargo_bin("curl").unwrap();
+    command.args([
+        "-q",
+        "-sS",
+        "--interface",
+        "if!curl-rust-missing-interface",
+        "tftp://127.0.0.1:9/file.txt",
+    ]);
+    command.assert().code(45).stdout("");
 }
 
 #[test]

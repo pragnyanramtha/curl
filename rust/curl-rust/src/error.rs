@@ -78,6 +78,8 @@ pub enum CurlError {
     LoginDenied,
     #[error("URL rejected: Credentials was passed in the URL when prohibited")]
     UrlCredentialsProhibited,
+    #[error("{0}")]
+    InterfaceFailed(String),
     #[error("SSL peer certificate or SSH remote key was not OK")]
     PeerVerificationFailed,
     #[error("LDAP cannot bind")]
@@ -136,6 +138,7 @@ impl CurlError {
             Self::FileSizeExceeded => 63,
             Self::RemoteDiskFull => 70,
             Self::LoginDenied | Self::UrlCredentialsProhibited => 67,
+            Self::InterfaceFailed(_) => 45,
             Self::PeerVerificationFailed => 60,
             Self::LdapCannotBind => 38,
             Self::LdapSearchFailed => 39,

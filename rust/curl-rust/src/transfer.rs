@@ -3700,7 +3700,12 @@ async fn run_tftp_exchange(
         .into_iter()
         .next()
         .ok_or_else(|| CurlError::Transfer("could not resolve host".to_string()))?;
-    let socket = bind_udp_socket_for_peer(peer_addr, transfer.local_port).await?;
+    let socket = bind_udp_socket_for_peer(
+        peer_addr,
+        transfer.interface.as_deref(),
+        transfer.local_port,
+    )
+    .await?;
     socket
         .send_to(&request, peer_addr)
         .await
@@ -3796,17 +3801,14 @@ async fn run_tftp_exchange(
 
 async fn bind_udp_socket_for_peer(
     peer_addr: SocketAddr,
+    interface: Option<&str>,
     local_port: Option<LocalPortRange>,
 ) -> Result<UdpSocket> {
-    let bind_ip = if peer_addr.is_ipv6() {
-        IpAddr::V6(std::net::Ipv6Addr::UNSPECIFIED)
-    } else {
-        IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED)
-    };
+    let bind_ip = bind_ip_for_peer(peer_addr, interface)?;
     let Some(local_port) = local_port.filter(|range| range.start != 0) else {
         return UdpSocket::bind(SocketAddr::new(bind_ip, 0))
             .await
-            .map_err(tcp_io_error);
+            .map_err(|error| bind_udp_error(error, interface));
     };
 
     let mut last_error = None;
@@ -3816,9 +3818,111 @@ async fn bind_udp_socket_for_peer(
             Err(error) => last_error = Some(error),
         }
     }
-    Err(tcp_io_error(last_error.unwrap_or_else(|| {
-        io::Error::new(io::ErrorKind::AddrNotAvailable, "no local port available")
-    })))
+    Err(bind_udp_error(
+        last_error.unwrap_or_else(|| {
+            io::Error::new(io::ErrorKind::AddrNotAvailable, "no local port available")
+        }),
+        interface,
+    ))
+}
+
+enum InterfaceBinding<'a> {
+    Host(&'a str),
+    Interface(&'a str),
+    InterfaceAndHost { iface: &'a str, host: &'a str },
+    DeviceOrHost(&'a str),
+}
+
+fn bind_ip_for_peer(peer_addr: SocketAddr, interface: Option<&str>) -> Result<IpAddr> {
+    let unspecified = if peer_addr.is_ipv6() {
+        IpAddr::V6(std::net::Ipv6Addr::UNSPECIFIED)
+    } else {
+        IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED)
+    };
+    let Some(interface) = interface else {
+        return Ok(unspecified);
+    };
+
+    match parse_interface_binding(interface)? {
+        InterfaceBinding::Host(host) | InterfaceBinding::DeviceOrHost(host) => {
+            resolve_bind_host(host, peer_addr)
+        }
+        InterfaceBinding::Interface(iface) => Err(interface_failed(format!(
+            "Could not bind to interface '{iface}'"
+        ))),
+        InterfaceBinding::InterfaceAndHost { iface, host } => {
+            if !iface.is_empty() {
+                return Err(interface_failed(format!(
+                    "Could not bind to interface '{iface}'"
+                )));
+            }
+            resolve_bind_host(host, peer_addr)
+        }
+    }
+}
+
+fn parse_interface_binding(input: &str) -> Result<InterfaceBinding<'_>> {
+    if input.len() > 512 {
+        return Err(CurlError::BadFunctionArgument(
+            "interface option is too long".to_string(),
+        ));
+    }
+    if let Some(iface) = input.strip_prefix("if!") {
+        if iface.is_empty() {
+            return Err(CurlError::BadFunctionArgument(
+                "interface name is empty".to_string(),
+            ));
+        }
+        return Ok(InterfaceBinding::Interface(iface));
+    }
+    if let Some(host) = input.strip_prefix("host!") {
+        if host.is_empty() {
+            return Err(CurlError::BadFunctionArgument(
+                "interface host is empty".to_string(),
+            ));
+        }
+        return Ok(InterfaceBinding::Host(host));
+    }
+    if let Some(rest) = input.strip_prefix("ifhost!") {
+        let Some((iface, host)) = rest.split_once('!') else {
+            return Err(CurlError::BadFunctionArgument(
+                "interface host is missing".to_string(),
+            ));
+        };
+        if host.is_empty() {
+            return Err(CurlError::BadFunctionArgument(
+                "interface host is empty".to_string(),
+            ));
+        }
+        return Ok(InterfaceBinding::InterfaceAndHost { iface, host });
+    }
+    if input.is_empty() {
+        return Err(CurlError::BadFunctionArgument(
+            "interface is empty".to_string(),
+        ));
+    }
+    Ok(InterfaceBinding::DeviceOrHost(input))
+}
+
+fn resolve_bind_host(host: &str, peer_addr: SocketAddr) -> Result<IpAddr> {
+    (host, 0)
+        .to_socket_addrs()
+        .map_err(|error| interface_failed(format!("Could not bind to '{host}': {error}")))?
+        .find(|addr| addr.is_ipv4() == peer_addr.is_ipv4())
+        .map(|addr| addr.ip())
+        .ok_or_else(|| interface_failed(format!("Could not bind to '{host}'")))
+}
+
+fn bind_udp_error(error: io::Error, interface: Option<&str>) -> CurlError {
+    if let Some(interface) = interface {
+        interface_failed(format!("Could not bind to '{interface}': {error}"))
+    } else {
+        tcp_io_error(error)
+    }
+}
+
+fn interface_failed(message: String) -> CurlError {
+    CurlError::InterfaceFailed(message)
 }
 
 async fn run_tftp_upload(socket: &UdpSocket, body: &[u8], requested_blksize: u16) -> Result<()> {

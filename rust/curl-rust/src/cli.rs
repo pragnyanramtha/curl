@@ -101,6 +101,7 @@ pub struct TransferConfig {
     pub proxy_auth: ProxyAuthMethods,
     pub noproxy: Option<String>,
     pub insecure: bool,
+    pub interface: Option<String>,
     pub local_port: Option<LocalPortRange>,
     pub connect_timeout: Option<Duration>,
     pub max_time: Option<Duration>,
@@ -483,6 +484,7 @@ impl Default for TransferConfig {
             proxy_auth: ProxyAuthMethods::default(),
             noproxy: None,
             insecure: false,
+            interface: None,
             local_port: None,
             connect_timeout: None,
             max_time: None,
@@ -908,6 +910,10 @@ impl Parser {
             "proxy-user" => {
                 let value = self.value_for(name, inline_value)?;
                 self.current().proxy_user = Some(value);
+            }
+            "interface" => {
+                let value = self.value_for(name, inline_value)?;
+                self.current().interface = Some(parse_nonempty_string(name, value)?);
             }
             "local-port" => {
                 let value = self.value_for(name, inline_value)?;
@@ -1635,6 +1641,7 @@ impl TransferConfig {
             || !self.proxy_auth.is_empty()
             || self.noproxy.is_some()
             || self.insecure
+            || self.interface.is_some()
             || self.local_port.is_some()
             || self.connect_timeout.is_some()
             || self.max_time.is_some()
@@ -1717,6 +1724,7 @@ fn option_takes_value(name: &str) -> bool {
             | "connect-to"
             | "proxy"
             | "proxy-user"
+            | "interface"
             | "local-port"
             | "noproxy"
             | "connect-timeout"
@@ -2296,6 +2304,7 @@ fn print_common_help() {
                --proxy-ntlm            Use NTLM proxy authentication\n\
                --proxy-anyauth         Pick any proxy authentication method\n\
                --noproxy <list>        List hosts that do not use proxy\n\
+               --interface <name>      Use network interface\n\
                --local-port <range>    Use a local port number within range\n\
            -k, --insecure              Allow insecure TLS/SSH\n\
            -s, --silent                Silent mode\n\
@@ -3584,6 +3593,24 @@ mod tests {
         assert_eq!(transfer.proxy.as_deref(), Some("http://proxy.example:8080"));
         assert_eq!(transfer.proxy_user.as_deref(), Some("proxy-user:secret"));
         assert_eq!(transfer.noproxy.as_deref(), Some("example.com"));
+    }
+
+    #[test]
+    fn parses_interface_option() {
+        let config = parse_args([
+            "-q",
+            "--interface",
+            "host!127.0.0.1",
+            "tftp://example.com/file",
+        ])
+        .unwrap();
+
+        assert_eq!(
+            config.transfers[0].interface.as_deref(),
+            Some("host!127.0.0.1")
+        );
+
+        assert!(parse_args(["-q", "--interface", "", "tftp://example.com/file"]).is_err());
     }
 
     #[test]

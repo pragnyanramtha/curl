@@ -399,6 +399,9 @@ fn write_request(out: &mut String, render: &RenderTransfer<'_>, url: &str) -> Re
     if let Some(noproxy) = &transfer.noproxy {
         emit_string_setopt(out, "CURLOPT_NOPROXY", noproxy);
     }
+    if let Some(interface) = &transfer.interface {
+        emit_string_setopt(out, "CURLOPT_INTERFACE", interface);
+    }
     if transfer.insecure {
         emit_long_setopt(out, "CURLOPT_SSL_VERIFYPEER", 0);
         emit_long_setopt(out, "CURLOPT_SSL_VERIFYHOST", 0);
@@ -1009,6 +1012,8 @@ mod tests {
             "2",
             "--max-time",
             "3",
+            "--interface",
+            "host!127.0.0.1",
             "--local-port",
             "4000-4002",
             "https://example.com",
@@ -1022,6 +1027,7 @@ mod tests {
         assert!(source.contains("CURLOPT_SSL_VERIFYHOST, 0L"));
         assert!(source.contains("CURLOPT_CONNECTTIMEOUT_MS, 2000L"));
         assert!(source.contains("CURLOPT_TIMEOUT_MS, 3000L"));
+        assert!(source.contains("CURLOPT_INTERFACE, \"host!127.0.0.1\""));
         assert!(source.contains("CURLOPT_LOCALPORT, 4000L"));
         assert!(source.contains("CURLOPT_LOCALPORTRANGE, 3L"));
 
