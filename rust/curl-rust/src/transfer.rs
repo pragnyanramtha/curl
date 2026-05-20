@@ -9738,8 +9738,11 @@ fn write_http_attempt_output(
         (&[][..], false)
     };
     metrics.size_download = body_bytes.len() as u64;
-    metrics.size_delivered =
-        delivered_http_bytes(write_headers, &header_bytes, write_body, body_bytes);
+    metrics.size_delivered = if write_body {
+        body_bytes.len() as u64
+    } else {
+        0
+    };
 
     if write_headers || write_body {
         let mut bytes = Vec::new();
@@ -9761,17 +9764,6 @@ fn write_http_attempt_output(
     }
 
     Ok(max_filesize_exceeded)
-}
-
-fn delivered_http_bytes(
-    write_headers: bool,
-    header_bytes: &[u8],
-    write_body: bool,
-    body_bytes: &[u8],
-) -> u64 {
-    let header_len = if write_headers { header_bytes.len() } else { 0 };
-    let body_len = if write_body { body_bytes.len() } else { 0 };
-    (header_len + body_len) as u64
 }
 
 async fn schedule_retry(
