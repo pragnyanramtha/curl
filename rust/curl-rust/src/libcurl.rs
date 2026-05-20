@@ -62,6 +62,7 @@ struct RenderTransfer<'a> {
     body: Option<PreparedBody>,
     headers: Vec<String>,
     slist: Option<String>,
+    resolve_slist: Option<String>,
     mail_rcpt_slist: Option<String>,
     quote_slist: Option<String>,
     postquote_slist: Option<String>,
@@ -78,6 +79,13 @@ fn prepare_transfers(config: &Config) -> Result<Vec<RenderTransfer<'_>>> {
         let urls = effective_urls(transfer, query.as_ref(), body.as_ref())?;
         let headers = effective_headers(transfer, body.as_ref())?;
         let slist = if headers.is_empty() {
+            None
+        } else {
+            let name = format!("slist{slist_index}");
+            slist_index += 1;
+            Some(name)
+        };
+        let resolve_slist = if transfer.resolve.is_empty() {
             None
         } else {
             let name = format!("slist{slist_index}");
@@ -119,6 +127,7 @@ fn prepare_transfers(config: &Config) -> Result<Vec<RenderTransfer<'_>>> {
             body,
             headers,
             slist,
+            resolve_slist,
             mail_rcpt_slist,
             quote_slist,
             postquote_slist,
@@ -148,6 +157,9 @@ fn write_declarations(out: &mut String, transfers: &[RenderTransfer<'_>]) {
         if let Some(slist) = &transfer.slist {
             writeln!(out, "  struct curl_slist *{slist};").unwrap();
         }
+        if let Some(slist) = &transfer.resolve_slist {
+            writeln!(out, "  struct curl_slist *{slist};").unwrap();
+        }
         if let Some(slist) = &transfer.mail_rcpt_slist {
             writeln!(out, "  struct curl_slist *{slist};").unwrap();
         }
@@ -167,6 +179,11 @@ fn write_declarations(out: &mut String, transfers: &[RenderTransfer<'_>]) {
 fn write_slist_initializers(out: &mut String, transfers: &[RenderTransfer<'_>]) {
     for transfer in transfers {
         write_slist_initializer(out, transfer.slist.as_deref(), &transfer.headers);
+        write_slist_initializer(
+            out,
+            transfer.resolve_slist.as_deref(),
+            &transfer.transfer.resolve,
+        );
         write_slist_initializer(
             out,
             transfer.mail_rcpt_slist.as_deref(),
@@ -248,6 +265,9 @@ fn write_request(out: &mut String, render: &RenderTransfer<'_>, url: &str) -> Re
     }
     if let Some(slist) = &render.mail_rcpt_slist {
         emit_raw_setopt(out, "CURLOPT_MAIL_RCPT", slist);
+    }
+    if let Some(slist) = &render.resolve_slist {
+        emit_raw_setopt(out, "CURLOPT_RESOLVE", slist);
     }
     if transfer.mail_rcpt_allowfails {
         emit_long_setopt(out, "CURLOPT_MAIL_RCPT_ALLOWFAILS", 1);
@@ -436,6 +456,10 @@ fn write_unrepresentable_comment(out: &mut String) {
 fn write_cleanup(out: &mut String, transfers: &[RenderTransfer<'_>]) {
     for transfer in transfers {
         if let Some(slist) = &transfer.slist {
+            writeln!(out, "  curl_slist_free_all({slist});").unwrap();
+            writeln!(out, "  {slist} = NULL;").unwrap();
+        }
+        if let Some(slist) = &transfer.resolve_slist {
             writeln!(out, "  curl_slist_free_all({slist});").unwrap();
             writeln!(out, "  {slist} = NULL;").unwrap();
         }
@@ -731,6 +755,26 @@ mod tests {
         let source = render_source(&config).unwrap();
 
         assert!(source.contains("CURLOPT_POSTREDIR, 5L"));
+    }
+
+    #[test]
+    fn renders_resolve_options() {
+        let config = parse_args([
+            "-q",
+            "--libcurl",
+            "client.c",
+            "--resolve",
+            "example.com:443:127.0.0.1",
+            "https://example.com",
+        ])
+        .unwrap();
+
+        let source = render_source(&config).unwrap();
+
+        assert!(source.contains("struct curl_slist *slist1;"));
+        assert!(source.contains("curl_slist_append(slist1, \"example.com:443:127.0.0.1\");"));
+        assert!(source.contains("CURLOPT_RESOLVE, slist1"));
+        assert!(source.contains("curl_slist_free_all(slist1);"));
     }
 
     #[test]
