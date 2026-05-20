@@ -111,6 +111,7 @@ struct RawHttpDirectContext<'a> {
     resume_from: u64,
     referer: Option<&'a str>,
     sensitive_headers_allowed: bool,
+    custom_host_allowed: bool,
 }
 
 struct ConnectToRule<'a> {
@@ -7808,6 +7809,7 @@ async fn run_http_transfer(
             let (connect_host, connect_port) = raw_http_direct_endpoint(transfer, &url)?;
             let sensitive_headers_allowed =
                 transfer.location_trusted || same_redirect_origin(&initial_url, &url);
+            let custom_host_allowed = same_redirect_origin(&initial_url, &url);
             let attempt = run_raw_http_direct_transfer(RawHttpDirectContext {
                 transfer,
                 url: &url,
@@ -7819,6 +7821,7 @@ async fn run_http_transfer(
                 resume_from,
                 referer: custom_referer.as_deref().or(current_referer.as_deref()),
                 sensitive_headers_allowed,
+                custom_host_allowed,
             })
             .await?;
 
@@ -7918,6 +7921,7 @@ async fn run_http_transfer(
             resume_from,
             referer: custom_referer.as_deref().or(current_referer.as_deref()),
             sensitive_headers_allowed: true,
+            custom_host_allowed: true,
         })
         .await?;
         metrics.url_effective = attempt.final_url.to_string();
@@ -7989,6 +7993,7 @@ async fn run_http_transfer(
             resume_from,
             referer: custom_referer.as_deref().or(current_referer.as_deref()),
             sensitive_headers_allowed: true,
+            custom_host_allowed: true,
         })
         .await?;
         metrics.url_effective = attempt.final_url.to_string();
@@ -8325,7 +8330,7 @@ fn raw_http_direct_request(context: &RawHttpDirectContext<'_>) -> Result<Vec<u8>
     let mut request = Vec::new();
     request
         .extend_from_slice(format!("{} {target} HTTP/1.1\r\n", context.method.as_str()).as_bytes());
-    if !has_header("host") {
+    if !context.custom_host_allowed || !has_header("host") {
         request
             .extend_from_slice(format!("Host: {}\r\n", http_host_header(context.url)).as_bytes());
     }
@@ -8404,6 +8409,9 @@ fn raw_http_direct_request(context: &RawHttpDirectContext<'_>) -> Result<Vec<u8>
         request.extend_from_slice(format!("Content-Length: {}\r\n", body.len()).as_bytes());
     }
     for (name, value) in parsed_headers {
+        if !context.custom_host_allowed && name.as_str().eq_ignore_ascii_case("host") {
+            continue;
+        }
         if !context.sensitive_headers_allowed && is_redirect_sensitive_header(name.as_str()) {
             continue;
         }

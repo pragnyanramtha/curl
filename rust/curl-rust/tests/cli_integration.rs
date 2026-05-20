@@ -2672,6 +2672,43 @@ fn request_target_location_follows_redirect_with_same_target() {
 }
 
 #[test]
+fn request_target_location_regenerates_host_on_cross_origin_redirect() {
+    let (target_url, target_rx) =
+        spawn_server(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok");
+    let target = Url::parse(&target_url).unwrap();
+    let target_host = format!(
+        "{}:{}",
+        target.host_str().unwrap(),
+        target.port_or_known_default().unwrap()
+    );
+    let redirect = format!(
+        "HTTP/1.1 302 Found\r\nLocation: {target_url}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+    )
+    .into_bytes();
+    let (url, first_rx) = spawn_sequence_server_bytes(vec![redirect]);
+
+    let mut command = Command::cargo_bin("curl").unwrap();
+    command.args([
+        "-q",
+        "-sS",
+        "--location-trusted",
+        "--request-target",
+        "/raw",
+        "-H",
+        "Host: first.example",
+        &url,
+    ]);
+    command.assert().success().stdout("ok");
+
+    let first = first_rx.recv().unwrap();
+    let second = target_rx.recv().unwrap();
+    assert_eq!(first.start_line, "GET /raw HTTP/1.1");
+    assert_eq!(second.start_line, "GET /raw HTTP/1.1");
+    assert_eq!(header(&first, "host"), Some("first.example"));
+    assert_eq!(header(&second, "host"), Some(target_host.as_str()));
+}
+
+#[test]
 fn request_target_location_decodes_chunked_redirect_body() {
     let (url, rx) = spawn_request_target_chunked_redirect_server();
 
