@@ -8891,7 +8891,7 @@ async fn run_http_transfer(
 
     loop {
         metrics.method = current_method.as_str().to_string();
-        let request_body = send_request_body
+        let request_body = (send_request_body && !transfer.get)
             .then_some(prepared_body.as_ref())
             .flatten();
         let multipart = if send_request_body {
@@ -9463,14 +9463,17 @@ fn raw_http_direct_request(context: &RawHttpDirectContext<'_>) -> Result<Vec<u8>
     {
         request.extend_from_slice(format!("Range: {}\r\n", range_header_value(&range)).as_bytes());
     }
-    if context.prepared_body.is_some_and(|body| body.is_json) && !has_header("content-type") {
-        request.extend_from_slice(b"Content-Type: application/json\r\n");
-    }
     if let Some(body) = body
         && !body.is_empty()
         && !has_header("content-length")
     {
         request.extend_from_slice(format!("Content-Length: {}\r\n", body.len()).as_bytes());
+    }
+    if body.is_some()
+        && let Some(content_type) = context.prepared_body.map(prepared_body_content_type)
+        && !has_header("content-type")
+    {
+        request.extend_from_slice(format!("Content-Type: {content_type}\r\n").as_bytes());
     }
     for RawHeader {
         name,
@@ -9605,14 +9608,17 @@ fn raw_http_proxy_request(context: &RawHttpProxyContext<'_>) -> Result<Vec<u8>> 
     {
         request.extend_from_slice(format!("Range: {}\r\n", range_header_value(&range)).as_bytes());
     }
-    if context.prepared_body.is_some_and(|body| body.is_json) && !has_header("content-type") {
-        request.extend_from_slice(b"Content-Type: application/json\r\n");
-    }
     if let Some(body) = body
         && !body.is_empty()
         && !has_header("content-length")
     {
         request.extend_from_slice(format!("Content-Length: {}\r\n", body.len()).as_bytes());
+    }
+    if body.is_some()
+        && let Some(content_type) = context.prepared_body.map(prepared_body_content_type)
+        && !has_header("content-type")
+    {
+        request.extend_from_slice(format!("Content-Type: {content_type}\r\n").as_bytes());
     }
     if !has_proxy_header("proxy-connection") {
         request.extend_from_slice(b"Proxy-Connection: Keep-Alive\r\n");
@@ -10624,11 +10630,11 @@ fn apply_headers(
         request = request.header(ACCEPT_ENCODING, "deflate, gzip, br");
     }
 
-    let body_is_json = body.is_some_and(|body| body.is_json);
+    let body_content_type = body.map(prepared_body_content_type);
     if !has_header("accept") {
         request = request.header(
             ACCEPT,
-            if body_is_json {
+            if body.is_some_and(|body| body.is_json) {
                 "application/json"
             } else {
                 "*/*"
@@ -10676,8 +10682,17 @@ fn apply_headers(
         request = request.header(RANGE, range_header_value(&range));
     }
 
-    if body_is_json && !has_header("content-type") {
-        request = request.header(CONTENT_TYPE, "application/json");
+    let generated_content_length = body.map(|body| body.bytes.len());
+    if let Some(content_length) = generated_content_length
+        && !has_content_length
+    {
+        request = request.header(CONTENT_LENGTH, content_length);
+    }
+
+    if let Some(content_type) = body_content_type
+        && !has_header("content-type")
+    {
+        request = request.header(CONTENT_TYPE, content_type);
     }
 
     for (name, value) in parsed_headers {
@@ -10692,8 +10707,16 @@ fn apply_headers(
     Ok(AppliedHttpHeaders {
         request,
         has_authorization,
-        has_content_length,
+        has_content_length: has_content_length || generated_content_length.is_some(),
     })
+}
+
+fn prepared_body_content_type(body: &PreparedBody) -> &'static str {
+    if body.is_json {
+        "application/json"
+    } else {
+        "application/x-www-form-urlencoded"
+    }
 }
 
 fn is_followed_redirect(status: StatusCode) -> bool {

@@ -2700,118 +2700,121 @@ fn find_dot_curlrc(base: &std::path::Path, _dotscore: bool) -> Option<PathBuf> {
 
 fn read_config_tokens(path: &std::path::Path) -> Result<Vec<String>> {
     let text = std::fs::read_to_string(path)?;
-    tokenize_config(&text)
+    tokenize_config_with_source(&text, Some(&path.display().to_string()))
 }
 
 fn tokenize_config(text: &str) -> Result<Vec<String>> {
+    tokenize_config_with_source(text, None)
+}
+
+fn tokenize_config_with_source(text: &str, source: Option<&str>) -> Result<Vec<String>> {
     let mut tokens = Vec::new();
-    for line in text.lines() {
-        let line = strip_config_comment(line).trim();
-        if line.is_empty() {
+    for (lineno, line) in text.lines().enumerate() {
+        let line = line.trim_start();
+        if line.is_empty() || line.starts_with('#') {
             continue;
         }
 
-        if line.starts_with('-') {
-            tokens.extend(shell_words(line, true)?);
+        let dashed_option = line.starts_with('-');
+        let (option, rest) = split_config_option(line, dashed_option);
+        if option.is_empty() {
+            continue;
+        }
+        let option_token = if dashed_option {
+            option.to_string()
+        } else {
+            format!("--{option}")
+        };
+        tokens.push(option_token);
+
+        let rest = rest.trim_start_matches(|ch: char| {
+            ch.is_whitespace() || (!dashed_option && matches!(ch, '=' | ':'))
+        });
+        if rest.is_empty() {
             continue;
         }
 
-        let (key, rest) = split_config_key_value(line);
-        if key.is_empty() {
-            continue;
-        }
-        tokens.push(format!("--{key}"));
-
-        let rest = rest.trim_start_matches(|ch: char| ch.is_whitespace() || ch == '=' || ch == ':');
-        if !rest.is_empty() {
-            tokens.extend(shell_words(rest, false)?);
+        let parameter = parse_config_parameter(rest, source, lineno + 1, option)?;
+        if let Some(parameter) = parameter {
+            tokens.push(parameter);
         }
     }
     Ok(tokens)
 }
 
-fn split_config_key_value(line: &str) -> (&str, &str) {
+fn split_config_option(line: &str, dashed_option: bool) -> (&str, &str) {
     line.char_indices()
-        .find(|(_, ch)| ch.is_whitespace() || *ch == '=' || *ch == ':')
+        .find(|(_, ch)| ch.is_whitespace() || (!dashed_option && matches!(*ch, '=' | ':')))
         .map_or((line, ""), |(index, _)| (&line[..index], &line[index..]))
 }
 
-fn strip_config_comment(line: &str) -> &str {
-    let mut in_single = false;
-    let mut in_double = false;
-    let mut escaped = false;
-
-    for (index, ch) in line.char_indices() {
-        if escaped {
-            escaped = false;
-            continue;
-        }
-        match ch {
-            '\\' if in_double => escaped = true,
-            '\'' if !in_double => in_single = !in_single,
-            '"' if !in_single => in_double = !in_double,
-            '#' if !in_single && !in_double => return &line[..index],
-            _ => {}
-        }
+fn parse_config_parameter(
+    rest: &str,
+    source: Option<&str>,
+    lineno: usize,
+    option: &str,
+) -> Result<Option<String>> {
+    if let Some(quoted) = rest.strip_prefix('"') {
+        return Ok(Some(unslashquote_config_parameter(quoted)));
     }
-    line
+
+    if rest.starts_with('\'') {
+        warn_config_leading_single_quote(source, lineno, option);
+    }
+
+    let end = rest
+        .char_indices()
+        .find(|(_, ch)| ch.is_whitespace())
+        .map_or(rest.len(), |(index, _)| index);
+    let parameter = &rest[..end];
+    if parameter.is_empty() {
+        return Ok(None);
+    }
+
+    let trailing = rest[end..].trim_start();
+    if !trailing.is_empty() && !trailing.starts_with('#') {
+        warn_config_unquoted_whitespace(source, lineno, option);
+    }
+
+    Ok(Some(parameter.to_string()))
 }
 
-fn shell_words(line: &str, split_equals: bool) -> Result<Vec<String>> {
-    let mut words = Vec::new();
-    let mut current = String::new();
-    let mut in_single = false;
-    let mut in_double = false;
-    let mut escaped = false;
-    let mut has_word = false;
-
-    for ch in line.chars() {
-        if escaped {
-            current.push(ch);
-            has_word = true;
-            escaped = false;
-            continue;
-        }
-
+fn unslashquote_config_parameter(line: &str) -> String {
+    let mut value = String::new();
+    let mut chars = line.chars();
+    while let Some(ch) = chars.next() {
         match ch {
-            '\\' if !in_single => escaped = true,
-            '\'' if !in_double => {
-                in_single = !in_single;
-                has_word = true;
-            }
-            '"' if !in_single => {
-                in_double = !in_double;
-                has_word = true;
-            }
-            '=' if split_equals && !in_single && !in_double => {
-                if has_word {
-                    words.push(std::mem::take(&mut current));
-                }
-                words.push("=".to_string());
-                has_word = false;
-            }
-            ch if ch.is_whitespace() && !in_single && !in_double => {
-                if has_word {
-                    words.push(std::mem::take(&mut current));
-                    has_word = false;
-                }
-            }
-            other => {
-                current.push(other);
-                has_word = true;
-            }
+            '"' => break,
+            '\\' => match chars.next() {
+                Some('t') => value.push('\t'),
+                Some('n') => value.push('\n'),
+                Some('r') => value.push('\r'),
+                Some('v') => value.push('\u{000b}'),
+                Some(other) => value.push(other),
+                None => break,
+            },
+            other => value.push(other),
         }
     }
+    value
+}
 
-    if escaped || in_single || in_double {
-        return Err(CurlError::Usage(
-            "unterminated quote or escape in config file".to_string(),
-        ));
+fn warn_config_leading_single_quote(source: Option<&str>, lineno: usize, option: &str) {
+    if let Some(source) = source {
+        eprintln!(
+            "Warning: {source}:{lineno} Option '{option}' uses argument with leading single quote. "
+        );
+        eprintln!("It is probably a mistake. Consider double quotes.");
     }
-    if has_word {
-        words.push(current);
+}
+
+fn warn_config_unquoted_whitespace(source: Option<&str>, lineno: usize, option: &str) {
+    if let Some(source) = source {
+        eprintln!(
+            "Warning: {source}:{lineno} Option '{option}' uses argument with unquoted whitespace. "
+        );
+        eprintln!("Warning: This may cause side-effects. Consider double quotes.");
     }
-    Ok(words)
 }
 
 fn read_at_lines_argument(value: &str) -> Result<Option<Vec<String>>> {
@@ -3661,6 +3664,43 @@ mod tests {
     fn dashed_config_options_do_not_use_colon_separator() {
         let tokens = tokenize_config("--url: https://example.com").unwrap();
         assert_eq!(tokens, ["--url:", "https://example.com"]);
+    }
+
+    #[test]
+    fn dashed_config_options_keep_inline_equals() {
+        let tokens = tokenize_config("--url=https://example.com").unwrap();
+        assert_eq!(tokens, ["--url=https://example.com"]);
+
+        let temp = tempdir().unwrap();
+        let config_file = temp.path().join("curlrc");
+        std::fs::write(&config_file, "--url=https://example.com\n").unwrap();
+
+        let config = parse_args(["-q", "--config", config_file.to_str().unwrap()]).unwrap();
+        assert_eq!(config.transfers[0].urls, ["https://example.com"]);
+    }
+
+    #[test]
+    fn config_unquoted_arguments_stop_at_whitespace() {
+        let tokens =
+            tokenize_config("data = arg with space\nurl = https://example.com/#fragment\n")
+                .unwrap();
+
+        assert_eq!(
+            tokens,
+            ["--data", "arg", "--url", "https://example.com/#fragment"]
+        );
+    }
+
+    #[test]
+    fn config_single_quotes_are_literal_argument_bytes() {
+        let tokens = tokenize_config("data = 'arg-with-quote'\n").unwrap();
+        assert_eq!(tokens, ["--data", "'arg-with-quote'"]);
+    }
+
+    #[test]
+    fn config_double_quotes_use_c_curl_escapes() {
+        let tokens = tokenize_config("data = \"a\\tb\\n\\\\q\"\n").unwrap();
+        assert_eq!(tokens, ["--data", "a\tb\n\\q"]);
     }
 
     #[test]

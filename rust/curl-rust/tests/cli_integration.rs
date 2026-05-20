@@ -3236,6 +3236,62 @@ fn default_config_continues_from_empty_curl_home_to_xdg_config_home() {
 }
 
 #[test]
+fn config_unquoted_whitespace_warns_and_uses_first_word_for_data() {
+    let temp = tempdir().unwrap();
+    let config_file = temp.path().join("config");
+    std::fs::write(&config_file, "data = arg with space\n").unwrap();
+    let (url, rx) = spawn_server(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok");
+
+    let mut command = Command::cargo_bin("curl").unwrap();
+    command.args([
+        "-q",
+        &url,
+        "--config",
+        config_file.to_str().unwrap(),
+        "--silent",
+    ]);
+    command.assert().success().stdout("ok").stderr(format!(
+        "Warning: {}:1 Option 'data' uses argument with unquoted whitespace. \nWarning: This may cause side-effects. Consider double quotes.\n",
+        config_file.display()
+    ));
+
+    let request = rx.recv().unwrap();
+    assert_eq!(
+        header(&request, "content-type"),
+        Some("application/x-www-form-urlencoded")
+    );
+    assert_eq!(request.body, b"arg");
+}
+
+#[test]
+fn config_single_quotes_are_literal_and_warn() {
+    let temp = tempdir().unwrap();
+    let config_file = temp.path().join("config");
+    std::fs::write(&config_file, "data = 'arg-with-quote'\n").unwrap();
+    let (url, rx) = spawn_server(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok");
+
+    let mut command = Command::cargo_bin("curl").unwrap();
+    command.args([
+        "-q",
+        &url,
+        "--config",
+        config_file.to_str().unwrap(),
+        "--silent",
+    ]);
+    command.assert().success().stdout("ok").stderr(format!(
+        "Warning: {}:1 Option 'data' uses argument with leading single quote. \nIt is probably a mistake. Consider double quotes.\n",
+        config_file.display()
+    ));
+
+    let request = rx.recv().unwrap();
+    assert_eq!(
+        header(&request, "content-type"),
+        Some("application/x-www-form-urlencoded")
+    );
+    assert_eq!(request.body, b"'arg-with-quote'");
+}
+
+#[test]
 fn default_config_prefers_curl_home_over_xdg_config_home() {
     let temp = tempdir().unwrap();
     let curl_home = temp.path().join("curl-home");
