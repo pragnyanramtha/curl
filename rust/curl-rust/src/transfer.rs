@@ -7880,6 +7880,9 @@ async fn run_http_transfer(
     let mut current_method = method;
     let mut send_request_body = true;
     let manual_redirects = manual_http_redirects(transfer);
+    let custom_method = transfer.method.is_some();
+    let post_redirect_body =
+        !transfer.get && (!transfer.data.is_empty() || !transfer.forms.is_empty());
 
     loop {
         metrics.method = current_method.as_str().to_string();
@@ -7968,8 +7971,17 @@ async fn run_http_transfer(
             if transfer.auto_referer && custom_referer.is_none() {
                 current_referer = Some(auto_referer_value(&final_url));
             }
-            if let Some(next_method) = redirect_followup_method(transfer, status, &current_method) {
+            let followup = redirect_followup(
+                transfer,
+                status,
+                &current_method,
+                custom_method,
+                post_redirect_body,
+            );
+            if let Some(next_method) = followup.method {
                 current_method = next_method;
+            }
+            if followup.drop_body {
                 send_request_body = false;
             }
             url = next_url;
@@ -9059,37 +9071,57 @@ fn apply_headers(
 }
 
 fn is_followed_redirect(status: StatusCode) -> bool {
-    matches!(
-        status,
-        StatusCode::MOVED_PERMANENTLY
-            | StatusCode::FOUND
-            | StatusCode::SEE_OTHER
-            | StatusCode::TEMPORARY_REDIRECT
-            | StatusCode::PERMANENT_REDIRECT
-    )
+    status.is_redirection()
 }
 
 fn manual_http_redirects(transfer: &TransferConfig) -> bool {
     transfer.auto_referer || transfer.post301 || transfer.post302 || transfer.post303
 }
 
-fn redirect_followup_method(
+struct RedirectFollowup {
+    method: Option<Method>,
+    drop_body: bool,
+}
+
+fn redirect_followup(
     transfer: &TransferConfig,
     status: StatusCode,
     method: &Method,
-) -> Option<Method> {
+    custom_method: bool,
+    post_redirect_body: bool,
+) -> RedirectFollowup {
     if *method == Method::HEAD {
-        return None;
+        return RedirectFollowup::keep();
     }
 
     match status {
-        StatusCode::MOVED_PERMANENTLY if *method == Method::POST && !transfer.post301 => {
-            Some(Method::GET)
+        StatusCode::MOVED_PERMANENTLY if post_redirect_body && !transfer.post301 => {
+            RedirectFollowup::drop_post_body(custom_method)
         }
-        StatusCode::FOUND if *method == Method::POST && !transfer.post302 => Some(Method::GET),
-        StatusCode::SEE_OTHER if *method == Method::POST && transfer.post303 => None,
-        StatusCode::SEE_OTHER if *method != Method::GET => Some(Method::GET),
-        _ => None,
+        StatusCode::FOUND if post_redirect_body && !transfer.post302 => {
+            RedirectFollowup::drop_post_body(custom_method)
+        }
+        StatusCode::SEE_OTHER if post_redirect_body && transfer.post303 => RedirectFollowup::keep(),
+        StatusCode::SEE_OTHER if *method != Method::GET || post_redirect_body => {
+            RedirectFollowup::drop_post_body(custom_method)
+        }
+        _ => RedirectFollowup::keep(),
+    }
+}
+
+impl RedirectFollowup {
+    fn keep() -> Self {
+        Self {
+            method: None,
+            drop_body: false,
+        }
+    }
+
+    fn drop_post_body(custom_method: bool) -> Self {
+        Self {
+            method: (!custom_method).then_some(Method::GET),
+            drop_body: true,
+        }
     }
 }
 

@@ -9641,6 +9641,67 @@ fn post303_preserves_post_on_redirect() {
 }
 
 #[test]
+fn post301_follows_300_redirect_and_replays_post_body() {
+    let (url, rx) = spawn_sequence_server(vec![
+        b"HTTP/1.1 300 Multiple Choices\r\nLocation: /next\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+        b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok",
+    ]);
+
+    let mut command = Command::cargo_bin("curl").unwrap();
+    command.args([
+        "-q",
+        "-sS",
+        "-L",
+        "--post301",
+        "-d",
+        "body",
+        "-w",
+        " %{method}",
+        &url,
+    ]);
+    command.assert().success().stdout("ok POST");
+
+    let first = rx.recv().unwrap();
+    let second = rx.recv().unwrap();
+    assert!(first.start_line.starts_with("POST /resource HTTP/1.1"));
+    assert_eq!(first.body, b"body");
+    assert!(second.start_line.starts_with("POST /next HTTP/1.1"));
+    assert_eq!(second.body, b"body");
+}
+
+#[test]
+fn custom_method_post_redirect_drops_body_when_post_flag_does_not_apply() {
+    let (url, rx) = spawn_sequence_server(vec![
+        b"HTTP/1.1 301 Moved Permanently\r\nLocation: /next\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+        b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok",
+    ]);
+
+    let mut command = Command::cargo_bin("curl").unwrap();
+    command.args([
+        "-q",
+        "-sS",
+        "-L",
+        "--post302",
+        "-X",
+        "PUT",
+        "-d",
+        "body",
+        "-w",
+        " %{method}",
+        &url,
+    ]);
+    command.assert().success().stdout("ok PUT");
+
+    let first = rx.recv().unwrap();
+    let second = rx.recv().unwrap();
+    assert!(first.start_line.starts_with("PUT /resource HTTP/1.1"));
+    assert_eq!(first.body, b"body");
+    assert!(second.start_line.starts_with("PUT /next HTTP/1.1"));
+    assert_eq!(second.body, b"");
+    assert_eq!(header(&second, "content-length"), None);
+}
+
+#[test]
 fn auto_referer_respects_max_redirs_limit() {
     let (url, rx) = spawn_sequence_server(vec![
         b"HTTP/1.1 302 Found\r\nLocation: /next\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
