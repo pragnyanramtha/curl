@@ -31,6 +31,20 @@ const TEST_SMB_COM_SETUP_ANDX: u8 = 0x73;
 const TEST_SMB_COM_TREE_CONNECT_ANDX: u8 = 0x75;
 const TEST_SMB_COM_NT_CREATE_ANDX: u8 = 0xa2;
 const TEST_SMB_ERR_NOACCESS: u32 = 0x0005_0001;
+const COMPRESSED_BODY: &[u8] = b"hello compressed\n";
+const GZIP_COMPRESSED_BODY: &[u8] = &[
+    0x1f, 0x8b, 0x08, 0x00, 0x00, 0x00, 0x00, 0x00, 0x02, 0xff, 0xcb, 0x48, 0xcd, 0xc9, 0xc9, 0x57,
+    0x48, 0xce, 0xcf, 0x2d, 0x28, 0x4a, 0x2d, 0x2e, 0x4e, 0x4d, 0xe1, 0x02, 0x00, 0x7b, 0x43, 0x9b,
+    0x2c, 0x11, 0x00, 0x00, 0x00,
+];
+const DEFLATE_COMPRESSED_BODY: &[u8] = &[
+    0x78, 0x9c, 0xcb, 0x48, 0xcd, 0xc9, 0xc9, 0x57, 0x48, 0xce, 0xcf, 0x2d, 0x28, 0x4a, 0x2d, 0x2e,
+    0x4e, 0x4d, 0xe1, 0x02, 0x00, 0x3c, 0x1c, 0x06, 0x74,
+];
+const BROTLI_COMPRESSED_BODY: &[u8] = &[
+    0x0f, 0x08, 0x80, 0x68, 0x65, 0x6c, 0x6c, 0x6f, 0x20, 0x63, 0x6f, 0x6d, 0x70, 0x72, 0x65, 0x73,
+    0x73, 0x65, 0x64, 0x0a, 0x03,
+];
 const TELNET_NEGOTIATION_GREETING: &[u8] = &[
     TELNET_IAC,
     TELNET_DO,
@@ -273,6 +287,10 @@ fn spawn_server(response: &'static [u8]) -> (String, Receiver<RequestRecord>) {
     spawn_sequence_server(vec![response])
 }
 
+fn spawn_server_bytes(response: Vec<u8>) -> (String, Receiver<RequestRecord>) {
+    spawn_sequence_server_bytes(vec![response])
+}
+
 fn gateway_origin(url: &str) -> String {
     let url = Url::parse(url).unwrap();
     let host = url.host_str().unwrap();
@@ -330,6 +348,10 @@ fn set_private_file_mode(path: &Path) {
 fn set_private_file_mode(_path: &Path) {}
 
 fn spawn_sequence_server(responses: Vec<&'static [u8]>) -> (String, Receiver<RequestRecord>) {
+    spawn_sequence_server_bytes(responses.into_iter().map(Vec::from).collect())
+}
+
+fn spawn_sequence_server_bytes(responses: Vec<Vec<u8>>) -> (String, Receiver<RequestRecord>) {
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let addr = listener.local_addr().unwrap();
     let (tx, rx) = mpsc::channel();
@@ -338,7 +360,7 @@ fn spawn_sequence_server(responses: Vec<&'static [u8]>) -> (String, Receiver<Req
         for response in responses {
             let (mut stream, _) = listener.accept().unwrap();
             tx.send(read_request(&mut stream)).unwrap();
-            stream.write_all(response).unwrap();
+            stream.write_all(&response).unwrap();
         }
     });
 
@@ -1953,6 +1975,16 @@ fn expected_dict_request(command: &[u8]) -> Vec<u8> {
     request
 }
 
+fn compressed_response(encoding: &str, body: &[u8]) -> Vec<u8> {
+    let mut response = format!(
+        "HTTP/1.1 200 OK\r\nContent-Encoding: {encoding}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+        body.len()
+    )
+    .into_bytes();
+    response.extend_from_slice(body);
+    response
+}
+
 #[test]
 fn downloads_http_and_renders_writeout() {
     let (url, rx) = spawn_server(
@@ -1967,6 +1999,84 @@ fn downloads_http_and_renders_writeout() {
     assert!(request.start_line.starts_with("GET /resource HTTP/1.1"));
     assert!(header(&request, "user-agent").unwrap().starts_with("curl/"));
     assert_eq!(header(&request, "accept"), Some("*/*"));
+    assert_eq!(header(&request, "accept-encoding"), None);
+}
+
+#[test]
+fn compressed_decodes_supported_response_bodies() {
+    for (encoding, compressed_body) in [
+        ("gzip", GZIP_COMPRESSED_BODY),
+        ("deflate", DEFLATE_COMPRESSED_BODY),
+        ("br", BROTLI_COMPRESSED_BODY),
+    ] {
+        let (url, rx) = spawn_server_bytes(compressed_response(encoding, compressed_body));
+
+        let output = Command::cargo_bin("curl")
+            .unwrap()
+            .args(["-q", "-sS", "--compressed", &url])
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{encoding}: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert_eq!(output.stdout, COMPRESSED_BODY, "{encoding}");
+
+        let request = rx.recv().unwrap();
+        assert_eq!(
+            header(&request, "accept-encoding"),
+            Some("deflate, gzip, br"),
+            "{encoding}"
+        );
+    }
+}
+
+#[test]
+fn compressed_custom_accept_encoding_still_decodes_response_body() {
+    let (url, rx) = spawn_server_bytes(compressed_response("gzip", GZIP_COMPRESSED_BODY));
+
+    let output = Command::cargo_bin("curl")
+        .unwrap()
+        .args([
+            "-q",
+            "-sS",
+            "--compressed",
+            "-H",
+            "Accept-Encoding: identity",
+            &url,
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(output.stdout, COMPRESSED_BODY);
+
+    let request = rx.recv().unwrap();
+    assert_eq!(header(&request, "accept-encoding"), Some("identity"));
+    assert_eq!(header_count(&request, "accept-encoding"), 1);
+}
+
+#[test]
+fn http_does_not_decode_content_encoding_without_compressed() {
+    let (url, rx) = spawn_server_bytes(compressed_response("gzip", GZIP_COMPRESSED_BODY));
+
+    let output = Command::cargo_bin("curl")
+        .unwrap()
+        .args(["-q", "-sS", &url])
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(output.stdout, GZIP_COMPRESSED_BODY);
+
+    let request = rx.recv().unwrap();
     assert_eq!(header(&request, "accept-encoding"), None);
 }
 
