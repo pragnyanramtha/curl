@@ -17,6 +17,8 @@ const COOKIE_FILE_HEADER: &str = "# Netscape HTTP Cookie File\n\
 pub struct CookieJar {
     cookies: RwLock<Vec<StoredCookie>>,
     explicit_cookie: RwLock<Option<String>>,
+    explicit_cookie_origins: RwLock<Vec<CookieOrigin>>,
+    explicit_cookie_unrestricted: RwLock<bool>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -31,6 +33,13 @@ struct StoredCookie {
     http_only: bool,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct CookieOrigin {
+    scheme: String,
+    host: String,
+    port: Option<u16>,
+}
+
 enum CookieUpdate {
     Set(StoredCookie),
     Delete {
@@ -43,6 +52,26 @@ enum CookieUpdate {
 impl CookieJar {
     pub fn set_explicit_cookie(&self, value: Option<&str>) {
         *self.explicit_cookie.write().expect("cookie jar lock") = value.map(ToString::to_string);
+    }
+
+    pub fn allow_explicit_cookie_for_url(&self, url: &Url, unrestricted: bool) {
+        if unrestricted {
+            *self
+                .explicit_cookie_unrestricted
+                .write()
+                .expect("cookie jar lock") = true;
+            return;
+        }
+        let Some(origin) = CookieOrigin::from_url(url) else {
+            return;
+        };
+        let mut origins = self
+            .explicit_cookie_origins
+            .write()
+            .expect("cookie jar lock");
+        if !origins.contains(&origin) {
+            origins.push(origin);
+        }
     }
 
     pub fn load_from_inputs(&self, inputs: &[String], skip_session_cookies: bool) -> Result<()> {
@@ -304,7 +333,7 @@ impl CookieStore for CookieJar {
             .read()
             .expect("cookie jar lock")
             .as_deref()
-            .filter(|explicit| !explicit.is_empty())
+            .filter(|explicit| !explicit.is_empty() && self.explicit_cookie_allowed(url))
         {
             if !header.is_empty() {
                 header.push_str("; ");
@@ -316,6 +345,35 @@ impl CookieStore for CookieJar {
         } else {
             HeaderValue::from_str(&header).ok()
         }
+    }
+}
+
+impl CookieJar {
+    fn explicit_cookie_allowed(&self, url: &Url) -> bool {
+        if *self
+            .explicit_cookie_unrestricted
+            .read()
+            .expect("cookie jar lock")
+        {
+            return true;
+        }
+        let Some(origin) = CookieOrigin::from_url(url) else {
+            return false;
+        };
+        self.explicit_cookie_origins
+            .read()
+            .expect("cookie jar lock")
+            .contains(&origin)
+    }
+}
+
+impl CookieOrigin {
+    fn from_url(url: &Url) -> Option<Self> {
+        Some(Self {
+            scheme: url.scheme().to_ascii_lowercase(),
+            host: url.host_str()?.to_ascii_lowercase(),
+            port: url.port_or_known_default(),
+        })
     }
 }
 
@@ -604,15 +662,43 @@ mod tests {
     #[test]
     fn appends_explicit_cookie_after_engine_cookies() {
         let jar = CookieJar::default();
+        let url = Url::parse("http://example.com/").unwrap();
         jar.load_from_text("example.com\tFALSE\t/\tFALSE\t0\tsid\tabc\n", false);
         jar.set_explicit_cookie(Some("tool=curl"));
+        jar.allow_explicit_cookie_for_url(&url, false);
 
         assert_eq!(
-            jar.cookies(&Url::parse("http://example.com/").unwrap())
+            jar.cookies(&url).unwrap().to_str().unwrap(),
+            "sid=abc; tool=curl"
+        );
+    }
+
+    #[test]
+    fn explicit_cookie_is_scoped_to_allowed_origin() {
+        let jar = CookieJar::default();
+        let url = Url::parse("http://example.com:80/").unwrap();
+        jar.set_explicit_cookie(Some("tool=curl"));
+        jar.allow_explicit_cookie_for_url(&url, false);
+
+        assert_eq!(jar.cookies(&url).unwrap().to_str().unwrap(), "tool=curl");
+        assert!(
+            jar.cookies(&Url::parse("http://example.com:81/").unwrap())
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn explicit_cookie_unrestricted_allows_other_origins() {
+        let jar = CookieJar::default();
+        jar.set_explicit_cookie(Some("tool=curl"));
+        jar.allow_explicit_cookie_for_url(&Url::parse("http://example.com/").unwrap(), true);
+
+        assert_eq!(
+            jar.cookies(&Url::parse("http://other.example/").unwrap())
                 .unwrap()
                 .to_str()
                 .unwrap(),
-            "sid=abc; tool=curl"
+            "tool=curl"
         );
     }
 }

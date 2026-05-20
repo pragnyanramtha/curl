@@ -161,7 +161,7 @@ pub async fn run(config: Config) -> Result<i32> {
         let expanded_urls = expand_urls(transfer)?;
 
         for expanded in expanded_urls {
-            let code = run_expanded_url(transfer, &client, expanded).await?;
+            let code = run_expanded_url(transfer, &client, cookie_jar.as_ref(), expanded).await?;
             if code != 0 {
                 final_code = code;
             }
@@ -179,6 +179,7 @@ struct ParallelJob {
     index: usize,
     transfer: TransferConfig,
     client: Client,
+    cookie_jar: Option<Arc<CookieJar>>,
     expanded: glob::ExpandedUrl,
 }
 
@@ -248,6 +249,7 @@ fn parallel_jobs(config: &Config) -> Result<(Vec<ParallelJob>, Vec<CookieSave>)>
                 index: jobs.len(),
                 transfer: transfer.clone(),
                 client: client.clone(),
+                cookie_jar: cookie_jar.clone(),
                 expanded,
             });
         }
@@ -273,7 +275,13 @@ fn cookie_engine_active(transfer: &TransferConfig) -> bool {
 
 fn spawn_parallel_job(active: &mut JoinSet<Result<(usize, i32)>>, job: ParallelJob) {
     active.spawn(async move {
-        let code = run_expanded_url(&job.transfer, &job.client, job.expanded).await?;
+        let code = run_expanded_url(
+            &job.transfer,
+            &job.client,
+            job.cookie_jar.as_ref(),
+            job.expanded,
+        )
+        .await?;
         Ok((job.index, code))
     });
 }
@@ -536,6 +544,7 @@ fn reject_url_userinfo(raw_url: &str) -> Result<()> {
 async fn run_expanded_url(
     transfer: &TransferConfig,
     client: &Client,
+    cookie_jar: Option<&Arc<CookieJar>>,
     expanded: glob::ExpandedUrl,
 ) -> Result<i32> {
     let mut method_label = effective_method_label(transfer);
@@ -577,6 +586,13 @@ async fn run_expanded_url(
     } else {
         transfer
     };
+
+    if let Some(cookie_jar) = cookie_jar
+        && transfer.cookie.is_some()
+        && let Ok(url) = Url::parse(&expanded.url)
+    {
+        cookie_jar.allow_explicit_cookie_for_url(&url, transfer.location_trusted);
+    }
 
     let userinfo_check = if transfer.disallow_username_in_url {
         reject_url_userinfo(&expanded.url)

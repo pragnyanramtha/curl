@@ -9642,6 +9642,58 @@ fn redirect_strips_literal_cookie_on_cross_origin_by_default() {
 }
 
 #[test]
+fn cookie_engine_strips_literal_cookie_on_cross_origin_redirect_by_default() {
+    let (url, first_rx, second_rx) =
+        spawn_cross_origin_redirect(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok");
+    let temp = tempdir().unwrap();
+    let jar = temp.path().join("cookies.txt");
+
+    let mut command = Command::cargo_bin("curl").unwrap();
+    command.args([
+        "-q",
+        "-sS",
+        "-L",
+        "-c",
+        jar.to_str().unwrap(),
+        "-b",
+        "sid=abc",
+        &url,
+    ]);
+    command.assert().success().stdout("ok");
+
+    let first = first_rx.recv().unwrap();
+    let second = second_rx.recv().unwrap();
+    assert_eq!(header(&first, "cookie"), Some("sid=abc"));
+    assert_eq!(header(&second, "cookie"), None);
+}
+
+#[test]
+fn location_trusted_keeps_cookie_engine_literal_cookie_on_cross_origin_redirect() {
+    let (url, first_rx, second_rx) =
+        spawn_cross_origin_redirect(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok");
+    let temp = tempdir().unwrap();
+    let jar = temp.path().join("cookies.txt");
+
+    let mut command = Command::cargo_bin("curl").unwrap();
+    command.args([
+        "-q",
+        "-sS",
+        "--location-trusted",
+        "-c",
+        jar.to_str().unwrap(),
+        "-b",
+        "sid=abc",
+        &url,
+    ]);
+    command.assert().success().stdout("ok");
+
+    let first = first_rx.recv().unwrap();
+    let second = second_rx.recv().unwrap();
+    assert_eq!(header(&first, "cookie"), Some("sid=abc"));
+    assert_eq!(header(&second, "cookie"), Some("sid=abc"));
+}
+
+#[test]
 fn fixed_referer_is_reused_across_redirects_without_auto() {
     let (url, rx) = spawn_sequence_server(vec![
         b"HTTP/1.1 302 Found\r\nLocation: /next\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
