@@ -1902,6 +1902,37 @@ fn spawn_tftp_upload_server(
     (format!("tftp://{addr}/upload.bin"), rx)
 }
 
+fn spawn_delayed_tftp_upload_ack_server(delay: Duration) -> (String, Receiver<TftpUploadRecord>) {
+    let socket = UdpSocket::bind("127.0.0.1:0").unwrap();
+    let addr = socket.local_addr().unwrap();
+    let (tx, rx) = mpsc::channel();
+
+    thread::spawn(move || {
+        let mut buffer = vec![0; 70_000];
+        let (read, peer) = socket.recv_from(&mut buffer).unwrap();
+        let request = buffer[..read].to_vec();
+        socket.send_to(&tftp_ack(0), peer).unwrap();
+
+        let (read, data_peer) = socket.recv_from(&mut buffer).unwrap();
+        assert_eq!(data_peer, peer);
+        assert!(read >= 4);
+        assert_eq!(&buffer[..2], &3_u16.to_be_bytes());
+        let block = u16::from_be_bytes([buffer[2], buffer[3]]);
+        let data = buffer[4..read].to_vec();
+
+        tx.send(TftpUploadRecord {
+            request,
+            data_blocks: vec![(block, data)],
+        })
+        .unwrap();
+
+        thread::sleep(delay);
+        let _ = socket.send_to(&tftp_ack(block), peer);
+    });
+
+    (format!("tftp://{addr}/upload.bin"), rx)
+}
+
 fn spawn_tftp_upload_error_server(code: u16) -> (String, Receiver<Vec<u8>>) {
     let socket = UdpSocket::bind("127.0.0.1:0").unwrap();
     let addr = socket.local_addr().unwrap();
@@ -6298,6 +6329,36 @@ fn tftp_upload_file_sends_wrq_and_data() {
 
     let record = rx.recv().unwrap();
     let mut expected = b"\x00\x02/payload.bin\x00octet\x00tsize\x00".to_vec();
+    expected.extend_from_slice(body.len().to_string().as_bytes());
+    expected.extend_from_slice(b"\x00blksize\x00512\x00timeout\x005\x00");
+    assert_eq!(record.request, expected);
+    assert_eq!(record.data_blocks, [(1, body.to_vec())]);
+}
+
+#[test]
+fn tftp_upload_low_speed_timeout_returns_28() {
+    let (url, rx) = spawn_delayed_tftp_upload_ack_server(Duration::from_millis(1200));
+    let temp = tempdir().unwrap();
+    let upload = temp.path().join("slow.bin");
+    let body = b"slow upload";
+    std::fs::write(&upload, body).unwrap();
+
+    let mut command = Command::cargo_bin("curl").unwrap();
+    command.args([
+        "-q",
+        "-sS",
+        "-Y1000",
+        "-y1",
+        "-T",
+        upload.to_str().unwrap(),
+        &url,
+    ]);
+    command.assert().failure().code(28).stdout("").stderr(
+        "curl: (28) Operation too slow. Less than 1000 bytes/sec transferred the last 1 seconds\n",
+    );
+
+    let record = rx.recv().unwrap();
+    let mut expected = b"\x00\x02upload.bin\x00octet\x00tsize\x00".to_vec();
     expected.extend_from_slice(body.len().to_string().as_bytes());
     expected.extend_from_slice(b"\x00blksize\x00512\x00timeout\x005\x00");
     assert_eq!(record.request, expected);

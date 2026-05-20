@@ -3712,7 +3712,8 @@ async fn run_tftp_exchange(
         .map_err(tcp_io_error)?;
 
     if let Some(upload) = upload {
-        run_tftp_upload(&socket, &upload, initial_blksize).await?;
+        let low_speed = LowSpeedDeadline::new(transfer);
+        run_tftp_upload(&socket, &upload, initial_blksize, low_speed.as_ref()).await?;
         metrics.url_effective = url.to_string();
         metrics.size_download = 0;
         if let Some(path) = &transfer.dump_header {
@@ -3945,8 +3946,8 @@ impl LowSpeedDeadline {
         })
     }
 
-    fn remaining_for_downloaded(&self, downloaded: usize) -> Option<Duration> {
-        let tolerated = Duration::from_secs_f64(downloaded as f64 / self.limit as f64);
+    fn remaining_for_transferred(&self, transferred: usize) -> Option<Duration> {
+        let tolerated = Duration::from_secs_f64(transferred as f64 / self.limit as f64);
         let deadline = self.started + tolerated + self.duration;
         deadline.checked_duration_since(Instant::now())
     }
@@ -3963,11 +3964,11 @@ async fn recv_tftp_packet(
     socket: &UdpSocket,
     packet: &mut [u8],
     low_speed: Option<&LowSpeedDeadline>,
-    downloaded: usize,
+    transferred: usize,
 ) -> Result<(usize, SocketAddr)> {
     let receive = socket.recv_from(packet);
     if let Some(low_speed) = low_speed {
-        let Some(deadline) = low_speed.remaining_for_downloaded(downloaded) else {
+        let Some(deadline) = low_speed.remaining_for_transferred(transferred) else {
             return Err(low_speed.error());
         };
         tokio::time::timeout(deadline, receive)
@@ -3980,18 +3981,24 @@ async fn recv_tftp_packet(
     }
 }
 
-async fn run_tftp_upload(socket: &UdpSocket, body: &[u8], requested_blksize: u16) -> Result<()> {
+async fn run_tftp_upload(
+    socket: &UdpSocket,
+    body: &[u8],
+    requested_blksize: u16,
+    low_speed: Option<&LowSpeedDeadline>,
+) -> Result<()> {
     let mut block_size = usize::from(requested_blksize);
     let mut peer = None;
     let mut packet = vec![0; TFTP_MAX_PACKET_SIZE];
     let mut offset = 0_usize;
+    let mut uploaded = 0_usize;
     let mut next_block = 1_u16;
     let mut last_packet = Vec::new();
     let mut last_sent_block: Option<u16> = None;
     let mut last_sent_len = 0_usize;
 
     loop {
-        let (read, addr) = socket.recv_from(&mut packet).await.map_err(tcp_io_error)?;
+        let (read, addr) = recv_tftp_packet(socket, &mut packet, low_speed, uploaded).await?;
         if let Some(peer) = peer {
             if addr != peer {
                 let error = tftp_error_packet(5, b"Unknown transfer ID");
@@ -4030,6 +4037,7 @@ async fn run_tftp_upload(socket: &UdpSocket, body: &[u8], requested_blksize: u16
                     .send_to(&data_packet, addr)
                     .await
                     .map_err(tcp_io_error)?;
+                uploaded = offset;
                 last_packet = data_packet;
                 last_sent_block = Some(block);
                 last_sent_len = data_len;
@@ -4046,6 +4054,7 @@ async fn run_tftp_upload(socket: &UdpSocket, body: &[u8], requested_blksize: u16
                     .send_to(&data_packet, addr)
                     .await
                     .map_err(tcp_io_error)?;
+                uploaded = offset;
                 last_packet = data_packet;
                 last_sent_block = Some(block);
                 last_sent_len = data_len;
