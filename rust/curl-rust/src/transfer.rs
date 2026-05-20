@@ -163,6 +163,50 @@ struct HttpAttempt {
     deferred_error: Option<CurlError>,
 }
 
+#[derive(Default)]
+struct HttpRetryOutputState {
+    preserved_file_bytes: u64,
+}
+
+struct HttpAttemptWrite {
+    max_filesize_exceeded: bool,
+    body_bytes: u64,
+    output_bytes: u64,
+    output_path: Option<PathBuf>,
+}
+
+impl HttpRetryOutputState {
+    fn should_append(&self) -> bool {
+        self.preserved_file_bytes > 0
+    }
+
+    fn record_retry_write(&mut self, write: HttpAttemptWrite, start: u64) -> Result<()> {
+        let Some(path) = write.output_path else {
+            return Ok(());
+        };
+        if write.output_bytes == 0 {
+            return Ok(());
+        }
+
+        let metadata = std::fs::metadata(&path)?;
+        if !metadata.is_file() {
+            self.preserved_file_bytes = 0;
+            return Ok(());
+        }
+
+        if write.body_bytes > 0 {
+            std::fs::OpenOptions::new()
+                .write(true)
+                .open(&path)?
+                .set_len(start)?;
+            self.preserved_file_bytes = start;
+        } else {
+            self.preserved_file_bytes = metadata.len();
+        }
+        Ok(())
+    }
+}
+
 struct AppliedHttpHeaders {
     request: reqwest::RequestBuilder,
     has_authorization: bool,
@@ -8877,6 +8921,7 @@ async fn run_http_transfer(
             || transfer.tr_encoding
             || raw_custom_header_wire_semantics
             || raw_http_output_slot_wire_semantics(transfer)
+            || raw_http_retry_wire_semantics(transfer, &method)
             || raw_http_default_get_version_wire_semantics(transfer, &method)
             || method == Method::HEAD
             || (method != Method::HEAD && max_filesize_limit(transfer).is_some()))
@@ -9132,6 +9177,16 @@ fn raw_http_direct_supported(transfer: &TransferConfig, url: &Url, has_multipart
 
 fn raw_http_output_slot_wire_semantics(transfer: &TransferConfig) -> bool {
     !transfer.output_slots.is_empty()
+        && !transfer.verbose
+        && transfer.resolve.is_empty()
+        && transfer.proxy.is_none()
+        && transfer.http_version == HttpVersionPreference::Any
+}
+
+fn raw_http_retry_wire_semantics(transfer: &TransferConfig, method: &Method) -> bool {
+    transfer.retry > 0
+        && *method == Method::GET
+        && (transfer.include_headers || transfer.fail_with_body)
         && !transfer.verbose
         && transfer.resolve.is_empty()
         && transfer.proxy.is_none()
@@ -10335,6 +10390,7 @@ async fn run_http_with_retries(
     retry_started: Instant,
     session: &mut TransferSession,
 ) -> Result<()> {
+    let mut retry_output = HttpRetryOutputState::default();
     loop {
         reset_attempt_metrics(metrics);
 
@@ -10354,20 +10410,20 @@ async fn run_http_with_retries(
                     && retry_delay_for_next(transfer, metrics, retry_started, attempt.retry_after)
                         .is_some()
                 {
-                    if transfer.fail_with_body && attempt.status.is_some_and(is_http_error_status) {
-                        let _ = write_http_attempt_output(
-                            transfer,
-                            expanded,
-                            &attempt.method,
-                            metrics,
-                            &attempt,
-                            false,
-                        )?;
-                    }
+                    write_http_retry_attempt_output(
+                        transfer,
+                        expanded,
+                        &attempt.method,
+                        metrics,
+                        &attempt,
+                        &mut retry_output,
+                    )?;
                     schedule_retry(transfer, metrics, retry_started, attempt.retry_after).await;
                     continue;
                 }
-                if let Err(error) = finish_http_transfer(transfer, expanded, metrics, attempt) {
+                if let Err(error) =
+                    finish_http_transfer(transfer, expanded, metrics, attempt, &retry_output)
+                {
                     if should_retry_transfer_error(transfer, &error)
                         && schedule_retry(transfer, metrics, retry_started, None).await
                     {
@@ -10406,9 +10462,18 @@ fn finish_http_transfer(
     expanded: &glob::ExpandedUrl,
     metrics: &mut writeout::Metrics,
     attempt: HttpAttempt,
+    retry_output: &HttpRetryOutputState,
 ) -> Result<()> {
-    let max_filesize_exceeded =
-        write_http_attempt_output(transfer, expanded, &attempt.method, metrics, &attempt, true)?;
+    let write = write_http_attempt_output(
+        transfer,
+        expanded,
+        &attempt.method,
+        metrics,
+        &attempt,
+        true,
+        retry_output.should_append(),
+    )?;
+    let max_filesize_exceeded = write.max_filesize_exceeded;
     if let Some(error) = attempt.deferred_error {
         return Err(error);
     }
@@ -10430,6 +10495,31 @@ fn finish_http_transfer(
     Ok(())
 }
 
+fn write_http_retry_attempt_output(
+    transfer: &TransferConfig,
+    expanded: &glob::ExpandedUrl,
+    method: &Method,
+    metrics: &mut writeout::Metrics,
+    attempt: &HttpAttempt,
+    retry_output: &mut HttpRetryOutputState,
+) -> Result<()> {
+    if !transfer.include_headers && !transfer.fail_with_body {
+        return Ok(());
+    }
+
+    let start = retry_output.preserved_file_bytes;
+    let write = write_http_attempt_output(
+        transfer,
+        expanded,
+        method,
+        metrics,
+        attempt,
+        false,
+        retry_output.should_append(),
+    )?;
+    retry_output.record_retry_write(write, start)
+}
+
 fn write_http_attempt_output(
     transfer: &TransferConfig,
     expanded: &glob::ExpandedUrl,
@@ -10437,7 +10527,8 @@ fn write_http_attempt_output(
     metrics: &mut writeout::Metrics,
     attempt: &HttpAttempt,
     persist_headers: bool,
-) -> Result<bool> {
+    append_output: bool,
+) -> Result<HttpAttemptWrite> {
     let header_bytes = attempt.header_bytes.clone().unwrap_or_else(|| {
         attempt
             .status
@@ -10467,6 +10558,8 @@ fn write_http_attempt_output(
         0
     };
 
+    let mut output_path = None;
+    let mut output_bytes = 0;
     if write_headers || write_body {
         let mut bytes = Vec::new();
         if write_headers {
@@ -10481,12 +10574,19 @@ fn write_http_attempt_output(
             &attempt.headers,
             &expanded.variables,
             &bytes,
-            attempt.resume_from > 0,
+            append_output || attempt.resume_from > 0,
         )?;
-        metrics.filename_effective = filename.map(|path| path.display().to_string());
+        output_bytes = bytes.len() as u64;
+        metrics.filename_effective = filename.as_ref().map(|path| path.display().to_string());
+        output_path = filename;
     }
 
-    Ok(max_filesize_exceeded)
+    Ok(HttpAttemptWrite {
+        max_filesize_exceeded,
+        body_bytes: body_bytes.len() as u64,
+        output_bytes,
+        output_path,
+    })
 }
 
 async fn schedule_retry(
