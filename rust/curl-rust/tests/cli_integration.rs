@@ -8698,6 +8698,7 @@ fn libcurl_writes_source_file_for_supported_options() {
     let parsed_url = Url::parse(&url).unwrap();
     let host = parsed_url.host_str().unwrap().to_string();
     let resolve_entry = format!("{}:{}:127.0.0.1", host, parsed_url.port().unwrap());
+    let connect_to_entry = "nomatch.test:80:127.0.0.1:80";
     let cookie_file = temp.path().join("cookies.txt");
     std::fs::write(
         &cookie_file,
@@ -8724,6 +8725,8 @@ fn libcurl_writes_source_file_for_supported_options() {
         "MyUA",
         "--resolve",
         &resolve_entry,
+        "--connect-to",
+        connect_to_entry,
         "--max-filesize",
         "2M",
         "--http1.1",
@@ -8757,6 +8760,10 @@ fn libcurl_writes_source_file_for_supported_options() {
     assert!(text.contains("CURLOPT_USERAGENT, \"MyUA\""));
     assert!(text.contains(&format!("curl_slist_append(slist2, \"{resolve_entry}\");")));
     assert!(text.contains("CURLOPT_RESOLVE, slist2"));
+    assert!(text.contains(&format!(
+        "curl_slist_append(slist3, \"{connect_to_entry}\");"
+    )));
+    assert!(text.contains("CURLOPT_CONNECT_TO, slist3"));
     assert!(text.contains("CURLOPT_MAXFILESIZE_LARGE, (curl_off_t)2097152"));
     assert!(text.contains("CURLOPT_REFERER, \"firstone.html\""));
     assert!(text.contains("CURLOPT_AUTOREFERER, 1"));
