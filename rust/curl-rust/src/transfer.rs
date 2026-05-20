@@ -8430,6 +8430,7 @@ async fn run_http_transfer(
         && raw_http_direct_supported(transfer, &url, has_multipart)
         && (transfer.request_target.is_some()
             || raw_custom_header_wire_semantics
+            || method == Method::HEAD
             || (method != Method::HEAD && max_filesize_limit(transfer).is_some()))
     {
         let attempt = run_raw_http_direct_transfer(RawHttpDirectContext {

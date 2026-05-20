@@ -43,6 +43,7 @@ if(NOT CURL_DISABLE_INSTALL)
 endif()
 
 set(_curl_rust_corpus_tests
+  14
   21
   23
   41
