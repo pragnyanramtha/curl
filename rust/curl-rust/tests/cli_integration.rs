@@ -284,6 +284,7 @@ struct FtpServerOptions {
     stor_denied: bool,
     stor_final: &'static [u8],
     size: Option<u64>,
+    size_reply: Option<&'static [u8]>,
     mdtm: Option<&'static str>,
 }
 
@@ -579,6 +580,7 @@ fn ftp_options(data: impl Into<Vec<u8>>) -> FtpServerOptions {
         stor_denied: false,
         stor_final: b"226 Transfer complete\r\n",
         size,
+        size_reply: None,
         mdtm: Some("20030409102659"),
     }
 }
@@ -710,7 +712,9 @@ fn spawn_ftp_server_with_listener(
                 }
                 stream.write_all(b"200 Type set\r\n").unwrap();
             } else if command.starts_with("SIZE ") {
-                if let Some(size) = options.size {
+                if let Some(reply) = options.size_reply {
+                    stream.write_all(reply).unwrap();
+                } else if let Some(size) = options.size {
                     stream
                         .write_all(format!("213 {size}\r\n").as_bytes())
                         .unwrap();
@@ -5289,6 +5293,91 @@ fn ftp_continue_at_without_size_still_sends_rest() {
         record.commands,
         b"USER anonymous\r\nPASS ftp@example.com\r\nPWD\r\nEPSV\r\nTYPE I\r\nSIZE file.txt\r\nREST 2\r\nRETR file.txt\r\nQUIT\r\n"
     );
+}
+
+#[test]
+fn ftp_range_download_sends_rest_and_aborts_after_requested_bytes() {
+    let data = b"skip0123456789abcdef\n0123456789abcdef\n";
+    let (url, rx) = spawn_ftp_server("/file.txt", ftp_options(&data[..]));
+
+    let mut command = Command::cargo_bin("curl").unwrap();
+    command.args(["-q", "-sS", "-r", "4-16", &url]);
+    command.assert().success().stdout("0123456789abc");
+
+    let record = rx.recv().unwrap();
+    assert_eq!(
+        record.commands,
+        b"USER anonymous\r\nPASS ftp@example.com\r\nPWD\r\nEPSV\r\nTYPE I\r\nSIZE file.txt\r\nREST 4\r\nRETR file.txt\r\nABOR\r\nQUIT\r\n"
+    );
+    assert_eq!(record.data_connections, 1);
+}
+
+#[test]
+fn ftp_range_download_without_size_still_sends_rest() {
+    let mut options = ftp_options(b"xxxdata to see");
+    options.size = None;
+    let (url, rx) = spawn_ftp_server("/file.txt", options);
+
+    let mut command = Command::cargo_bin("curl").unwrap();
+    command.args(["-q", "-sS", "--range", "3-6", &url]);
+    command.assert().success().stdout("data");
+
+    let record = rx.recv().unwrap();
+    assert_eq!(
+        record.commands,
+        b"USER anonymous\r\nPASS ftp@example.com\r\nPWD\r\nEPSV\r\nTYPE I\r\nSIZE file.txt\r\nREST 3\r\nRETR file.txt\r\nABOR\r\nQUIT\r\n"
+    );
+}
+
+#[test]
+fn ftp_range_short_data_writes_partial_body_then_fails() {
+    let mut options = ftp_options(b"abcdef");
+    options.size_reply = Some(b"213 20\r\n");
+    let (url, rx) = spawn_ftp_server("/file.txt", options);
+
+    let mut command = Command::cargo_bin("curl").unwrap();
+    command.args(["-q", "-sS", "--range", "2-8", &url]);
+    command.assert().failure().code(18).stdout("cdef");
+
+    let record = rx.recv().unwrap();
+    assert_eq!(
+        record.commands,
+        b"USER anonymous\r\nPASS ftp@example.com\r\nPWD\r\nEPSV\r\nTYPE I\r\nSIZE file.txt\r\nREST 2\r\nRETR file.txt\r\nQUIT\r\n"
+    );
+}
+
+#[test]
+fn ftp_range_start_past_known_size_returns_36() {
+    let (url, rx) = spawn_ftp_server("/file.txt", ftp_options(b"hello"));
+
+    let mut command = Command::cargo_bin("curl").unwrap();
+    command.args(["-q", "-sS", "--range", "10-12", &url]);
+    command.assert().failure().code(36).stdout("");
+
+    let record = rx.recv().unwrap();
+    assert_eq!(
+        record.commands,
+        b"USER anonymous\r\nPASS ftp@example.com\r\nPWD\r\nEPSV\r\nTYPE I\r\nSIZE file.txt\r\nQUIT\r\n"
+    );
+    assert_eq!(record.data_connections, 0);
+}
+
+#[test]
+fn ftp_range_trailing_digits_size_reply_bounds_offset() {
+    let mut options = ftp_options(b"hello");
+    options.size_reply = Some(b"213 file: 213, Size =5\r\n");
+    let (url, rx) = spawn_ftp_server("/file.txt", options);
+
+    let mut command = Command::cargo_bin("curl").unwrap();
+    command.args(["-q", "-sS", "--range", "10-12", &url]);
+    command.assert().failure().code(36).stdout("");
+
+    let record = rx.recv().unwrap();
+    assert_eq!(
+        record.commands,
+        b"USER anonymous\r\nPASS ftp@example.com\r\nPWD\r\nEPSV\r\nTYPE I\r\nSIZE file.txt\r\nQUIT\r\n"
+    );
+    assert_eq!(record.data_connections, 0);
 }
 
 #[test]

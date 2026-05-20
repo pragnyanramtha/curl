@@ -1036,12 +1036,6 @@ async fn run_ftp_transfer(
             "--oauth2-bearer for ftp:// URLs".to_string(),
         ));
     }
-    if transfer.range.is_some() {
-        return Err(CurlError::Unsupported(
-            "FTP range requests in the Rust sidecar".to_string(),
-        ));
-    }
-
     if let Some(timeout) = active_timeout(transfer.max_time) {
         tokio::time::timeout(
             timeout,
@@ -1076,6 +1070,18 @@ async fn run_ftp_exchange(
         .ok_or_else(|| CurlError::Url("FTP URL is missing a host".to_string()))?;
     let port = url.port().unwrap_or(FTP_DEFAULT_PORT);
     let path = ftp_path(&url)?;
+    if transfer.range.is_some()
+        && (upload.is_some()
+            || method == "HEAD"
+            || transfer.head
+            || transfer.use_ascii
+            || transfer.list_only
+            || path.file.is_none())
+    {
+        return Err(CurlError::Unsupported(
+            "FTP range requests in the Rust sidecar".to_string(),
+        ));
+    }
     if upload.is_none()
         && transfer.continue_at.is_some()
         && (transfer.list_only || path.file.is_none())
@@ -1152,6 +1158,7 @@ async fn run_ftp_exchange(
     let mut synthetic_headers = reqwest::header::HeaderMap::new();
     let mut body = Vec::new();
     let mut uploaded = false;
+    let mut deferred_download_error: Option<CurlError> = None;
     let transfer_result = if let Some(upload) = upload.as_deref() {
         uploaded = true;
         ftp_upload_body(
@@ -1188,7 +1195,8 @@ async fn run_ftp_exchange(
         .await
         {
             Ok(downloaded) => {
-                body = downloaded;
+                body = downloaded.body;
+                deferred_download_error = downloaded.deferred_error;
                 Ok(())
             }
             Err(error) => Err(error),
@@ -1258,6 +1266,10 @@ async fn run_ftp_exchange(
     })();
 
     if let Err(error) = local_result {
+        ftp_quit_preserving_response_code(&mut stream, metrics, &mut control_headers).await;
+        return Err(error);
+    }
+    if let Some(error) = deferred_download_error {
         ftp_quit_preserving_response_code(&mut stream, metrics, &mut control_headers).await;
         return Err(error);
     }
@@ -1407,7 +1419,7 @@ async fn ftp_download_body(
     metrics: &mut writeout::Metrics,
     control_headers: &mut Vec<u8>,
     resume_from: u64,
-) -> Result<Vec<u8>> {
+) -> Result<FtpDownloadBody> {
     let mut data_stream =
         ftp_open_passive_data(transfer, stream, host, metrics, control_headers).await?;
     let ascii = transfer.use_ascii || transfer.list_only || path.file.is_none();
@@ -1440,20 +1452,67 @@ async fn ftp_download_body(
         {
             return Err(CurlError::FileSizeExceeded);
         }
+        let range_plan = transfer
+            .range
+            .as_deref()
+            .map(|range| ftp_download_range_plan(range, remote_size))
+            .transpose()?;
         if let Some(size) = remote_size {
             if resume_from > size {
                 return Err(CurlError::BadDownloadResume);
             }
             if resume_from == size && resume_from > 0 {
-                return Ok(Vec::new());
+                return Ok(FtpDownloadBody::new(Vec::new()));
             }
         }
-        if resume_from > 0 {
-            let rest_command = format!("REST {resume_from}");
+        let rest_offset = range_plan.map_or(resume_from, |plan| plan.start);
+        if range_plan.is_some_and(|plan| plan.length == Some(0)) {
+            return Ok(FtpDownloadBody::new(Vec::new()));
+        }
+        if rest_offset > 0 {
+            let rest_command = format!("REST {rest_offset}");
             let response =
                 ftp_command(stream, rest_command.as_bytes(), metrics, control_headers).await?;
             ftp_require_code(&response, &[350], CurlError::FtpCouldntUseRest)?;
         }
+
+        let command = ftp_transfer_command(path, transfer.list_only);
+        let response = ftp_command(stream, &command, metrics, control_headers).await?;
+        if response.code / 100 != 1 {
+            return if command.starts_with(b"RETR ") && response.code == 550 {
+                Err(CurlError::RemoteFileNotFound)
+            } else {
+                Err(CurlError::FtpCouldntRetrFile)
+            };
+        }
+
+        let mut body = Vec::new();
+        if let Some(plan) = range_plan
+            && let Some(length) = plan.length
+        {
+            {
+                let mut limited = data_stream.take(length);
+                limited.read_to_end(&mut body).await.map_err(tcp_io_error)?;
+            }
+            if body.len() as u64 == length {
+                let _ = ftp_command(stream, b"ABOR", metrics, control_headers).await;
+                return Ok(FtpDownloadBody::new(body));
+            }
+            let response = ftp_read_response(stream, metrics, control_headers).await?;
+            ftp_require_positive(&response, CurlError::FtpCouldntRetrFile)?;
+            return Ok(FtpDownloadBody {
+                body,
+                deferred_error: Some(CurlError::PartialFile),
+            });
+        }
+
+        data_stream
+            .read_to_end(&mut body)
+            .await
+            .map_err(tcp_io_error)?;
+        let response = ftp_read_response(stream, metrics, control_headers).await?;
+        ftp_require_positive(&response, CurlError::FtpCouldntRetrFile)?;
+        return Ok(FtpDownloadBody::new(body));
     }
 
     let command = ftp_transfer_command(path, transfer.list_only);
@@ -1473,7 +1532,89 @@ async fn ftp_download_body(
         .map_err(tcp_io_error)?;
     let response = ftp_read_response(stream, metrics, control_headers).await?;
     ftp_require_positive(&response, CurlError::FtpCouldntRetrFile)?;
-    Ok(body)
+    Ok(FtpDownloadBody::new(body))
+}
+
+struct FtpDownloadBody {
+    body: Vec<u8>,
+    deferred_error: Option<CurlError>,
+}
+
+impl FtpDownloadBody {
+    fn new(body: Vec<u8>) -> Self {
+        Self {
+            body,
+            deferred_error: None,
+        }
+    }
+}
+
+#[derive(Clone, Copy)]
+struct FtpDownloadRangePlan {
+    start: u64,
+    length: Option<u64>,
+}
+
+fn ftp_download_range_plan(range: &str, remote_size: Option<u64>) -> Result<FtpDownloadRangePlan> {
+    let range = range
+        .strip_prefix("bytes=")
+        .or_else(|| range.strip_prefix("BYTES="))
+        .unwrap_or(range);
+    if range.contains(',') {
+        return Err(CurlError::RangeError);
+    }
+    let Some((start, end)) = range.split_once('-') else {
+        return Err(CurlError::RangeError);
+    };
+
+    if start.is_empty() {
+        let suffix = end.parse::<u64>().map_err(|_| CurlError::RangeError)?;
+        if suffix == 0 {
+            return Err(CurlError::RangeError);
+        }
+        let remote_size = remote_size
+            .filter(|size| *size > 0)
+            .ok_or(CurlError::RangeError)?;
+        if suffix > remote_size {
+            return Err(CurlError::BadDownloadResume);
+        }
+        let length = suffix;
+        return Ok(FtpDownloadRangePlan {
+            start: remote_size - length,
+            length: Some(length),
+        });
+    }
+
+    let start = start.parse::<u64>().map_err(|_| CurlError::RangeError)?;
+    if let Some(remote_size) = remote_size {
+        if start > remote_size {
+            return Err(CurlError::BadDownloadResume);
+        }
+        if start == remote_size {
+            return Ok(FtpDownloadRangePlan {
+                start,
+                length: Some(0),
+            });
+        }
+    }
+    if end.is_empty() {
+        return Ok(FtpDownloadRangePlan {
+            start,
+            length: None,
+        });
+    }
+
+    let mut end = end.parse::<u64>().map_err(|_| CurlError::RangeError)?;
+    if let Some(remote_size) = remote_size {
+        end = end.min(remote_size - 1);
+    }
+    if start > end {
+        return Err(CurlError::RangeError);
+    }
+    Ok(FtpDownloadRangePlan {
+        start,
+        length: Some(end - start + 1),
+    })
 }
 
 async fn ftp_upload_body(
@@ -1848,7 +1989,20 @@ fn ftp_credentials(transfer: &TransferConfig, url: &Url) -> Result<(Vec<u8>, Vec
 fn ftp_size_value(response: &FtpResponse) -> Option<u64> {
     let line = response.lines.first()?;
     let text = std::str::from_utf8(line).ok()?;
-    text.get(4..)?.trim().parse::<u64>().ok()
+    let payload = text.get(4..)?.trim();
+    if let Ok(size) = payload.parse::<u64>() {
+        return Some(size);
+    }
+    let bytes = payload.as_bytes();
+    let last_digit = bytes.iter().rposition(u8::is_ascii_digit)?;
+    if last_digit + 1 != bytes.len() {
+        return None;
+    }
+    let first_digit = bytes[..last_digit]
+        .iter()
+        .rposition(|byte| !byte.is_ascii_digit())
+        .map_or(0, |index| index + 1);
+    payload.get(first_digit..)?.parse::<u64>().ok()
 }
 
 fn ftp_mdtm_time(response: &FtpResponse) -> Option<SystemTime> {
