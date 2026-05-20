@@ -1986,6 +1986,175 @@ fn write_out_at_file_reads_format() {
 }
 
 #[test]
+fn default_config_continues_from_empty_curl_home_to_xdg_config_home() {
+    let temp = tempdir().unwrap();
+    let curl_home = temp.path().join("curl-home");
+    let xdg_config = temp.path().join("xdg");
+    let home = temp.path().join("home");
+    std::fs::create_dir_all(&curl_home).unwrap();
+    std::fs::create_dir_all(&xdg_config).unwrap();
+    std::fs::create_dir_all(&home).unwrap();
+    let (url, rx) = spawn_server(b"HTTP/1.1 200 OK\r\nContent-Length: 3\r\n\r\nxdg");
+    std::fs::write(
+        xdg_config.join("curlrc"),
+        format!("silent\nurl = {url}\nheader = \"X-Config: xdg\"\n"),
+    )
+    .unwrap();
+
+    let mut command = Command::cargo_bin("curl").unwrap();
+    command
+        .env("CURL_HOME", &curl_home)
+        .env("XDG_CONFIG_HOME", &xdg_config)
+        .env("HOME", &home);
+    command.assert().success().stdout("xdg");
+
+    let request = rx.recv().unwrap();
+    assert!(request.start_line.starts_with("GET /resource HTTP/1.1"));
+    assert_eq!(header(&request, "x-config"), Some("xdg"));
+}
+
+#[test]
+fn default_config_prefers_curl_home_over_xdg_config_home() {
+    let temp = tempdir().unwrap();
+    let curl_home = temp.path().join("curl-home");
+    let xdg_config = temp.path().join("xdg");
+    let home = temp.path().join("home");
+    std::fs::create_dir_all(&curl_home).unwrap();
+    std::fs::create_dir_all(&xdg_config).unwrap();
+    std::fs::create_dir_all(&home).unwrap();
+    let (url, rx) = spawn_server(b"HTTP/1.1 200 OK\r\nContent-Length: 4\r\n\r\ncurl");
+    std::fs::write(
+        curl_home.join(".curlrc"),
+        format!("silent\nurl = {url}\nheader = \"X-Config: curl\"\n"),
+    )
+    .unwrap();
+    std::fs::write(
+        xdg_config.join("curlrc"),
+        "silent\nurl = http://127.0.0.1:1/xdg\n",
+    )
+    .unwrap();
+
+    let mut command = Command::cargo_bin("curl").unwrap();
+    command
+        .env("CURL_HOME", &curl_home)
+        .env("XDG_CONFIG_HOME", &xdg_config)
+        .env("HOME", &home);
+    command.assert().success().stdout("curl");
+
+    let request = rx.recv().unwrap();
+    assert!(request.start_line.starts_with("GET /resource HTTP/1.1"));
+    assert_eq!(header(&request, "x-config"), Some("curl"));
+}
+
+#[cfg(unix)]
+#[test]
+fn default_config_skips_unreadable_xdg_candidate() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let temp = tempdir().unwrap();
+    let xdg_config = temp.path().join("xdg");
+    let home = temp.path().join("home");
+    std::fs::create_dir_all(&xdg_config).unwrap();
+    std::fs::create_dir_all(&home).unwrap();
+    let unreadable = xdg_config.join("curlrc");
+    std::fs::write(&unreadable, "url = http://127.0.0.1:1/xdg\n").unwrap();
+    let mut permissions = std::fs::metadata(&unreadable).unwrap().permissions();
+    permissions.set_mode(0o000);
+    std::fs::set_permissions(&unreadable, permissions).unwrap();
+    if std::fs::File::open(&unreadable).is_ok() {
+        return;
+    }
+
+    let (url, rx) = spawn_server(b"HTTP/1.1 200 OK\r\nContent-Length: 4\r\n\r\nhome");
+    std::fs::write(
+        home.join(".curlrc"),
+        format!("silent\nurl = {url}\nheader = \"X-Config: home\"\n"),
+    )
+    .unwrap();
+
+    let mut command = Command::cargo_bin("curl").unwrap();
+    command
+        .env_remove("CURL_HOME")
+        .env("XDG_CONFIG_HOME", &xdg_config)
+        .env("HOME", &home);
+    command.assert().success().stdout("home");
+
+    let request = rx.recv().unwrap();
+    assert!(request.start_line.starts_with("GET /resource HTTP/1.1"));
+    assert_eq!(header(&request, "x-config"), Some("home"));
+}
+
+#[test]
+fn default_config_falls_back_to_home_config_dir_without_xdg_config_home() {
+    let temp = tempdir().unwrap();
+    let home = temp.path().join("home");
+    std::fs::create_dir_all(home.join(".config")).unwrap();
+    let (url, rx) = spawn_server(b"HTTP/1.1 200 OK\r\nContent-Length: 6\r\n\r\nconfig");
+    std::fs::write(
+        home.join(".config").join("curlrc"),
+        format!("silent\nurl = {url}\nheader = \"X-Config: home-config\"\n"),
+    )
+    .unwrap();
+
+    let mut command = Command::cargo_bin("curl").unwrap();
+    command
+        .env_remove("CURL_HOME")
+        .env_remove("XDG_CONFIG_HOME")
+        .env("HOME", &home);
+    command.assert().success().stdout("config");
+
+    let request = rx.recv().unwrap();
+    assert!(request.start_line.starts_with("GET /resource HTTP/1.1"));
+    assert_eq!(header(&request, "x-config"), Some("home-config"));
+}
+
+#[test]
+fn default_config_is_skipped_by_disable_flag() {
+    let temp = tempdir().unwrap();
+    let xdg_config = temp.path().join("xdg");
+    let home = temp.path().join("home");
+    std::fs::create_dir_all(&xdg_config).unwrap();
+    std::fs::create_dir_all(&home).unwrap();
+    std::fs::write(xdg_config.join("curlrc"), "header = X-Config: xdg\n").unwrap();
+    let (url, rx) = spawn_server(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok");
+
+    let mut command = Command::cargo_bin("curl").unwrap();
+    command
+        .env_remove("CURL_HOME")
+        .env("XDG_CONFIG_HOME", &xdg_config)
+        .env("HOME", &home)
+        .args(["--disable", "-sS", &url]);
+    command.assert().success().stdout("ok");
+
+    let request = rx.recv().unwrap();
+    assert!(request.start_line.starts_with("GET /resource HTTP/1.1"));
+    assert_eq!(header(&request, "x-config"), None);
+}
+
+#[test]
+fn default_config_is_skipped_by_q_cluster() {
+    let temp = tempdir().unwrap();
+    let xdg_config = temp.path().join("xdg");
+    let home = temp.path().join("home");
+    std::fs::create_dir_all(&xdg_config).unwrap();
+    std::fs::create_dir_all(&home).unwrap();
+    std::fs::write(xdg_config.join("curlrc"), "header = X-Config: xdg\n").unwrap();
+    let (url, rx) = spawn_server(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok");
+
+    let mut command = Command::cargo_bin("curl").unwrap();
+    command
+        .env_remove("CURL_HOME")
+        .env("XDG_CONFIG_HOME", &xdg_config)
+        .env("HOME", &home)
+        .args(["-qsS", &url]);
+    command.assert().success().stdout("ok");
+
+    let request = rx.recv().unwrap();
+    assert!(request.start_line.starts_with("GET /resource HTTP/1.1"));
+    assert_eq!(header(&request, "x-config"), None);
+}
+
+#[test]
 fn url_at_file_downloads_each_url_as_remote_name() {
     let temp = tempdir().unwrap();
     let (url, rx) = spawn_sequence_server(vec![

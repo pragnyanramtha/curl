@@ -1843,14 +1843,92 @@ fn curl_compat_version() -> &'static str {
 }
 
 fn should_load_default_config(args: &[String]) -> bool {
-    !matches!(args.first().map(String::as_str), Some("-q" | "--disable"))
+    match args.first().map(String::as_str) {
+        Some("--disable") => false,
+        Some(arg) if arg.starts_with("-q") => false,
+        _ => true,
+    }
 }
 
 fn default_config_path() -> Option<PathBuf> {
-    std::env::var_os("CURL_HOME")
-        .or_else(|| std::env::var_os("HOME"))
+    let curl_home = nonempty_env_path("CURL_HOME");
+    let xdg_config_home = nonempty_env_path("XDG_CONFIG_HOME");
+    let home = nonempty_env_path("HOME");
+    let mut dotscore = true;
+    let mut locations = vec![
+        (curl_home.clone(), false),
+        (xdg_config_home, true),
+        (home.clone(), false),
+    ];
+
+    #[cfg(windows)]
+    {
+        let user_profile = nonempty_env_path("USERPROFILE");
+        let app_data = nonempty_env_path("APPDATA");
+        locations.push((user_profile.clone(), false));
+        locations.push((app_data, false));
+        locations.push((
+            user_profile.map(|path| path.join("Application Data")),
+            false,
+        ));
+    }
+
+    locations.push((curl_home.map(|path| path.join(".config")), true));
+    locations.push((home.map(|path| path.join(".config")), true));
+
+    for (base, without_dot) in locations {
+        let Some(base) = base else {
+            continue;
+        };
+        if without_dot {
+            if !dotscore {
+                continue;
+            }
+            dotscore = false;
+            let path = base.join("curlrc");
+            if is_readable_config_candidate(&path) {
+                return Some(path);
+            }
+        } else if let Some(path) = find_dot_curlrc(&base, dotscore) {
+            return Some(path);
+        }
+    }
+
+    None
+}
+
+fn nonempty_env_path(name: &str) -> Option<PathBuf> {
+    std::env::var_os(name)
+        .filter(|value| !value.is_empty())
         .map(PathBuf::from)
-        .map(|home| home.join(".curlrc"))
+}
+
+fn is_readable_config_candidate(path: &std::path::Path) -> bool {
+    std::fs::File::open(path).is_ok()
+}
+
+#[cfg(windows)]
+fn find_dot_curlrc(base: &std::path::Path, dotscore: bool) -> Option<PathBuf> {
+    for filename in [".curlrc", "_curlrc"]
+        .into_iter()
+        .take(if dotscore { 2 } else { 1 })
+    {
+        let path = base.join(filename);
+        if is_readable_config_candidate(&path) {
+            return Some(path);
+        }
+    }
+    None
+}
+
+#[cfg(not(windows))]
+fn find_dot_curlrc(base: &std::path::Path, _dotscore: bool) -> Option<PathBuf> {
+    let path = base.join(".curlrc");
+    if is_readable_config_candidate(&path) {
+        Some(path)
+    } else {
+        None
+    }
 }
 
 fn read_config_tokens(path: &std::path::Path) -> Result<Vec<String>> {
