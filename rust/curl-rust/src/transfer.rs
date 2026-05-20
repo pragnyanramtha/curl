@@ -7063,23 +7063,24 @@ fn smtp_dot_stuffed_body(input: &[u8]) -> Vec<u8> {
 
 fn tftp_filename_and_mode(url: &Url, use_ascii: bool) -> Result<(Vec<u8>, &'static str)> {
     let path = url.path().strip_prefix('/').unwrap_or(url.path());
-    let mut decoded = percent_decode(path.as_bytes()).collect::<Vec<_>>();
-    if decoded.contains(&0) {
-        return Err(CurlError::Url(
-            "TFTP filename contains a decoded NUL byte".to_string(),
-        ));
-    }
-
-    let mode = if strip_tftp_mode_suffix(&mut decoded, b";mode=netascii") {
+    let mut encoded = path.as_bytes().to_vec();
+    let mode = if strip_tftp_mode_suffix(&mut encoded, b";mode=netascii") {
         "netascii"
     } else {
-        let explicit_octet = strip_tftp_mode_suffix(&mut decoded, b";mode=octet");
+        let explicit_octet = strip_tftp_mode_suffix(&mut encoded, b";mode=octet");
         if explicit_octet || !use_ascii {
             "octet"
         } else {
             "netascii"
         }
     };
+
+    let decoded = percent_decode(&encoded).collect::<Vec<_>>();
+    if decoded.contains(&0) {
+        return Err(CurlError::Url(
+            "TFTP filename contains a decoded NUL byte".to_string(),
+        ));
+    }
 
     if decoded.is_empty() {
         return Err(CurlError::TftpIllegal);
@@ -7092,7 +7093,7 @@ fn strip_tftp_mode_suffix(value: &mut Vec<u8>, suffix: &[u8]) -> bool {
         return false;
     }
     let start = value.len() - suffix.len();
-    if value[start..].eq_ignore_ascii_case(suffix) {
+    if value[start..] == *suffix {
         value.truncate(start);
         true
     } else {

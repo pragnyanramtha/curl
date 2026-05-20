@@ -5858,6 +5858,32 @@ fn tftp_mode_netascii_suffix_sends_netascii() {
 }
 
 #[test]
+fn tftp_encoded_mode_suffix_is_part_of_filename() {
+    let (url, rx) = spawn_tftp_server(vec![b"encoded".to_vec()]);
+    let url = url.replace("/file.txt", "/file%3Bmode%3Doctet");
+
+    let mut command = Command::cargo_bin("curl").unwrap();
+    command.args(["-q", "-sS", "--tftp-no-options", "--use-ascii", &url]);
+    command.assert().success().stdout("encoded");
+
+    let record = rx.recv().unwrap();
+    assert_eq!(record.request, b"\0\x01file;mode=octet\0netascii\0");
+}
+
+#[test]
+fn tftp_mixed_case_mode_suffix_is_part_of_filename() {
+    let (url, rx) = spawn_tftp_server(vec![b"mixed".to_vec()]);
+    let url = url.replace("/file.txt", "/file.txt;mode=OCTET");
+
+    let mut command = Command::cargo_bin("curl").unwrap();
+    command.args(["-q", "-sS", "--tftp-no-options", "--use-ascii", &url]);
+    command.assert().success().stdout("mixed");
+
+    let record = rx.recv().unwrap();
+    assert_eq!(record.request, b"\0\x01file.txt;mode=OCTET\0netascii\0");
+}
+
+#[test]
 fn tftp_writeout_reports_zero_http_code_and_download_size() {
     let (url, rx) = spawn_tftp_server(vec![b"abcdef".to_vec()]);
 
