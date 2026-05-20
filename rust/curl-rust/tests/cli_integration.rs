@@ -4820,6 +4820,25 @@ fn ftp_retr_downloads_file_and_sends_default_sequence() {
 }
 
 #[test]
+fn ftp_use_ascii_download_sends_type_a_without_size() {
+    let mut options = ftp_options(b"ascii ftp");
+    options.epsv_fails = true;
+    let (url, rx) = spawn_ftp_server("/105", options);
+    let url = url.replacen("ftp://", "ftp://userdude:passfellow@", 1);
+
+    let mut command = Command::cargo_bin("curl").unwrap();
+    command.args(["-q", "-sS", "--use-ascii", &url]);
+    command.assert().success().stdout("ascii ftp");
+
+    let record = rx.recv().unwrap();
+    assert_eq!(
+        record.commands,
+        b"USER userdude\r\nPASS passfellow\r\nPWD\r\nEPSV\r\nPASV\r\nTYPE A\r\nRETR 105\r\nQUIT\r\n"
+    );
+    assert_eq!(record.data_connections, 1);
+}
+
+#[test]
 fn ftp_directory_url_lists_with_type_a_and_list() {
     let listing = b"drwxr-xr-x pub\r\n-rw-r--r-- README\r\n";
     let (url, rx) = spawn_ftp_server("/pub/", ftp_options(&listing[..]));

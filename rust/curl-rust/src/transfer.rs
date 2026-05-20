@@ -1410,7 +1410,7 @@ async fn ftp_download_body(
 ) -> Result<Vec<u8>> {
     let mut data_stream =
         ftp_open_passive_data(transfer, stream, host, metrics, control_headers).await?;
-    let ascii = transfer.list_only || path.file.is_none();
+    let ascii = transfer.use_ascii || transfer.list_only || path.file.is_none();
     ftp_set_type(
         stream,
         if ascii { b'A' } else { b'I' },
@@ -1420,7 +1420,11 @@ async fn ftp_download_body(
     .await?;
     ftp_run_quote_commands(stream, &transfer.ftp_prequote, metrics, control_headers).await?;
 
-    if let Some(file) = path.file.as_ref().filter(|_| !transfer.list_only) {
+    if let Some(file) = path
+        .file
+        .as_ref()
+        .filter(|_| !transfer.use_ascii && !transfer.list_only)
+    {
         let mut size_command = Vec::from(&b"SIZE "[..]);
         size_command.extend_from_slice(file);
         let response = ftp_command(stream, &size_command, metrics, control_headers).await?;
