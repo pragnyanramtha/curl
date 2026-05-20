@@ -441,7 +441,11 @@ fn write_request(out: &mut String, render: &RenderTransfer<'_>, url: &str) -> Re
     if transfer.http09_allowed {
         emit_long_setopt(out, "CURLOPT_HTTP09_ALLOWED", 1);
     }
-    emit_long_setopt(out, "CURLOPT_MAXREDIRS", transfer.max_redirs as i64);
+    emit_long_setopt(
+        out,
+        "CURLOPT_MAXREDIRS",
+        max_redirs_for_libcurl(transfer.max_redirs),
+    );
     if let Some(cookie) = &transfer.cookie {
         emit_string_setopt(out, "CURLOPT_COOKIE", cookie);
     }
@@ -637,6 +641,14 @@ fn postredir_bitmask(transfer: &TransferConfig) -> i64 {
     bitmask
 }
 
+fn max_redirs_for_libcurl(max_redirs: usize) -> i64 {
+    if max_redirs == usize::MAX {
+        -1
+    } else {
+        max_redirs as i64
+    }
+}
+
 fn emit_slist_append(out: &mut String, slist: &str, value: &str) {
     writeln!(
         out,
@@ -802,6 +814,24 @@ mod tests {
         let source = render_source(&config).unwrap();
 
         assert!(source.contains("CURLOPT_FOLLOWLOCATION, 1L"));
+    }
+
+    #[test]
+    fn renders_unlimited_max_redirs() {
+        let config = parse_args([
+            "-q",
+            "--libcurl",
+            "client.c",
+            "-L",
+            "--max-redirs",
+            "-1",
+            "https://example.com",
+        ])
+        .unwrap();
+
+        let source = render_source(&config).unwrap();
+
+        assert!(source.contains("CURLOPT_MAXREDIRS, -1L"));
     }
 
     #[test]

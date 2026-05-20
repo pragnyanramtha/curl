@@ -9702,6 +9702,25 @@ fn location_does_not_auto_referer_without_referer_auto() {
 }
 
 #[test]
+fn location_unlimited_max_redirs_follows_more_than_default_limit() {
+    const REDIRECT: &[u8] =
+        b"HTTP/1.1 302 Found\r\nLocation: /next\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
+    const OK: &[u8] = b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok";
+
+    let mut responses = vec![REDIRECT; 51];
+    responses.push(OK);
+    let (url, rx) = spawn_sequence_server(responses);
+
+    let mut command = Command::cargo_bin("curl").unwrap();
+    command.args(["-q", "-sS", "-L", "--max-redirs", "-1", &url]);
+    command.assert().success().stdout("ok");
+
+    for _ in 0..52 {
+        rx.recv().unwrap();
+    }
+}
+
+#[test]
 fn redirect_strips_oauth2_bearer_on_cross_origin_by_default() {
     let (url, first_rx, second_rx) =
         spawn_cross_origin_redirect(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok");

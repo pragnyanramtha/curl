@@ -601,7 +601,7 @@ impl Parser {
             "post303" => self.current().post303 = true,
             "max-redirs" => {
                 let value = self.value_for(name, inline_value)?;
-                self.current().max_redirs = parse_usize(name, &value)?;
+                self.current().max_redirs = parse_max_redirs(name, &value)?;
             }
             "retry" => {
                 let value = self.value_for(name, inline_value)?;
@@ -1524,6 +1524,14 @@ fn parse_usize(name: &str, value: &str) -> Result<usize> {
         .map_err(|_| CurlError::Usage(format!("option --{name} expects an integer")))
 }
 
+fn parse_max_redirs(name: &str, value: &str) -> Result<usize> {
+    if value == "-1" {
+        Ok(usize::MAX)
+    } else {
+        parse_usize(name, value)
+    }
+}
+
 fn parse_limited_usize(name: &str, value: &str, default: usize, limit: usize) -> Result<usize> {
     let value = parse_usize(name, value)?;
     Ok(if value == 0 {
@@ -2160,6 +2168,15 @@ mod tests {
         .unwrap();
         assert!(!config.transfers[0].follow_location);
         assert!(!config.transfers[0].location_trusted);
+    }
+
+    #[test]
+    fn parses_unlimited_max_redirs() {
+        let config = parse_args(["-q", "-L", "--max-redirs", "-1", "https://example.com"]).unwrap();
+        assert_eq!(config.transfers[0].max_redirs, usize::MAX);
+
+        let error = parse_args(["-q", "--max-redirs", "-2", "https://example.com"]).unwrap_err();
+        assert!(error.to_string().contains("max-redirs"));
     }
 
     #[test]
