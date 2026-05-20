@@ -158,6 +158,7 @@ struct HttpAttempt {
     headers: reqwest::header::HeaderMap,
     header_bytes: Option<Vec<u8>>,
     body: Vec<u8>,
+    redirects: Vec<HttpAttempt>,
     retry_after: Option<Duration>,
     resume_from: u64,
     deferred_error: Option<CurlError>,
@@ -173,6 +174,17 @@ struct HttpAttemptWrite {
     body_bytes: u64,
     output_bytes: u64,
     output_path: Option<PathBuf>,
+}
+
+impl HttpAttemptWrite {
+    fn absorb(&mut self, write: HttpAttemptWrite) {
+        self.max_filesize_exceeded |= write.max_filesize_exceeded;
+        self.body_bytes += write.body_bytes;
+        self.output_bytes += write.output_bytes;
+        if write.output_path.is_some() {
+            self.output_path = write.output_path;
+        }
+    }
 }
 
 impl HttpRetryOutputState {
@@ -8584,6 +8596,7 @@ async fn run_http_transfer(
             || transfer.ignore_content_length
             || initial_connect_to.is_some()
             || custom_host_header
+            || raw_http_retry_redirect_wire_semantics(transfer)
             || (method != Method::HEAD && max_filesize_limit(transfer).is_some()))
     {
         let custom_method = transfer.method.is_some();
@@ -8591,6 +8604,7 @@ async fn run_http_transfer(
             !transfer.get && (!transfer.data.is_empty() || !transfer.forms.is_empty());
         let mut current_method = method.clone();
         let mut send_request_body = true;
+        let mut redirect_attempts = Vec::new();
 
         loop {
             metrics.method = current_method.as_str().to_string();
@@ -8703,26 +8717,29 @@ async fn run_http_transfer(
                 }
                 url = next_url;
                 redirects += 1;
+                redirect_attempts.push(attempt);
                 continue;
             }
 
-            metrics.url_effective = attempt.final_url.to_string();
-            metrics.response_code = attempt.status.map(|status| status.as_u16());
+            let mut final_attempt = attempt;
+            final_attempt.redirects = redirect_attempts;
+            metrics.url_effective = final_attempt.final_url.to_string();
+            metrics.response_code = final_attempt.status.map(|status| status.as_u16());
             metrics.referer = custom_referer.clone().or_else(|| current_referer.clone());
-            metrics.content_type = attempt
+            metrics.content_type = final_attempt
                 .headers
                 .get(CONTENT_TYPE)
                 .and_then(|value| value.to_str().ok())
                 .map(ToString::to_string);
-            metrics.redirect_url = redirect_location_string(&attempt.headers)?;
-            metrics.headers = attempt.headers.clone();
+            metrics.redirect_url = redirect_location_string(&final_attempt.headers)?;
+            metrics.headers = final_attempt.headers.clone();
             check_http_content_length_max_filesize(
                 transfer,
-                &attempt.headers,
+                &final_attempt.headers,
                 current_method == Method::HEAD,
             )?;
-            metrics.size_download = attempt.body.len() as u64;
-            return Ok(attempt);
+            metrics.size_download = final_attempt.body.len() as u64;
+            return Ok(final_attempt);
         }
     }
 
@@ -8778,6 +8795,7 @@ async fn run_http_transfer(
             !transfer.get && (!transfer.data.is_empty() || !transfer.forms.is_empty());
         let mut current_method = method.clone();
         let mut send_request_body = true;
+        let mut redirect_attempts = Vec::new();
 
         loop {
             metrics.method = current_method.as_str().to_string();
@@ -8858,26 +8876,29 @@ async fn run_http_transfer(
                 }
                 url = next_url;
                 redirects += 1;
+                redirect_attempts.push(attempt);
                 continue;
             }
 
-            metrics.url_effective = attempt.final_url.to_string();
-            metrics.response_code = attempt.status.map(|status| status.as_u16());
+            let mut final_attempt = attempt;
+            final_attempt.redirects = redirect_attempts;
+            metrics.url_effective = final_attempt.final_url.to_string();
+            metrics.response_code = final_attempt.status.map(|status| status.as_u16());
             metrics.referer = custom_referer.clone().or_else(|| current_referer.clone());
-            metrics.content_type = attempt
+            metrics.content_type = final_attempt
                 .headers
                 .get(CONTENT_TYPE)
                 .and_then(|value| value.to_str().ok())
                 .map(ToString::to_string);
-            metrics.redirect_url = redirect_location_string(&attempt.headers)?;
-            metrics.headers = attempt.headers.clone();
+            metrics.redirect_url = redirect_location_string(&final_attempt.headers)?;
+            metrics.headers = final_attempt.headers.clone();
             check_http_content_length_max_filesize(
                 transfer,
-                &attempt.headers,
+                &final_attempt.headers,
                 current_method == Method::HEAD,
             )?;
-            metrics.size_download = attempt.body.len() as u64;
-            return Ok(attempt);
+            metrics.size_download = final_attempt.body.len() as u64;
+            return Ok(final_attempt);
         }
     }
 
@@ -9152,6 +9173,7 @@ async fn run_http_transfer(
             headers,
             header_bytes: None,
             body,
+            redirects: Vec::new(),
             retry_after,
             resume_from,
             deferred_error: None,
@@ -9187,6 +9209,16 @@ fn raw_http_retry_wire_semantics(transfer: &TransferConfig, method: &Method) -> 
     transfer.retry > 0
         && *method == Method::GET
         && (transfer.include_headers || transfer.fail_with_body)
+        && !transfer.verbose
+        && transfer.resolve.is_empty()
+        && transfer.proxy.is_none()
+        && transfer.http_version == HttpVersionPreference::Any
+}
+
+fn raw_http_retry_redirect_wire_semantics(transfer: &TransferConfig) -> bool {
+    transfer.retry > 0
+        && transfer.follow_location
+        && transfer.include_headers
         && !transfer.verbose
         && transfer.resolve.is_empty()
         && transfer.proxy.is_none()
@@ -9932,6 +9964,7 @@ async fn raw_http_read_response(
         headers,
         header_bytes: Some(header_bytes),
         body,
+        redirects: Vec::new(),
         retry_after,
         resume_from,
         deferred_error,
@@ -10054,6 +10087,7 @@ fn raw_http09_attempt(
         } else {
             body
         },
+        redirects: Vec::new(),
         retry_after: None,
         resume_from,
         deferred_error: None,
@@ -10464,10 +10498,9 @@ fn finish_http_transfer(
     attempt: HttpAttempt,
     retry_output: &HttpRetryOutputState,
 ) -> Result<()> {
-    let write = write_http_attempt_output(
+    let write = write_http_attempt_sequence_output(
         transfer,
         expanded,
-        &attempt.method,
         metrics,
         &attempt,
         true,
@@ -10507,6 +10540,21 @@ fn write_http_retry_attempt_output(
         return Ok(());
     }
 
+    for redirect in &attempt.redirects {
+        if !transfer.include_headers && !transfer.head {
+            continue;
+        }
+        let start = retry_output.preserved_file_bytes;
+        let write = write_http_redirect_attempt_output(
+            transfer,
+            expanded,
+            metrics,
+            redirect,
+            retry_output.should_append(),
+        )?;
+        retry_output.record_retry_write(write, start)?;
+    }
+
     let start = retry_output.preserved_file_bytes;
     let write = write_http_attempt_output(
         transfer,
@@ -10520,6 +10568,77 @@ fn write_http_retry_attempt_output(
     retry_output.record_retry_write(write, start)
 }
 
+fn write_http_attempt_sequence_output(
+    transfer: &TransferConfig,
+    expanded: &glob::ExpandedUrl,
+    metrics: &mut writeout::Metrics,
+    attempt: &HttpAttempt,
+    persist_headers: bool,
+    append_output: bool,
+) -> Result<HttpAttemptWrite> {
+    let mut combined = HttpAttemptWrite {
+        max_filesize_exceeded: false,
+        body_bytes: 0,
+        output_bytes: 0,
+        output_path: None,
+    };
+    let mut append_next = append_output;
+
+    for redirect in &attempt.redirects {
+        if !transfer.include_headers && !transfer.head {
+            continue;
+        }
+        let write =
+            write_http_redirect_attempt_output(transfer, expanded, metrics, redirect, append_next)?;
+        append_next = append_next || write.output_bytes > 0;
+        combined.absorb(write);
+    }
+
+    let write = write_http_attempt_output(
+        transfer,
+        expanded,
+        &attempt.method,
+        metrics,
+        attempt,
+        persist_headers,
+        append_next,
+    )?;
+    combined.absorb(write);
+    Ok(combined)
+}
+
+fn write_http_redirect_attempt_output(
+    transfer: &TransferConfig,
+    expanded: &glob::ExpandedUrl,
+    metrics: &mut writeout::Metrics,
+    attempt: &HttpAttempt,
+    append_output: bool,
+) -> Result<HttpAttemptWrite> {
+    let header_bytes = http_attempt_header_bytes(attempt);
+    let mut output_path = None;
+    let mut output_bytes = 0;
+    if transfer.include_headers || transfer.head {
+        let filename = output::write_response(
+            transfer,
+            &attempt.final_url,
+            &attempt.headers,
+            &expanded.variables,
+            &header_bytes,
+            append_output || attempt.resume_from > 0,
+        )?;
+        output_bytes = header_bytes.len() as u64;
+        metrics.filename_effective = filename.as_ref().map(|path| path.display().to_string());
+        output_path = filename;
+    }
+
+    Ok(HttpAttemptWrite {
+        max_filesize_exceeded: false,
+        body_bytes: 0,
+        output_bytes,
+        output_path,
+    })
+}
+
 fn write_http_attempt_output(
     transfer: &TransferConfig,
     expanded: &glob::ExpandedUrl,
@@ -10529,12 +10648,7 @@ fn write_http_attempt_output(
     persist_headers: bool,
     append_output: bool,
 ) -> Result<HttpAttemptWrite> {
-    let header_bytes = attempt.header_bytes.clone().unwrap_or_else(|| {
-        attempt
-            .status
-            .map(|status| output::render_headers(attempt.version, status, &attempt.headers))
-            .unwrap_or_default()
-    });
+    let header_bytes = http_attempt_header_bytes(attempt);
     if persist_headers && let Some(path) = &transfer.dump_header {
         output::append_dump_headers(path, &header_bytes, transfer.create_dirs)?;
     }
@@ -10586,6 +10700,15 @@ fn write_http_attempt_output(
         body_bytes: body_bytes.len() as u64,
         output_bytes,
         output_path,
+    })
+}
+
+fn http_attempt_header_bytes(attempt: &HttpAttempt) -> Vec<u8> {
+    attempt.header_bytes.clone().unwrap_or_else(|| {
+        attempt
+            .status
+            .map(|status| output::render_headers(attempt.version, status, &attempt.headers))
+            .unwrap_or_default()
     })
 }
 
