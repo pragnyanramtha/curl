@@ -7270,7 +7270,7 @@ fn smtp_dot_stuffed_body(input: &[u8]) -> Vec<u8> {
         output.push(*byte);
         at_line_start = *byte == b'\n';
     }
-    if !input.ends_with(b"\r\n") {
+    if !input.is_empty() && !input.ends_with(b"\r\n") {
         output.extend_from_slice(b"\r\n");
     }
     output.extend_from_slice(b".\r\n");

@@ -5799,6 +5799,32 @@ fn smtp_upload_sends_mail_transaction_and_dot_stuffs_body() {
 }
 
 #[test]
+fn smtp_empty_upload_sends_only_data_terminator() {
+    let (url, rx) = spawn_smtp_server("/empty.example", b"250 empty.example\r\n", b"250 ok\r\n");
+
+    let mut command = Command::cargo_bin("curl").unwrap();
+    command.args([
+        "-q",
+        "-sS",
+        "--mail-from",
+        "sender@example.com",
+        "--mail-rcpt",
+        "recipient@example.com",
+        "-T",
+        "-",
+        &url,
+    ]);
+    command.assert().success().stdout("");
+
+    let record = rx.recv().unwrap();
+    assert_eq!(
+        record.commands,
+        b"EHLO empty.example\r\nMAIL FROM:<sender@example.com>\r\nRCPT TO:<recipient@example.com>\r\nDATA\r\nQUIT\r\n"
+    );
+    assert_eq!(record.upload, b".\r\n");
+}
+
+#[test]
 fn smtp_upload_file_adds_size_when_server_advertises_size() {
     let temp = tempdir().unwrap();
     let upload = temp.path().join("mail.txt");
