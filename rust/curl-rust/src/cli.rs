@@ -667,7 +667,7 @@ impl Parser {
             }
             "cookie" => {
                 let value = self.value_for(name, inline_value)?;
-                self.add_cookie_input(value);
+                self.add_cookie_input(value)?;
             }
             "cookie-jar" => {
                 let value = self.value_for(name, inline_value)?;
@@ -914,7 +914,7 @@ impl Parser {
                 }
                 'b' => {
                     let value = self.short_value('b', rest)?;
-                    self.add_cookie_input(value);
+                    self.add_cookie_input(value)?;
                     break;
                 }
                 'c' => {
@@ -986,12 +986,13 @@ impl Parser {
             .expect("parser always has a current transfer")
     }
 
-    fn add_cookie_input(&mut self, value: String) {
+    fn add_cookie_input(&mut self, value: String) -> Result<()> {
         if value.contains('=') {
-            append_cookie_header(&mut self.current().cookie, value);
+            append_cookie_header(&mut self.current().cookie, value)?;
         } else {
             self.current().cookie_files.push(value);
         }
+        Ok(())
     }
 
     fn add_ftp_quote(&mut self, value: String) {
@@ -1678,14 +1679,33 @@ fn warn_deprecated_ssl_option(name: &str) {
     eprintln!("Warning: --{name} is deprecated and has no function anymore");
 }
 
-fn append_cookie_header(cookie: &mut Option<String>, value: String) {
+const MAX_LITERAL_COOKIE_HEADER_LEN: usize = 8200;
+
+fn append_cookie_header(cookie: &mut Option<String>, value: String) -> Result<()> {
     if let Some(existing) = cookie {
         if !existing.is_empty() && !value.is_empty() {
-            existing.push_str("; ");
+            existing.push(';');
+            if !value
+                .as_bytes()
+                .first()
+                .is_some_and(u8::is_ascii_whitespace)
+            {
+                existing.push(' ');
+            }
         }
         existing.push_str(&value);
     } else {
         *cookie = Some(value);
+    }
+    if cookie
+        .as_ref()
+        .is_some_and(|cookie| cookie.len() > MAX_LITERAL_COOKIE_HEADER_LEN)
+    {
+        Err(CurlError::Usage(
+            "option --cookie literal cookie header is too long".to_string(),
+        ))
+    } else {
+        Ok(())
     }
 }
 
@@ -3056,6 +3076,14 @@ mod tests {
             transfer.cookie_files,
             vec!["cookies.txt".to_string(), "".to_string()]
         );
+    }
+
+    #[test]
+    fn rejects_literal_cookie_header_over_cap() {
+        let cookie = format!("name={}", "x".repeat(MAX_LITERAL_COOKIE_HEADER_LEN));
+        let error = parse_args(["-q", "-b", &cookie, "https://example.com"]).unwrap_err();
+
+        assert!(error.to_string().contains("cookie"));
     }
 
     #[test]

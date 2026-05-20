@@ -8825,6 +8825,25 @@ fn cookie_header_appends_repeated_literals() {
         header(&request, "cookie"),
         Some("name=contents;name2=content2; name3=content3")
     );
+
+    let (url, rx) = spawn_server(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok");
+    let mut command = Command::cargo_bin("curl").unwrap();
+    command.args([
+        "-q",
+        "-sS",
+        "-b",
+        "name=contents",
+        "-b",
+        " name2=content2",
+        &url,
+    ]);
+    command.assert().success().stdout("ok");
+
+    let request = rx.recv().unwrap();
+    assert_eq!(
+        header(&request, "cookie"),
+        Some("name=contents; name2=content2")
+    );
 }
 
 #[test]
