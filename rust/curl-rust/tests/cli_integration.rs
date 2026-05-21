@@ -282,12 +282,16 @@ struct FtpServerOptions {
     pasv_reply: Option<&'static [u8]>,
     pasv_host: [u8; 4],
     login_denied: bool,
+    pass_requires_acct: bool,
+    user_requires_acct: bool,
+    acct_reply: &'static [u8],
     pwd_denied: bool,
     cwd_denied: bool,
     missing_directories: Vec<&'static str>,
     mkd_denied: bool,
     type_denied: bool,
     rest_denied: bool,
+    pret_reply: Option<&'static [u8]>,
     retr_denied: bool,
     stor_denied: bool,
     stor_final: &'static [u8],
@@ -641,12 +645,16 @@ fn ftp_options(data: impl Into<Vec<u8>>) -> FtpServerOptions {
         pasv_reply: None,
         pasv_host: [127, 0, 0, 1],
         login_denied: false,
+        pass_requires_acct: false,
+        user_requires_acct: false,
+        acct_reply: b"230 Account accepted\r\n",
         pwd_denied: false,
         cwd_denied: false,
         missing_directories: Vec::new(),
         mkd_denied: false,
         type_denied: false,
         rest_denied: false,
+        pret_reply: None,
         retr_denied: false,
         stor_denied: false,
         stor_final: b"226 Transfer complete\r\n",
@@ -699,9 +707,19 @@ fn spawn_ftp_server_with_listener(
                     stream.write_all(b"530 Login incorrect\r\n").unwrap();
                     break;
                 }
+                if options.user_requires_acct {
+                    stream.write_all(b"332 Account required\r\n").unwrap();
+                    continue;
+                }
                 stream.write_all(b"331 Password required\r\n").unwrap();
             } else if command.starts_with("PASS ") {
-                stream.write_all(b"230 Login successful\r\n").unwrap();
+                if options.pass_requires_acct {
+                    stream.write_all(b"332 Account required\r\n").unwrap();
+                } else {
+                    stream.write_all(b"230 Login successful\r\n").unwrap();
+                }
+            } else if command.starts_with("ACCT ") {
+                stream.write_all(options.acct_reply).unwrap();
             } else if command == "PWD" {
                 if options.pwd_denied {
                     stream.write_all(b"500 PWD failed\r\n").unwrap();
@@ -808,6 +826,10 @@ fn spawn_ftp_server_with_listener(
                 restart_offset = offset.parse::<usize>().unwrap();
                 stream
                     .write_all(format!("350 Restarting at {restart_offset}\r\n").as_bytes())
+                    .unwrap();
+            } else if command.starts_with("PRET ") {
+                stream
+                    .write_all(options.pret_reply.unwrap_or(b"200 PRET ok\r\n"))
                     .unwrap();
             } else if command.starts_with("RETR ")
                 || command == "LIST"
@@ -962,6 +984,46 @@ fn spawn_pop3_auth_plain_server(
                 command_response
             };
             stream.write_all(response).unwrap();
+        }
+
+        tx.send(commands).unwrap();
+    });
+
+    (format!("pop3://{addr}{path}"), rx)
+}
+
+fn spawn_pop3_sasl_server(
+    path: &str,
+    mechanisms: &'static str,
+    auth_steps: Vec<(&'static str, &'static [u8])>,
+    command_response: &'static [u8],
+) -> (String, Receiver<Vec<u8>>) {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = listener.local_addr().unwrap();
+    let (tx, rx) = mpsc::channel();
+    let capabilities = format!("+OK capabilities\r\nSASL {mechanisms}\r\n.\r\n").into_bytes();
+
+    thread::spawn(move || {
+        let (mut stream, _) = listener.accept().unwrap();
+        stream.write_all(b"+OK curl POP3 test server\r\n").unwrap();
+
+        let mut commands = Vec::new();
+        while let Some(line) = read_pop3_client_line(&mut stream) {
+            commands.extend_from_slice(&line);
+            let command = String::from_utf8_lossy(&line);
+            let command = command.trim_end_matches(['\r', '\n']);
+            if command == "CAPA" {
+                stream.write_all(&capabilities).unwrap();
+            } else if command == "QUIT" {
+                let _ = stream.write_all(b"+OK bye\r\n");
+                break;
+            } else if let Some((_, response)) =
+                auth_steps.iter().find(|(expected, _)| *expected == command)
+            {
+                stream.write_all(response).unwrap();
+            } else {
+                stream.write_all(command_response).unwrap();
+            }
         }
 
         tx.send(commands).unwrap();
@@ -5901,6 +5963,90 @@ fn ftp_retr_downloads_file_and_sends_default_sequence() {
 }
 
 #[test]
+fn ftp_account_is_sent_after_pass_requests_it() {
+    let mut options = ftp_options(b"acct download");
+    options.pass_requires_acct = true;
+    let (url, rx) = spawn_ftp_server("/228", options);
+
+    let mut command = Command::cargo_bin("curl").unwrap();
+    command.args(["-q", "-sS", "--ftp-account", "one count", &url]);
+    command.assert().success().stdout("acct download");
+
+    let record = rx.recv().unwrap();
+    assert_eq!(
+        record.commands,
+        b"USER anonymous\r\nPASS ftp@example.com\r\nACCT one count\r\nPWD\r\nEPSV\r\nTYPE I\r\nSIZE 228\r\nRETR 228\r\nQUIT\r\n"
+    );
+    assert_eq!(record.data_connections, 1);
+}
+
+#[test]
+fn ftp_account_is_only_sent_when_pass_returns_332() {
+    let (url, rx) = spawn_ftp_server("/file.txt", ftp_options(b"no acct needed"));
+
+    let mut command = Command::cargo_bin("curl").unwrap();
+    command.args(["-q", "-sS", "--ftp-account", "unused", &url]);
+    command.assert().success().stdout("no acct needed");
+
+    assert_eq!(
+        rx.recv().unwrap().commands,
+        b"USER anonymous\r\nPASS ftp@example.com\r\nPWD\r\nEPSV\r\nTYPE I\r\nSIZE file.txt\r\nRETR file.txt\r\nQUIT\r\n"
+    );
+}
+
+#[test]
+fn ftp_account_missing_after_pass_332_returns_login_denied() {
+    let mut options = ftp_options(Vec::new());
+    options.pass_requires_acct = true;
+    let (url, rx) = spawn_ftp_server("/295/", options);
+
+    let mut command = Command::cargo_bin("curl").unwrap();
+    command.args(["-q", "-sS", &url]);
+    command.assert().failure().code(67).stdout("");
+
+    assert_eq!(
+        rx.recv().unwrap().commands,
+        b"USER anonymous\r\nPASS ftp@example.com\r\n"
+    );
+}
+
+#[test]
+fn ftp_account_is_sent_after_user_requests_it() {
+    let mut options = ftp_options(b"user acct download");
+    options.user_requires_acct = true;
+    let (url, rx) = spawn_ftp_server("/acct-user.txt", options);
+
+    let mut command = Command::cargo_bin("curl").unwrap();
+    command.args(["-q", "-sS", "--ftp-account", "direct acct", &url]);
+    command.assert().success().stdout("user acct download");
+
+    let record = rx.recv().unwrap();
+    assert_eq!(
+        record.commands,
+        b"USER anonymous\r\nACCT direct acct\r\nPWD\r\nEPSV\r\nTYPE I\r\nSIZE acct-user.txt\r\nRETR acct-user.txt\r\nQUIT\r\n"
+    );
+    assert_eq!(record.data_connections, 1);
+}
+
+#[test]
+fn ftp_account_directory_listing_matches_acct_corpus() {
+    let mut options = ftp_options(b"listing");
+    options.pass_requires_acct = true;
+    let (url, rx) = spawn_ftp_server("/294/", options);
+
+    let mut command = Command::cargo_bin("curl").unwrap();
+    command.args(["-q", "-sS", "--ftp-account", "data for acct", &url]);
+    command.assert().success().stdout("listing");
+
+    let record = rx.recv().unwrap();
+    assert_eq!(
+        record.commands,
+        b"USER anonymous\r\nPASS ftp@example.com\r\nACCT data for acct\r\nPWD\r\nCWD 294\r\nEPSV\r\nTYPE A\r\nLIST\r\nQUIT\r\n"
+    );
+    assert_eq!(record.data_connections, 1);
+}
+
+#[test]
 fn ftp_ignore_content_length_skips_size_before_retr() {
     let body = b"0123456789abcdef0123456789abcdef0123456789abcdef";
     let mut options = ftp_options(body.as_slice());
@@ -5937,6 +6083,40 @@ fn ftp_ignore_content_length_pasv_fallback_skips_size_before_retr() {
         b"USER anonymous\r\nPASS ftp@example.com\r\nPWD\r\nEPSV\r\nPASV\r\nTYPE I\r\nRETR 1137\r\nQUIT\r\n"
     );
     assert_eq!(record.data_connections, 1);
+}
+
+#[test]
+fn ftp_pret_is_sent_before_passive_setup_for_downloads() {
+    let (url, rx) = spawn_ftp_server("/1107", ftp_options(b"pret download"));
+
+    let mut command = Command::cargo_bin("curl").unwrap();
+    command.args(["-q", "-sS", "--ftp-pret", &url]);
+    command.assert().success().stdout("pret download");
+
+    let record = rx.recv().unwrap();
+    assert_eq!(
+        record.commands,
+        b"USER anonymous\r\nPASS ftp@example.com\r\nPWD\r\nPRET RETR 1107\r\nEPSV\r\nTYPE I\r\nSIZE 1107\r\nRETR 1107\r\nQUIT\r\n"
+    );
+    assert_eq!(record.data_connections, 1);
+}
+
+#[test]
+fn ftp_pret_failure_returns_84_without_passive_setup() {
+    let mut options = ftp_options(Vec::new());
+    options.pret_reply = Some(b"550 unknown command\r\n");
+    let (url, rx) = spawn_ftp_server("/1108", options);
+
+    let mut command = Command::cargo_bin("curl").unwrap();
+    command.args(["-q", "-sS", "--ftp-pret", &url]);
+    command.assert().failure().code(84).stdout("");
+
+    let record = rx.recv().unwrap();
+    assert_eq!(
+        record.commands,
+        b"USER anonymous\r\nPASS ftp@example.com\r\nPWD\r\nPRET RETR 1108\r\n"
+    );
+    assert_eq!(record.data_connections, 0);
 }
 
 #[test]
@@ -6298,6 +6478,53 @@ fn ftp_upload_file_sends_stor_and_body() {
         b"USER anonymous\r\nPASS ftp@example.com\r\nPWD\r\nEPSV\r\nTYPE I\r\nSTOR target.txt\r\nQUIT\r\n"
     );
     assert_eq!(record.upload, b"uploaded over ftp\n");
+    assert_eq!(record.data_connections, 1);
+}
+
+#[test]
+fn ftp_upload_crlf_converts_lf_without_type_a() {
+    let temp = tempdir().unwrap();
+    let upload = temp.path().join("payload.txt");
+    std::fs::write(&upload, b"one\ntwo\r\nthree\n").unwrap();
+    let (url, rx) = spawn_ftp_server("/128", ftp_options(Vec::new()));
+
+    let mut command = Command::cargo_bin("curl").unwrap();
+    command.args(["-q", "-sS", "--crlf", "-T", upload.to_str().unwrap(), &url]);
+    command.assert().success().stdout("");
+
+    let record = rx.recv().unwrap();
+    assert_eq!(
+        record.commands,
+        b"USER anonymous\r\nPASS ftp@example.com\r\nPWD\r\nEPSV\r\nTYPE I\r\nSTOR 128\r\nQUIT\r\n"
+    );
+    assert_eq!(record.upload, b"one\r\ntwo\r\nthree\r\n");
+    assert_eq!(record.data_connections, 1);
+}
+
+#[test]
+fn ftp_upload_pret_sends_pret_stor_before_passive_setup() {
+    let temp = tempdir().unwrap();
+    let upload = temp.path().join("payload.txt");
+    std::fs::write(&upload, b"pret upload").unwrap();
+    let (url, rx) = spawn_ftp_server("/upload.txt", ftp_options(Vec::new()));
+
+    let mut command = Command::cargo_bin("curl").unwrap();
+    command.args([
+        "-q",
+        "-sS",
+        "--ftp-pret",
+        "-T",
+        upload.to_str().unwrap(),
+        &url,
+    ]);
+    command.assert().success().stdout("");
+
+    let record = rx.recv().unwrap();
+    assert_eq!(
+        record.commands,
+        b"USER anonymous\r\nPASS ftp@example.com\r\nPWD\r\nPRET STOR upload.txt\r\nEPSV\r\nTYPE I\r\nSTOR upload.txt\r\nQUIT\r\n"
+    );
+    assert_eq!(record.upload, b"pret upload");
     assert_eq!(record.data_connections, 1);
 }
 
@@ -7453,6 +7680,155 @@ fn pop3_auth_plain_without_sasl_ir_when_advertised() {
 }
 
 #[test]
+fn pop3_auth_login_when_advertised() {
+    let (url, rx) = spawn_pop3_sasl_server(
+        "/866",
+        "LOGIN",
+        vec![
+            ("AUTH LOGIN", b"+ VXNlcm5hbWU6\r\n"),
+            ("dXNlcg==", b"+ UGFzc3dvcmQ6\r\n"),
+            ("c2VjcmV0", b"+OK Login successful\r\n"),
+        ],
+        b"+OK message follows\r\nhello\r\n.\r\n",
+    );
+
+    let mut command = Command::cargo_bin("curl").unwrap();
+    command.args(["-q", "-sS", "-u", "user:secret", &url]);
+    command.assert().success().stdout("hello\r\n");
+
+    assert_eq!(
+        rx.recv().unwrap(),
+        b"CAPA\r\nAUTH LOGIN\r\ndXNlcg==\r\nc2VjcmV0\r\nRETR 866\r\nQUIT\r\n"
+    );
+}
+
+#[test]
+fn pop3_auth_plain_with_sasl_ir() {
+    let (url, rx) = spawn_pop3_sasl_server(
+        "/871",
+        "PLAIN",
+        vec![("AUTH PLAIN AHVzZXIAc2VjcmV0", b"+OK Login successful\r\n")],
+        b"+OK message follows\r\nhello\r\n.\r\n",
+    );
+
+    let mut command = Command::cargo_bin("curl").unwrap();
+    command.args(["-q", "-sS", "-u", "user:secret", "--sasl-ir", &url]);
+    command.assert().success().stdout("hello\r\n");
+
+    assert_eq!(
+        rx.recv().unwrap(),
+        b"CAPA\r\nAUTH PLAIN AHVzZXIAc2VjcmV0\r\nRETR 871\r\nQUIT\r\n"
+    );
+}
+
+#[test]
+fn pop3_auth_login_with_sasl_ir() {
+    let (url, rx) = spawn_pop3_sasl_server(
+        "/872",
+        "LOGIN",
+        vec![
+            ("AUTH LOGIN dXNlcg==", b"+ UGFzc3dvcmQ6\r\n"),
+            ("c2VjcmV0", b"+OK Login successful\r\n"),
+        ],
+        b"+OK message follows\r\nhello\r\n.\r\n",
+    );
+
+    let mut command = Command::cargo_bin("curl").unwrap();
+    command.args(["-q", "-sS", "-u", "user:secret", "--sasl-ir", &url]);
+    command.assert().success().stdout("hello\r\n");
+
+    assert_eq!(
+        rx.recv().unwrap(),
+        b"CAPA\r\nAUTH LOGIN dXNlcg==\r\nc2VjcmV0\r\nRETR 872\r\nQUIT\r\n"
+    );
+}
+
+#[test]
+fn pop3_plain_auth_uses_authzid() {
+    let (url, rx) = spawn_pop3_sasl_server(
+        "/892",
+        "PLAIN",
+        vec![
+            ("AUTH PLAIN", b"+\r\n"),
+            (
+                "c2hhcmVkLW1haWxib3gAdXNlcgBzZWNyZXQ=",
+                b"+OK Login successful\r\n",
+            ),
+        ],
+        b"+OK message follows\r\nhello\r\n.\r\n",
+    );
+
+    let mut command = Command::cargo_bin("curl").unwrap();
+    command.args([
+        "-q",
+        "-sS",
+        "-u",
+        "user:secret",
+        "--sasl-authzid",
+        "shared-mailbox",
+        &url,
+    ]);
+    command.assert().success().stdout("hello\r\n");
+
+    assert_eq!(
+        rx.recv().unwrap(),
+        b"CAPA\r\nAUTH PLAIN\r\nc2hhcmVkLW1haWxib3gAdXNlcgBzZWNyZXQ=\r\nRETR 892\r\nQUIT\r\n"
+    );
+}
+
+#[test]
+fn pop3_plain_authzid_denial_returns_login_denied() {
+    let (url, rx) = spawn_pop3_sasl_server(
+        "/893",
+        "PLAIN",
+        vec![
+            ("AUTH PLAIN", b"+\r\n"),
+            ("dXJzZWwAa3VydAB4aXBqM3BsbXE=", b"-ERR Not authorized\r\n"),
+        ],
+        b"-ERR unexpected command\r\n",
+    );
+
+    let mut command = Command::cargo_bin("curl").unwrap();
+    command.args([
+        "-q",
+        "-sS",
+        "-u",
+        "kurt:xipj3plmq",
+        "--sasl-authzid",
+        "ursel",
+        &url,
+    ]);
+    command.assert().failure().code(67).stdout("");
+
+    assert_eq!(
+        rx.recv().unwrap(),
+        b"CAPA\r\nAUTH PLAIN\r\ndXJzZWwAa3VydAB4aXBqM3BsbXE=\r\n"
+    );
+}
+
+#[test]
+fn pop3_sasl_authzid_does_not_change_user_pass_fallback() {
+    let (url, rx) = spawn_pop3_server("/42", b"+OK message follows\r\nhello\r\n.\r\n");
+
+    let mut command = Command::cargo_bin("curl").unwrap();
+    command.args([
+        "-q",
+        "-sS",
+        "-u",
+        "user:secret",
+        "--sasl-authzid",
+        "shared-mailbox",
+        &url,
+    ]);
+    command.assert().success().stdout("hello\r\n");
+
+    assert_eq!(
+        rx.recv().unwrap(),
+        b"CAPA\r\nUSER user\r\nPASS secret\r\nRETR 42\r\nQUIT\r\n"
+    );
+}
+
+#[test]
 fn pop3_cram_md5_authenticates_when_advertised() {
     let (url, rx) = spawn_pop3_cram_md5_server("/867", b"+OK message follows\r\nhello\r\n.\r\n");
 
@@ -8022,6 +8398,43 @@ fn smtp_upload_file_adds_size_when_server_advertises_size() {
         b"EHLO size.example\r\nMAIL FROM:<sender@example.com> RET=HDRS SIZE=21\r\nRCPT TO:<recipient@example.com> NOTIFY=SUCCESS,FAILURE\r\nDATA\r\nQUIT\r\n"
     );
     assert_eq!(record.upload, b"Subject: hi\r\n\r\nbody\r\n.\r\n");
+}
+
+#[test]
+fn smtp_crlf_converts_lf_before_size_and_dot_stuffing() {
+    let temp = tempdir().unwrap();
+    let upload = temp.path().join("mail.txt");
+    std::fs::write(&upload, b"Subject: hi\nAlready: ok\r\n.body\ntrail").unwrap();
+    let (url, rx) = spawn_smtp_server(
+        "/crlf.example",
+        b"250-crlf.example\r\n250 SIZE\r\n",
+        b"250 ok\r\n",
+    );
+
+    let mut command = Command::cargo_bin("curl").unwrap();
+    command.args([
+        "-q",
+        "-sS",
+        "--crlf",
+        "--mail-from",
+        "sender@example.com",
+        "--mail-rcpt",
+        "recipient@example.com",
+        "-T",
+        upload.to_str().unwrap(),
+        &url,
+    ]);
+    command.assert().success().stdout("");
+
+    let record = rx.recv().unwrap();
+    assert_eq!(
+        record.commands,
+        b"EHLO crlf.example\r\nMAIL FROM:<sender@example.com> SIZE=36\r\nRCPT TO:<recipient@example.com>\r\nDATA\r\nQUIT\r\n"
+    );
+    assert_eq!(
+        record.upload,
+        b"Subject: hi\r\nAlready: ok\r\n..body\r\ntrail\r\n.\r\n"
+    );
 }
 
 #[test]
@@ -13072,6 +13485,7 @@ fn libcurl_writes_smtp_mail_options() {
             "--mail-rcpt",
             "two@example.com",
             "--mail-rcpt-allowfails",
+            "--crlf",
             "-T",
             "-",
             &url,
@@ -13091,6 +13505,7 @@ fn libcurl_writes_smtp_mail_options() {
     assert!(text.contains("curl_slist_append(slist1, \"two@example.com\");"));
     assert!(text.contains("CURLOPT_MAIL_RCPT, slist1"));
     assert!(text.contains("CURLOPT_MAIL_RCPT_ALLOWFAILS, 1"));
+    assert!(text.contains("CURLOPT_CRLF, 1"));
 }
 
 #[test]
@@ -13207,6 +13622,36 @@ fn libcurl_writes_ftp_passive_options() {
     let text = std::fs::read_to_string(source).unwrap();
     assert!(text.contains("CURLOPT_FTP_USE_EPSV, 0L"));
     assert!(text.contains("CURLOPT_FTP_SKIP_PASV_IP, 1L"));
+}
+
+#[test]
+fn libcurl_writes_ftp_account_and_pret_options() {
+    let temp = tempdir().unwrap();
+    let source = temp.path().join("ftp-auth-client.c");
+    let mut options = ftp_options(b"acct pret");
+    options.pass_requires_acct = true;
+    let (url, rx) = spawn_ftp_server("/file.txt", options);
+
+    let mut command = Command::cargo_bin("curl").unwrap();
+    command.args([
+        "-q",
+        "-sS",
+        "--libcurl",
+        source.to_str().unwrap(),
+        "--ftp-account",
+        "one count",
+        "--ftp-pret",
+        &url,
+    ]);
+    command.assert().success().stdout("acct pret");
+
+    assert_eq!(
+        rx.recv().unwrap().commands,
+        b"USER anonymous\r\nPASS ftp@example.com\r\nACCT one count\r\nPWD\r\nPRET RETR file.txt\r\nEPSV\r\nTYPE I\r\nSIZE file.txt\r\nRETR file.txt\r\nQUIT\r\n"
+    );
+    let text = std::fs::read_to_string(source).unwrap();
+    assert!(text.contains("CURLOPT_FTP_ACCOUNT, \"one count\""));
+    assert!(text.contains("CURLOPT_FTP_USE_PRET, 1L"));
 }
 
 #[test]

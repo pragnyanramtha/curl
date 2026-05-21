@@ -46,8 +46,12 @@ pub enum CurlError {
     FtpWeird227Format,
     #[error("FTP could not set transfer type")]
     FtpCouldntSetType,
+    #[error("FTP: unknown PASS reply")]
+    FtpWeirdPassReply,
     #[error("FTP could not retrieve file")]
     FtpCouldntRetrFile,
+    #[error("FTP: The server did not accept the PRET command.")]
+    FtpPretFailed,
     #[error("FTP upload failed")]
     FtpUploadFailed,
     #[error("FTP: command REST failed")]
@@ -139,7 +143,9 @@ impl CurlError {
             Self::FtpWeirdPasvReply => 13,
             Self::FtpWeird227Format => 14,
             Self::FtpCouldntSetType => 17,
+            Self::FtpWeirdPassReply => 11,
             Self::FtpCouldntRetrFile => 19,
+            Self::FtpPretFailed => 84,
             Self::FtpUploadFailed => 25,
             Self::FtpCouldntUseRest => 31,
             Self::QuoteError => 21,

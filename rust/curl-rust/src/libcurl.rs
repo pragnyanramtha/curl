@@ -282,6 +282,9 @@ fn write_request(out: &mut String, render: &RenderTransfer<'_>, url: &str) -> Re
     if transfer.list_only {
         emit_long_setopt(out, "CURLOPT_DIRLISTONLY", 1);
     }
+    if let Some(account) = &transfer.ftp_account {
+        emit_string_setopt(out, "CURLOPT_FTP_ACCOUNT", account);
+    }
     if transfer.ftp_create_dirs {
         emit_raw_setopt(
             out,
@@ -301,6 +304,9 @@ fn write_request(out: &mut String, render: &RenderTransfer<'_>, url: &str) -> Re
             "CURLOPT_FTP_SKIP_PASV_IP",
             if skip_pasv_ip { 1 } else { 0 },
         );
+    }
+    if transfer.ftp_pret {
+        emit_long_setopt(out, "CURLOPT_FTP_USE_PRET", 1);
     }
     if let Some(slist) = &render.quote_slist {
         emit_raw_setopt(out, "CURLOPT_QUOTE", slist);
@@ -352,6 +358,9 @@ fn write_request(out: &mut String, render: &RenderTransfer<'_>, url: &str) -> Re
     }
     if transfer.mail_rcpt_allowfails {
         emit_long_setopt(out, "CURLOPT_MAIL_RCPT_ALLOWFAILS", 1);
+    }
+    if transfer.crlf {
+        emit_long_setopt(out, "CURLOPT_CRLF", 1);
     }
     if let Some(blksize) = transfer.tftp_blksize {
         emit_long_setopt(out, "CURLOPT_TFTP_BLKSIZE", i64::from(blksize));
@@ -408,6 +417,12 @@ fn write_request(out: &mut String, render: &RenderTransfer<'_>, url: &str) -> Re
     }
     if let Some(expr) = transfer.http_auth.to_curlauth_expr() {
         emit_raw_setopt(out, "CURLOPT_HTTPAUTH", &curlauth_setopt_value(&expr));
+    }
+    if transfer.sasl_ir {
+        emit_long_setopt(out, "CURLOPT_SASL_IR", 1);
+    }
+    if let Some(authzid) = &transfer.sasl_authzid {
+        emit_string_setopt(out, "CURLOPT_SASL_AUTHZID", authzid);
     }
     if let Some(private_key) = &transfer.ssh_private_key {
         emit_path_setopt(out, "CURLOPT_SSH_PRIVATE_KEYFILE", private_key);
@@ -1506,6 +1521,25 @@ mod tests {
 
         assert!(source.contains("CURLOPT_XOAUTH2_BEARER, \"token123\""));
         assert!(source.contains("CURLOPT_HTTPAUTH, (long)CURLAUTH_BEARER"));
+    }
+
+    #[test]
+    fn renders_sasl_options() {
+        let config = parse_args([
+            "-q",
+            "--libcurl",
+            "client.c",
+            "--sasl-ir",
+            "--sasl-authzid",
+            "shared-mailbox",
+            "pop3://example.com/1",
+        ])
+        .unwrap();
+
+        let source = render_source(&config).unwrap();
+
+        assert!(source.contains("CURLOPT_SASL_IR, 1L"));
+        assert!(source.contains("CURLOPT_SASL_AUTHZID, \"shared-mailbox\""));
     }
 
     #[test]

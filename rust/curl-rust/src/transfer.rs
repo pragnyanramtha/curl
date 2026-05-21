@@ -1495,6 +1495,7 @@ async fn run_ftp_exchange(
         ));
     }
     let (user, password) = ftp_credentials(transfer, &url)?;
+    let account = ftp_account_bytes(transfer)?;
     let resume_from = if upload.is_none() {
         resume_offset(
             transfer,
@@ -1518,13 +1519,32 @@ async fn run_ftp_exchange(
             ftp_command(&mut stream, &user_command, metrics, &mut control_headers).await?;
         match response.code {
             230 => {}
+            332 => {
+                ftp_send_acct(
+                    &mut stream,
+                    account.as_deref(),
+                    metrics,
+                    &mut control_headers,
+                )
+                .await?;
+            }
             331 => {
                 let mut pass_command = Vec::from(&b"PASS "[..]);
                 pass_command.extend_from_slice(&password);
                 let response =
                     ftp_command(&mut stream, &pass_command, metrics, &mut control_headers).await?;
-                if response.code != 230 {
-                    return Err(CurlError::LoginDenied);
+                match response.code {
+                    230 => {}
+                    332 => {
+                        ftp_send_acct(
+                            &mut stream,
+                            account.as_deref(),
+                            metrics,
+                            &mut control_headers,
+                        )
+                        .await?;
+                    }
+                    _ => return Err(CurlError::LoginDenied),
                 }
             }
             _ => return Err(CurlError::LoginDenied),
@@ -1602,7 +1622,10 @@ async fn run_ftp_exchange(
         }
     };
 
-    if matches!(transfer_result, Err(CurlError::FtpWeird227Format)) {
+    if matches!(
+        transfer_result,
+        Err(CurlError::FtpPretFailed | CurlError::FtpWeird227Format)
+    ) {
         return transfer_result;
     }
 
@@ -1834,10 +1857,11 @@ async fn ftp_download_body(
     control_headers: &mut Vec<u8>,
     resume_from: u64,
 ) -> Result<FtpDownloadBody> {
-    let mut data_stream =
-        ftp_open_passive_data(transfer, stream, host, metrics, control_headers).await?;
     let list_only = ftp_effective_list_only(transfer, path);
     let ascii = ftp_effective_ascii(transfer, path);
+    ftp_send_pret(transfer, stream, path, list_only, metrics, control_headers).await?;
+    let mut data_stream =
+        ftp_open_passive_data(transfer, stream, host, metrics, control_headers).await?;
     ftp_set_type(
         stream,
         if ascii { b'A' } else { b'I' },
@@ -2041,6 +2065,7 @@ async fn ftp_upload_body(
         .file
         .as_ref()
         .ok_or_else(|| CurlError::Url("FTP upload requires a remote filename".to_string()))?;
+    ftp_send_upload_pret(transfer, stream, file, metrics, control_headers).await?;
     let mut data_stream =
         ftp_open_passive_data(transfer, stream, host, metrics, control_headers).await?;
     let ascii = ftp_effective_ascii(transfer, path);
@@ -2079,7 +2104,7 @@ async fn ftp_upload_body(
     }
     let body = upload.get(offset..).unwrap_or_default();
     let ascii_body;
-    let body = if ascii {
+    let body = if ascii || transfer.crlf {
         ascii_body = ftp_ascii_upload_body(body);
         ascii_body.as_slice()
     } else {
@@ -2173,6 +2198,58 @@ fn ftp_transfer_command(path: &FtpPath, list_only: bool) -> Vec<u8> {
     } else {
         ftp_list_command(b"LIST", path.list_argument.as_deref())
     }
+}
+
+async fn ftp_send_pret(
+    transfer: &TransferConfig,
+    stream: &mut TcpStream,
+    path: &FtpPath,
+    list_only: bool,
+    metrics: &mut writeout::Metrics,
+    control_headers: &mut Vec<u8>,
+) -> Result<()> {
+    if !transfer.ftp_pret {
+        return Ok(());
+    }
+
+    let pret_target = if let Some(file) = &path.file {
+        let mut target = Vec::from(&b"RETR "[..]);
+        target.extend_from_slice(file);
+        target
+    } else if list_only {
+        b"NLST".to_vec()
+    } else {
+        b"LIST".to_vec()
+    };
+    ftp_send_pret_target(stream, pret_target, metrics, control_headers).await
+}
+
+async fn ftp_send_upload_pret(
+    transfer: &TransferConfig,
+    stream: &mut TcpStream,
+    file: &[u8],
+    metrics: &mut writeout::Metrics,
+    control_headers: &mut Vec<u8>,
+) -> Result<()> {
+    if !transfer.ftp_pret {
+        return Ok(());
+    }
+
+    let mut pret_target = Vec::from(&b"STOR "[..]);
+    pret_target.extend_from_slice(file);
+    ftp_send_pret_target(stream, pret_target, metrics, control_headers).await
+}
+
+async fn ftp_send_pret_target(
+    stream: &mut TcpStream,
+    pret_target: Vec<u8>,
+    metrics: &mut writeout::Metrics,
+    control_headers: &mut Vec<u8>,
+) -> Result<()> {
+    let mut command = Vec::from(&b"PRET "[..]);
+    command.extend_from_slice(&pret_target);
+    let response = ftp_command(stream, &command, metrics, control_headers).await?;
+    ftp_require_code(&response, &[200], CurlError::FtpPretFailed)
 }
 
 fn ftp_list_command(command: &[u8], argument: Option<&[u8]>) -> Vec<u8> {
@@ -2530,6 +2607,37 @@ fn ftp_credentials(transfer: &TransferConfig, url: &Url) -> Result<(Vec<u8>, Vec
     }
 
     Ok((b"anonymous".to_vec(), b"ftp@example.com".to_vec()))
+}
+
+fn ftp_account_bytes(transfer: &TransferConfig) -> Result<Option<Vec<u8>>> {
+    let Some(account) = &transfer.ftp_account else {
+        return Ok(None);
+    };
+    let account = account.as_bytes().to_vec();
+    if has_control_byte(&account) {
+        return Err(CurlError::Url(
+            "FTP account data contains a decoded control byte".to_string(),
+        ));
+    }
+    Ok(Some(account))
+}
+
+async fn ftp_send_acct(
+    stream: &mut TcpStream,
+    account: Option<&[u8]>,
+    metrics: &mut writeout::Metrics,
+    control_headers: &mut Vec<u8>,
+) -> Result<()> {
+    let Some(account) = account else {
+        return Err(CurlError::LoginDenied);
+    };
+    let mut acct_command = Vec::from(&b"ACCT "[..]);
+    acct_command.extend_from_slice(account);
+    let response = ftp_command(stream, &acct_command, metrics, control_headers).await?;
+    if response.code != 230 {
+        return Err(CurlError::FtpWeirdPassReply);
+    }
+    Ok(())
 }
 
 fn ftp_size_value(response: &FtpResponse) -> Option<u64> {
@@ -4226,14 +4334,14 @@ async fn run_pop3_exchange(
     if capabilities.auth_cram_md5 {
         match pop3_auth_cram_md5(&mut stream, &user, &password).await? {
             Pop3AuthResult::Done => {}
-            Pop3AuthResult::TryNext if capabilities.auth_plain => {
-                pop3_auth_plain(&mut stream, &user, &password).await?;
+            Pop3AuthResult::TryNext => {
+                pop3_auth_plain_or_login(&mut stream, transfer, &capabilities, &user, &password)
+                    .await?;
             }
-            Pop3AuthResult::TryNext => return Err(CurlError::LoginDenied),
             Pop3AuthResult::Denied => return Err(CurlError::LoginDenied),
         }
-    } else if capabilities.auth_plain {
-        pop3_auth_plain(&mut stream, &user, &password).await?;
+    } else if capabilities.auth_plain || capabilities.auth_login {
+        pop3_auth_plain_or_login(&mut stream, transfer, &capabilities, &user, &password).await?;
     } else {
         let mut user_command = Vec::from(&b"USER "[..]);
         user_command.extend_from_slice(&user);
@@ -4345,6 +4453,15 @@ async fn run_smtp_exchange(
         .as_deref()
         .map(data::read_upload_body)
         .transpose()?;
+    let upload = upload.map(|body| {
+        let original_len = body.len();
+        let body = if transfer.crlf {
+            smtp_crlf_upload_body(body)
+        } else {
+            body
+        };
+        (body, original_len)
+    });
 
     if upload.is_some() && transfer.mail_rcpt.is_empty() {
         return Err(CurlError::Usage(
@@ -4359,10 +4476,17 @@ async fn run_smtp_exchange(
 
     let capabilities = smtp_greet(&mut stream, &ehlo_domain, metrics).await?;
 
-    let body_result = if let Some(upload) = upload {
-        smtp_send_mail(transfer, &mut stream, &capabilities, &upload, metrics)
-            .await
-            .map(|()| Vec::new())
+    let body_result = if let Some((upload, upload_len)) = upload {
+        smtp_send_mail(
+            transfer,
+            &mut stream,
+            &capabilities,
+            &upload,
+            upload_len,
+            metrics,
+        )
+        .await
+        .map(|()| Vec::new())
     } else {
         let command = smtp_command(transfer, &capabilities)?;
         smtp_send_line(&mut stream, &command).await?;
@@ -7327,6 +7451,7 @@ fn has_control_byte(bytes: &[u8]) -> bool {
 struct Pop3Capabilities {
     auth_cram_md5: bool,
     auth_plain: bool,
+    auth_login: bool,
 }
 
 enum Pop3AuthResult {
@@ -7382,17 +7507,82 @@ async fn pop3_auth_cram_md5(
     }
 }
 
-async fn pop3_auth_plain(stream: &mut TcpStream, user: &[u8], password: &[u8]) -> Result<()> {
+async fn pop3_auth_plain_or_login(
+    stream: &mut TcpStream,
+    transfer: &TransferConfig,
+    capabilities: &Pop3Capabilities,
+    user: &[u8],
+    password: &[u8],
+) -> Result<()> {
+    if capabilities.auth_plain {
+        pop3_auth_plain(
+            stream,
+            user,
+            password,
+            transfer.sasl_authzid.as_deref().unwrap_or(""),
+            transfer.sasl_ir,
+        )
+        .await
+    } else if capabilities.auth_login {
+        pop3_auth_login(stream, user, password, transfer.sasl_ir).await
+    } else {
+        Err(CurlError::LoginDenied)
+    }
+}
+
+async fn pop3_auth_plain(
+    stream: &mut TcpStream,
+    user: &[u8],
+    password: &[u8],
+    authzid: &str,
+    sasl_ir: bool,
+) -> Result<()> {
+    let response = pop3_plain_message(authzid.as_bytes(), user, password);
+    let response = base64_padded(&response);
+
+    if sasl_ir {
+        let mut command = Vec::from(&b"AUTH PLAIN "[..]);
+        command.extend_from_slice(response.as_bytes());
+        pop3_send_line(stream, &command).await?;
+        return pop3_expect_ok(pop3_read_line(stream).await?, true);
+    }
+
     pop3_send_line(stream, b"AUTH PLAIN").await?;
     pop3_expect_auth_continuation(pop3_read_line(stream).await?)?;
+    pop3_send_line(stream, response.as_bytes()).await?;
+    pop3_expect_ok(pop3_read_line(stream).await?, true)
+}
 
-    let mut response = Vec::with_capacity(user.len() + password.len() + 2);
+fn pop3_plain_message(authzid: &[u8], user: &[u8], password: &[u8]) -> Vec<u8> {
+    let mut response = Vec::with_capacity(authzid.len() + user.len() + password.len() + 2);
+    response.extend_from_slice(authzid);
     response.push(0);
     response.extend_from_slice(user);
     response.push(0);
     response.extend_from_slice(password);
-    let response = base64_padded(&response);
-    pop3_send_line(stream, response.as_bytes()).await?;
+    response
+}
+
+async fn pop3_auth_login(
+    stream: &mut TcpStream,
+    user: &[u8],
+    password: &[u8],
+    sasl_ir: bool,
+) -> Result<()> {
+    let login = base64_padded(user);
+    if sasl_ir {
+        let mut command = Vec::from(&b"AUTH LOGIN "[..]);
+        command.extend_from_slice(login.as_bytes());
+        pop3_send_line(stream, &command).await?;
+    } else {
+        pop3_send_line(stream, b"AUTH LOGIN").await?;
+        pop3_expect_auth_continuation(pop3_read_line(stream).await?)?;
+        pop3_send_line(stream, login.as_bytes()).await?;
+    }
+
+    pop3_expect_auth_continuation(pop3_read_line(stream).await?)?;
+    let password = base64_padded(password);
+    pop3_send_line(stream, password.as_bytes()).await?;
     pop3_expect_ok(pop3_read_line(stream).await?, true)
 }
 
@@ -7476,6 +7666,8 @@ fn pop3_update_sasl_capabilities(capabilities: &mut Pop3Capabilities, line: &[u8
             capabilities.auth_cram_md5 = true;
         } else if word.eq_ignore_ascii_case(b"PLAIN") {
             capabilities.auth_plain = true;
+        } else if word.eq_ignore_ascii_case(b"LOGIN") {
+            capabilities.auth_login = true;
         }
     }
 }
@@ -8245,13 +8437,14 @@ async fn smtp_send_mail(
     stream: &mut TcpStream,
     capabilities: &SmtpResponse,
     upload: &[u8],
+    upload_len: usize,
     metrics: &mut writeout::Metrics,
 ) -> Result<()> {
     let mail_from = smtp_path_address(transfer.mail_from.as_deref())?;
     let mut command = Vec::from(&b"MAIL FROM:"[..]);
     command.extend_from_slice(&mail_from);
-    if smtp_response_has_keyword(capabilities, b"SIZE") {
-        command.extend_from_slice(format!(" SIZE={}", upload.len()).as_bytes());
+    if smtp_response_has_keyword(capabilities, b"SIZE") && upload_len > 0 {
+        command.extend_from_slice(format!(" SIZE={upload_len}").as_bytes());
     }
     smtp_send_line(stream, &command).await?;
     let response = smtp_read_response(stream).await?;
@@ -8468,6 +8661,19 @@ fn smtp_dot_stuffed_body(input: &[u8]) -> Vec<u8> {
         output.extend_from_slice(b"\r\n");
     }
     output.extend_from_slice(b".\r\n");
+    output
+}
+
+fn smtp_crlf_upload_body(input: Vec<u8>) -> Vec<u8> {
+    let mut output = Vec::with_capacity(input.len());
+    let mut previous_was_cr = false;
+    for byte in input {
+        if byte == b'\n' && !previous_was_cr {
+            output.push(b'\r');
+        }
+        output.push(byte);
+        previous_was_cr = byte == b'\r';
+    }
     output
 }
 

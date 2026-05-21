@@ -59,9 +59,11 @@ pub struct TransferConfig {
     pub list_only: bool,
     pub use_ascii: bool,
     pub ftp_append: bool,
+    pub ftp_account: Option<String>,
     pub ftp_create_dirs: bool,
     pub ftp_file_method: Option<FtpFileMethod>,
     pub ftp_disable_epsv: bool,
+    pub ftp_pret: bool,
     pub ftp_skip_pasv_ip: Option<bool>,
     pub ftp_quote: Vec<String>,
     pub ftp_prequote: Vec<String>,
@@ -73,6 +75,7 @@ pub struct TransferConfig {
     pub url_query: Vec<DataSpec>,
     pub forms: Vec<FormSpec>,
     pub upload_file: Option<String>,
+    pub crlf: bool,
     pub mail_from: Option<String>,
     pub mail_rcpt: Vec<String>,
     pub mail_rcpt_allowfails: bool,
@@ -121,6 +124,8 @@ pub struct TransferConfig {
     pub user: Option<String>,
     pub http_auth: AuthMethods,
     pub oauth2_bearer: Option<String>,
+    pub sasl_ir: bool,
+    pub sasl_authzid: Option<String>,
     pub aws_sigv4: Option<String>,
     pub resolve: Vec<String>,
     pub connect_to: Vec<String>,
@@ -553,9 +558,11 @@ impl Default for TransferConfig {
             list_only: false,
             use_ascii: false,
             ftp_append: false,
+            ftp_account: None,
             ftp_create_dirs: false,
             ftp_file_method: None,
             ftp_disable_epsv: false,
+            ftp_pret: false,
             ftp_skip_pasv_ip: None,
             ftp_quote: Vec::new(),
             ftp_prequote: Vec::new(),
@@ -567,6 +574,7 @@ impl Default for TransferConfig {
             url_query: Vec::new(),
             forms: Vec::new(),
             upload_file: None,
+            crlf: false,
             mail_from: None,
             mail_rcpt: Vec::new(),
             mail_rcpt_allowfails: false,
@@ -615,6 +623,8 @@ impl Default for TransferConfig {
             user: None,
             http_auth: AuthMethods::default(),
             oauth2_bearer: None,
+            sasl_ir: false,
+            sasl_authzid: None,
             aws_sigv4: None,
             resolve: Vec::new(),
             connect_to: Vec::new(),
@@ -851,6 +861,10 @@ impl Parser {
             "list-only" => self.current().list_only = true,
             "use-ascii" => self.current().use_ascii = true,
             "append" => self.current().ftp_append = true,
+            "ftp-account" => {
+                let value = self.value_for(name, inline_value)?;
+                self.current().ftp_account = Some(parse_nonempty_string(name, value)?);
+            }
             "ftp-create-dirs" => self.current().ftp_create_dirs = true,
             "ftp-method" => {
                 let value = self.value_for(name, inline_value)?;
@@ -859,6 +873,7 @@ impl Parser {
             "disable-epsv" => self.current().ftp_disable_epsv = true,
             "epsv" => self.current().ftp_disable_epsv = false,
             "ftp-pasv" => {}
+            "ftp-pret" => self.current().ftp_pret = true,
             "ftp-skip-pasv-ip" => self.current().ftp_skip_pasv_ip = Some(true),
             "quote" => {
                 let value = self.value_for(name, inline_value)?;
@@ -947,6 +962,7 @@ impl Parser {
                 let value = self.value_for(name, inline_value)?;
                 self.current().upload_file = Some(value);
             }
+            "crlf" => self.current().crlf = true,
             "mail-from" => {
                 let value = self.value_for(name, inline_value)?;
                 self.current().mail_from = Some(value);
@@ -1110,6 +1126,11 @@ impl Parser {
                 let value = self.value_for(name, inline_value)?;
                 self.current().http_auth.insert(AuthMethods::BEARER);
                 self.current().oauth2_bearer = Some(value);
+            }
+            "sasl-ir" => self.current().sasl_ir = true,
+            "sasl-authzid" => {
+                let value = self.value_for(name, inline_value)?;
+                self.current().sasl_authzid = Some(parse_nonempty_string(name, value)?);
             }
             "aws-sigv4" => {
                 let value = self.value_for(name, inline_value)?;
@@ -1303,6 +1324,7 @@ impl Parser {
             "ftp-create-dirs" => self.current().ftp_create_dirs = false,
             "disable-epsv" => self.current().ftp_disable_epsv = false,
             "epsv" => self.current().ftp_disable_epsv = true,
+            "ftp-pret" => self.current().ftp_pret = false,
             "ftp-skip-pasv-ip" => self.current().ftp_skip_pasv_ip = Some(false),
             "include" | "show-headers" => self.current().include_headers = false,
             "parallel" => self.config.parallel = false,
@@ -1365,6 +1387,7 @@ impl Parser {
             "digest" => self.current().http_auth.remove(AuthMethods::DIGEST),
             "negotiate" => self.current().http_auth.remove(AuthMethods::NEGOTIATE),
             "ntlm" => self.current().http_auth.remove(AuthMethods::NTLM),
+            "sasl-ir" => self.current().sasl_ir = false,
             "disallow-username-in-url" => self.current().disallow_username_in_url = false,
             "proxy-anyauth" => self.current().proxy_auth.set_anyauth(false),
             "proxy-basic" => self.current().proxy_auth.set_basic(false),
@@ -1375,6 +1398,7 @@ impl Parser {
             "suppress-connect-headers" => self.current().suppress_connect_headers = false,
             "insecure" => self.current().insecure = false,
             "junk-session-cookies" => self.current().junk_session_cookies = false,
+            "crlf" => self.current().crlf = false,
             "mail-rcpt-allowfails" => self.current().mail_rcpt_allowfails = false,
             "compressed-ssh" => self.current().compressed_ssh = false,
             "tftp-no-options" => self.current().tftp_no_options = false,
@@ -2017,9 +2041,11 @@ impl TransferConfig {
             || self.list_only
             || self.use_ascii
             || self.ftp_append
+            || self.ftp_account.is_some()
             || self.ftp_create_dirs
             || self.ftp_file_method.is_some()
             || self.ftp_disable_epsv
+            || self.ftp_pret
             || self.ftp_skip_pasv_ip.is_some()
             || !self.ftp_quote.is_empty()
             || !self.ftp_prequote.is_empty()
@@ -2031,6 +2057,7 @@ impl TransferConfig {
             || !self.url_query.is_empty()
             || !self.forms.is_empty()
             || self.upload_file.is_some()
+            || self.crlf
             || self.mail_from.is_some()
             || !self.mail_rcpt.is_empty()
             || self.mail_rcpt_allowfails
@@ -2077,6 +2104,8 @@ impl TransferConfig {
             || self.user.is_some()
             || !self.http_auth.is_empty()
             || self.oauth2_bearer.is_some()
+            || self.sasl_ir
+            || self.sasl_authzid.is_some()
             || self.aws_sigv4.is_some()
             || !self.resolve.is_empty()
             || !self.connect_to.is_empty()
@@ -2175,6 +2204,7 @@ fn option_takes_value(name: &str) -> bool {
             | "upload-file"
             | "mail-from"
             | "mail-rcpt"
+            | "ftp-account"
             | "ftp-method"
             | "key"
             | "pubkey"
@@ -2201,6 +2231,7 @@ fn option_takes_value(name: &str) -> bool {
             | "user"
             | "aws-sigv4"
             | "oauth2-bearer"
+            | "sasl-authzid"
             | "resolve"
             | "connect-to"
             | "proxy"
@@ -3151,13 +3182,16 @@ fn print_common_help() {
            -F, --form <name=content>   Specify multipart form data\n\
            -T, --upload-file <file>    Transfer local file to remote URL\n\
            -a, --append                Append to target file when uploading\n\
+               --crlf                  Convert LF to CRLF in uploads\n\
                --mail-from <address>   Mail from this address\n\
                --mail-rcpt <address>   Mail to this address\n\
                --key <file>            SSH private key file\n\
                --pubkey <file>         SSH public key file\n\
                --knownhosts <file>     SSH known_hosts file\n\
                --compressed-ssh        Enable SSH compression\n\
+               --ftp-account <data>    Account data after FTP PASS\n\
                --ftp-method <method>   Set FTP CWD method\n\
+               --ftp-pret              Send PRET before PASV\n\
                --tftp-blksize <value>  Set TFTP BLKSIZE option\n\
                --tftp-no-options       Do not send TFTP options\n\
           -B, --use-ascii             Use ASCII/text transfer\n\
@@ -3216,6 +3250,8 @@ fn print_common_help() {
                --ntlm                  Use HTTP NTLM Authentication\n\
                --anyauth               Pick any authentication method\n\
                --aws-sigv4 <provider>  Use AWS V4 signature authentication\n\
+               --sasl-ir               Enable SASL initial response\n\
+               --sasl-authzid <id>     Authorization identity for SASL PLAIN\n\
                --disallow-username-in-url Reject URL user names\n\
                --resolve <host:port:addr> Resolve host to address\n\
                --connect-to <rule>     Connect to alternate host\n\
@@ -4151,6 +4187,15 @@ mod tests {
     }
 
     #[test]
+    fn parses_crlf_option() {
+        let config = parse_args(["-q", "--crlf", "smtp://example.com"]).unwrap();
+        assert!(config.transfers[0].crlf);
+
+        let config = parse_args(["-q", "--crlf", "--no-crlf", "smtp://example.com"]).unwrap();
+        assert!(!config.transfers[0].crlf);
+    }
+
+    #[test]
     fn parses_list_only_option() {
         let config = parse_args(["-q", "-l", "pop3://example.com/1"]).unwrap();
         assert!(config.transfers[0].list_only);
@@ -4173,6 +4218,26 @@ mod tests {
         let config =
             parse_args(["-q", "--append", "--no-append", "ftp://example.com/file"]).unwrap();
         assert!(!config.transfers[0].ftp_append);
+    }
+
+    #[test]
+    fn parses_ftp_account_option() {
+        let config = parse_args([
+            "-q",
+            "--ftp-account",
+            "data for acct",
+            "ftp://example.com/file",
+        ])
+        .unwrap();
+        assert_eq!(
+            config.transfers[0].ftp_account.as_deref(),
+            Some("data for acct")
+        );
+
+        let config = parse_args(["-q", "--ftp-account=data", "ftp://example.com/file"]).unwrap();
+        assert_eq!(config.transfers[0].ftp_account.as_deref(), Some("data"));
+
+        assert!(parse_args(["-q", "--ftp-account=", "ftp://example.com/file"]).is_err());
     }
 
     #[test]
@@ -4245,15 +4310,19 @@ mod tests {
             "-q",
             "--disable-epsv",
             "--ftp-pasv",
+            "--ftp-pret",
             "--ftp-skip-pasv-ip",
             "ftp://example.com/file",
         ])
         .unwrap();
         assert!(config.transfers[0].ftp_disable_epsv);
+        assert!(config.transfers[0].ftp_pret);
         assert_eq!(config.transfers[0].ftp_skip_pasv_ip, Some(true));
 
         let config = parse_args([
             "-q",
+            "--ftp-pret",
+            "--no-ftp-pret",
             "--disable-epsv",
             "--epsv",
             "--ftp-skip-pasv-ip",
@@ -4262,12 +4331,14 @@ mod tests {
         ])
         .unwrap();
         assert!(!config.transfers[0].ftp_disable_epsv);
+        assert!(!config.transfers[0].ftp_pret);
         assert_eq!(config.transfers[0].ftp_skip_pasv_ip, Some(false));
 
         let config = parse_args(["-q", "--no-epsv", "ftp://example.com/file"]).unwrap();
         assert!(config.transfers[0].ftp_disable_epsv);
 
         let config = parse_args(["-q", "ftp://example.com/file"]).unwrap();
+        assert!(!config.transfers[0].ftp_pret);
         assert_eq!(config.transfers[0].ftp_skip_pasv_ip, None);
     }
 
@@ -5002,6 +5073,29 @@ mod tests {
         assert!(transfer.proxytunnel);
         assert!(transfer.suppress_connect_headers);
         assert_eq!(transfer.noproxy.as_deref(), Some("example.com"));
+    }
+
+    #[test]
+    fn parses_sasl_options() {
+        let config = parse_args([
+            "-q",
+            "--sasl-ir",
+            "--sasl-authzid",
+            "shared-mailbox",
+            "pop3://example.com/1",
+        ])
+        .unwrap();
+
+        let transfer = &config.transfers[0];
+        assert!(transfer.sasl_ir);
+        assert_eq!(transfer.sasl_authzid.as_deref(), Some("shared-mailbox"));
+
+        let config =
+            parse_args(["-q", "--sasl-ir", "--no-sasl-ir", "pop3://example.com/1"]).unwrap();
+        assert!(!config.transfers[0].sasl_ir);
+
+        let error = parse_args(["-q", "--sasl-authzid=", "pop3://example.com/1"]).unwrap_err();
+        assert!(error.to_string().contains("sasl-authzid"));
     }
 
     #[test]
