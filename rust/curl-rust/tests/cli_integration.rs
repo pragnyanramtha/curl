@@ -970,6 +970,184 @@ fn spawn_pop3_auth_plain_server(
     (format!("pop3://{addr}{path}"), rx)
 }
 
+fn spawn_pop3_cram_md5_server(
+    path: &str,
+    command_response: &'static [u8],
+) -> (String, Receiver<Vec<u8>>) {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = listener.local_addr().unwrap();
+    let (tx, rx) = mpsc::channel();
+
+    thread::spawn(move || {
+        let (mut stream, _) = listener.accept().unwrap();
+        stream.write_all(b"+OK curl POP3 test server\r\n").unwrap();
+
+        let mut commands = Vec::new();
+        while let Some(line) = read_pop3_client_line(&mut stream) {
+            commands.extend_from_slice(&line);
+            let command = String::from_utf8_lossy(&line);
+            let command = command.trim_end_matches(['\r', '\n']);
+            let response = if command == "CAPA" {
+                b"+OK capabilities\r\nSASL CRAM-MD5\r\n.\r\n".as_slice()
+            } else if command == "AUTH CRAM-MD5" {
+                b"+ PDE5NzIuOTg3NjU0MzIxQGN1cmw+\r\n".as_slice()
+            } else if command == "dXNlciA3MDMxNzI1NTk5ZmRiYjVkNDEyNjg5YWEzMjNlM2UwYg==" {
+                b"+OK Login successful\r\n".as_slice()
+            } else if command == "QUIT" {
+                let _ = stream.write_all(b"+OK bye\r\n");
+                break;
+            } else {
+                command_response
+            };
+            stream.write_all(response).unwrap();
+        }
+
+        tx.send(commands).unwrap();
+    });
+
+    (format!("pop3://{addr}{path}"), rx)
+}
+
+fn spawn_pop3_cram_md5_downgrade_server(
+    path: &str,
+    command_response: &'static [u8],
+) -> (String, Receiver<Vec<u8>>) {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = listener.local_addr().unwrap();
+    let (tx, rx) = mpsc::channel();
+
+    thread::spawn(move || {
+        let (mut stream, _) = listener.accept().unwrap();
+        stream.write_all(b"+OK curl POP3 test server\r\n").unwrap();
+
+        let mut commands = Vec::new();
+        while let Some(line) = read_pop3_client_line(&mut stream) {
+            commands.extend_from_slice(&line);
+            let command = String::from_utf8_lossy(&line);
+            let command = command.trim_end_matches(['\r', '\n']);
+            let response = if command == "CAPA" {
+                b"+OK capabilities\r\nSASL CRAM-MD5 PLAIN\r\n.\r\n".as_slice()
+            } else if command == "AUTH CRAM-MD5" {
+                b"+ Rubbish\r\n".as_slice()
+            } else if command == "*" {
+                b"-ERR AUTH exchange cancelled by client\r\n".as_slice()
+            } else if command == "AUTH PLAIN" {
+                b"+\r\n".as_slice()
+            } else if command == "AHVzZXIAc2VjcmV0" {
+                b"+OK Login successful\r\n".as_slice()
+            } else if command == "QUIT" {
+                let _ = stream.write_all(b"+OK bye\r\n");
+                break;
+            } else {
+                command_response
+            };
+            stream.write_all(response).unwrap();
+        }
+
+        tx.send(commands).unwrap();
+    });
+
+    (format!("pop3://{addr}{path}"), rx)
+}
+
+fn spawn_pop3_cram_md5_empty_challenge_server(
+    path: &str,
+    command_response: &'static [u8],
+) -> (String, Receiver<Vec<u8>>) {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = listener.local_addr().unwrap();
+    let (tx, rx) = mpsc::channel();
+
+    thread::spawn(move || {
+        let (mut stream, _) = listener.accept().unwrap();
+        stream.write_all(b"+OK curl POP3 test server\r\n").unwrap();
+
+        let mut commands = Vec::new();
+        while let Some(line) = read_pop3_client_line(&mut stream) {
+            commands.extend_from_slice(&line);
+            let command = String::from_utf8_lossy(&line);
+            let command = command.trim_end_matches(['\r', '\n']);
+            let response = if command == "CAPA" {
+                b"+OK capabilities\r\nSASL CRAM-MD5\r\n.\r\n".as_slice()
+            } else if command == "AUTH CRAM-MD5" {
+                b"+ =\r\n".as_slice()
+            } else if command == "dXNlciA1YzhkYjAzZjA0Y2VjMGY0M2JjYjA2MDAyMzkxNDE5MA==" {
+                b"+OK Login successful\r\n".as_slice()
+            } else if command == "QUIT" {
+                let _ = stream.write_all(b"+OK bye\r\n");
+                break;
+            } else {
+                command_response
+            };
+            stream.write_all(response).unwrap();
+        }
+
+        tx.send(commands).unwrap();
+    });
+
+    (format!("pop3://{addr}{path}"), rx)
+}
+
+fn spawn_pop3_cram_md5_denied_server(path: &str) -> (String, Receiver<Vec<u8>>) {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = listener.local_addr().unwrap();
+    let (tx, rx) = mpsc::channel();
+
+    thread::spawn(move || {
+        let (mut stream, _) = listener.accept().unwrap();
+        stream.write_all(b"+OK curl POP3 test server\r\n").unwrap();
+
+        let mut commands = Vec::new();
+        while let Some(line) = read_pop3_client_line(&mut stream) {
+            commands.extend_from_slice(&line);
+            let command = String::from_utf8_lossy(&line);
+            let command = command.trim_end_matches(['\r', '\n']);
+            let response = if command == "CAPA" {
+                b"+OK capabilities\r\nSASL CRAM-MD5 PLAIN\r\n.\r\n".as_slice()
+            } else if command == "AUTH CRAM-MD5" {
+                b"-ERR Authentication failed\r\n".as_slice()
+            } else {
+                b"-ERR unexpected command\r\n".as_slice()
+            };
+            stream.write_all(response).unwrap();
+        }
+
+        tx.send(commands).unwrap();
+    });
+
+    (format!("pop3://{addr}{path}"), rx)
+}
+
+fn spawn_pop3_cram_md5_direct_ok_server(path: &str) -> (String, Receiver<Vec<u8>>) {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = listener.local_addr().unwrap();
+    let (tx, rx) = mpsc::channel();
+
+    thread::spawn(move || {
+        let (mut stream, _) = listener.accept().unwrap();
+        stream.write_all(b"+OK curl POP3 test server\r\n").unwrap();
+
+        let mut commands = Vec::new();
+        while let Some(line) = read_pop3_client_line(&mut stream) {
+            commands.extend_from_slice(&line);
+            let command = String::from_utf8_lossy(&line);
+            let command = command.trim_end_matches(['\r', '\n']);
+            let response = if command == "CAPA" {
+                b"+OK capabilities\r\nSASL CRAM-MD5 PLAIN\r\n.\r\n".as_slice()
+            } else if command == "AUTH CRAM-MD5" {
+                b"+OK already authenticated\r\n".as_slice()
+            } else {
+                b"-ERR unexpected command\r\n".as_slice()
+            };
+            stream.write_all(response).unwrap();
+        }
+
+        tx.send(commands).unwrap();
+    });
+
+    (format!("pop3://{addr}{path}"), rx)
+}
+
 fn spawn_pop3_auth_keyword_capa_server(
     path: &str,
     command_response: &'static [u8],
@@ -7272,6 +7450,72 @@ fn pop3_auth_plain_without_sasl_ir_when_advertised() {
         rx.recv().unwrap(),
         b"CAPA\r\nAUTH PLAIN\r\nAHVzZXIAc2VjcmV0\r\nRETR 865\r\nQUIT\r\n"
     );
+}
+
+#[test]
+fn pop3_cram_md5_authenticates_when_advertised() {
+    let (url, rx) = spawn_pop3_cram_md5_server("/867", b"+OK message follows\r\nhello\r\n.\r\n");
+
+    let mut command = Command::cargo_bin("curl").unwrap();
+    command.args(["-q", "-sS", "-u", "user:secret", &url]);
+    command.assert().success().stdout("hello\r\n");
+
+    assert_eq!(
+        rx.recv().unwrap(),
+        b"CAPA\r\nAUTH CRAM-MD5\r\ndXNlciA3MDMxNzI1NTk5ZmRiYjVkNDEyNjg5YWEzMjNlM2UwYg==\r\nRETR 867\r\nQUIT\r\n"
+    );
+}
+
+#[test]
+fn pop3_cram_md5_downgrades_to_plain_after_bad_challenge() {
+    let (url, rx) =
+        spawn_pop3_cram_md5_downgrade_server("/879", b"+OK message follows\r\nhello\r\n.\r\n");
+
+    let mut command = Command::cargo_bin("curl").unwrap();
+    command.args(["-q", "-sS", "-u", "user:secret", &url]);
+    command.assert().success().stdout("hello\r\n");
+
+    assert_eq!(
+        rx.recv().unwrap(),
+        b"CAPA\r\nAUTH CRAM-MD5\r\n*\r\nAUTH PLAIN\r\nAHVzZXIAc2VjcmV0\r\nRETR 879\r\nQUIT\r\n"
+    );
+}
+
+#[test]
+fn pop3_cram_md5_equals_challenge_is_empty_challenge() {
+    let (url, rx) =
+        spawn_pop3_cram_md5_empty_challenge_server("/42", b"+OK message follows\r\nhello\r\n.\r\n");
+
+    let mut command = Command::cargo_bin("curl").unwrap();
+    command.args(["-q", "-sS", "-u", "user:secret", &url]);
+    command.assert().success().stdout("hello\r\n");
+
+    assert_eq!(
+        rx.recv().unwrap(),
+        b"CAPA\r\nAUTH CRAM-MD5\r\ndXNlciA1YzhkYjAzZjA0Y2VjMGY0M2JjYjA2MDAyMzkxNDE5MA==\r\nRETR 42\r\nQUIT\r\n"
+    );
+}
+
+#[test]
+fn pop3_cram_md5_denial_does_not_downgrade_to_plain() {
+    let (url, rx) = spawn_pop3_cram_md5_denied_server("/42");
+
+    let mut command = Command::cargo_bin("curl").unwrap();
+    command.args(["-q", "-sS", "-u", "user:wrong", &url]);
+    command.assert().failure().code(67).stdout("");
+
+    assert_eq!(rx.recv().unwrap(), b"CAPA\r\nAUTH CRAM-MD5\r\n");
+}
+
+#[test]
+fn pop3_cram_md5_direct_ok_returns_login_denied() {
+    let (url, rx) = spawn_pop3_cram_md5_direct_ok_server("/42");
+
+    let mut command = Command::cargo_bin("curl").unwrap();
+    command.args(["-q", "-sS", "-u", "user:wrong", &url]);
+    command.assert().failure().code(67).stdout("");
+
+    assert_eq!(rx.recv().unwrap(), b"CAPA\r\nAUTH CRAM-MD5\r\n");
 }
 
 #[test]

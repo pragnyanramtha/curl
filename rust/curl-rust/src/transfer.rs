@@ -5,8 +5,11 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
+use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64_STANDARD};
 use brotli::Decompressor as BrotliDecoder;
 use flate2::read::{DeflateDecoder, GzDecoder, ZlibDecoder};
+use hmac::{Hmac, Mac};
+use md5::Md5;
 use percent_encoding::percent_decode;
 use ssh2::{
     CheckResult, ErrorCode as SshErrorCode, FileStat as SftpFileStat, HashType, KnownHostFileKind,
@@ -4220,7 +4223,16 @@ async fn run_pop3_exchange(
     pop3_send_line(&mut stream, b"CAPA").await?;
     let capabilities = pop3_read_capa(&mut stream).await?;
 
-    if capabilities.auth_plain {
+    if capabilities.auth_cram_md5 {
+        match pop3_auth_cram_md5(&mut stream, &user, &password).await? {
+            Pop3AuthResult::Done => {}
+            Pop3AuthResult::TryNext if capabilities.auth_plain => {
+                pop3_auth_plain(&mut stream, &user, &password).await?;
+            }
+            Pop3AuthResult::TryNext => return Err(CurlError::LoginDenied),
+            Pop3AuthResult::Denied => return Err(CurlError::LoginDenied),
+        }
+    } else if capabilities.auth_plain {
         pop3_auth_plain(&mut stream, &user, &password).await?;
     } else {
         let mut user_command = Vec::from(&b"USER "[..]);
@@ -7313,7 +7325,61 @@ fn has_control_byte(bytes: &[u8]) -> bool {
 
 #[derive(Default)]
 struct Pop3Capabilities {
+    auth_cram_md5: bool,
     auth_plain: bool,
+}
+
+enum Pop3AuthResult {
+    Done,
+    TryNext,
+    Denied,
+}
+
+type HmacMd5 = Hmac<Md5>;
+
+async fn pop3_auth_cram_md5(
+    stream: &mut TcpStream,
+    user: &[u8],
+    password: &[u8],
+) -> Result<Pop3AuthResult> {
+    pop3_send_line(stream, b"AUTH CRAM-MD5").await?;
+    let challenge = match pop3_auth_continuation_payload(pop3_read_line(stream).await?)? {
+        Some(challenge) => challenge,
+        None => return Ok(Pop3AuthResult::Denied),
+    };
+
+    let challenge = if challenge.is_empty() || challenge[0] == b'=' {
+        Vec::new()
+    } else {
+        match BASE64_STANDARD.decode(challenge) {
+            Ok(challenge) => challenge,
+            Err(_) => {
+                pop3_cancel_auth(stream).await?;
+                return Ok(Pop3AuthResult::TryNext);
+            }
+        }
+    };
+
+    let mut mac = HmacMd5::new_from_slice(password)
+        .map_err(|error| CurlError::Transfer(error.to_string()))?;
+    mac.update(&challenge);
+    let digest = mac.finalize().into_bytes();
+
+    let mut response = Vec::with_capacity(user.len() + 1 + digest.len() * 2);
+    response.extend_from_slice(user);
+    response.push(b' ');
+    response.extend_from_slice(hex_lower(&digest).as_bytes());
+    let response = base64_padded(&response);
+    pop3_send_line(stream, response.as_bytes()).await?;
+
+    let line = pop3_read_line(stream).await?;
+    if line.starts_with(b"+OK") {
+        Ok(Pop3AuthResult::Done)
+    } else if line.starts_with(b"-ERR") {
+        Ok(Pop3AuthResult::Denied)
+    } else {
+        Err(CurlError::WeirdServerReply)
+    }
 }
 
 async fn pop3_auth_plain(stream: &mut TcpStream, user: &[u8], password: &[u8]) -> Result<()> {
@@ -7328,6 +7394,16 @@ async fn pop3_auth_plain(stream: &mut TcpStream, user: &[u8], password: &[u8]) -
     let response = base64_padded(&response);
     pop3_send_line(stream, response.as_bytes()).await?;
     pop3_expect_ok(pop3_read_line(stream).await?, true)
+}
+
+async fn pop3_cancel_auth(stream: &mut TcpStream) -> Result<()> {
+    pop3_send_line(stream, b"*").await?;
+    let line = pop3_read_line(stream).await?;
+    if line.starts_with(b"-ERR") || line.starts_with(b"+OK") {
+        Ok(())
+    } else {
+        Err(CurlError::WeirdServerReply)
+    }
 }
 
 async fn pop3_send_line(stream: &mut TcpStream, line: &[u8]) -> Result<()> {
@@ -7375,9 +7451,7 @@ async fn pop3_read_capa(stream: &mut TcpStream) -> Result<Pop3Capabilities> {
             if pop3_is_terminator_line(&line) {
                 break;
             }
-            if pop3_capa_supports_auth_plain(&line) {
-                capabilities.auth_plain = true;
-            }
+            pop3_update_sasl_capabilities(&mut capabilities, &line);
         }
         Ok(capabilities)
     } else if line.starts_with(b"-ERR") {
@@ -7387,14 +7461,23 @@ async fn pop3_read_capa(stream: &mut TcpStream) -> Result<Pop3Capabilities> {
     }
 }
 
-fn pop3_capa_supports_auth_plain(line: &[u8]) -> bool {
+fn pop3_update_sasl_capabilities(capabilities: &mut Pop3Capabilities, line: &[u8]) {
     let mut words = line
         .split(|byte| byte.is_ascii_whitespace())
         .filter(|word| !word.is_empty());
     let Some(first) = words.next() else {
-        return false;
+        return;
     };
-    first.eq_ignore_ascii_case(b"SASL") && words.any(|word| word.eq_ignore_ascii_case(b"PLAIN"))
+    if !first.eq_ignore_ascii_case(b"SASL") {
+        return;
+    }
+    for word in words {
+        if word.eq_ignore_ascii_case(b"CRAM-MD5") {
+            capabilities.auth_cram_md5 = true;
+        } else if word.eq_ignore_ascii_case(b"PLAIN") {
+            capabilities.auth_plain = true;
+        }
+    }
 }
 
 async fn pop3_read_multiline_body(stream: &mut TcpStream) -> Result<Vec<u8>> {
@@ -7432,6 +7515,16 @@ fn pop3_expect_auth_continuation(line: Vec<u8>) -> Result<()> {
         Ok(())
     } else if line.starts_with(b"-ERR") {
         Err(CurlError::LoginDenied)
+    } else {
+        Err(CurlError::WeirdServerReply)
+    }
+}
+
+fn pop3_auth_continuation_payload(line: Vec<u8>) -> Result<Option<Vec<u8>>> {
+    if line.starts_with(b"+") && !line.starts_with(b"+OK") {
+        Ok(Some(line[1..].trim_ascii().to_vec()))
+    } else if line.starts_with(b"-ERR") || line.starts_with(b"+OK") {
+        Ok(None)
     } else {
         Err(CurlError::WeirdServerReply)
     }
