@@ -122,6 +122,7 @@ pub struct TransferConfig {
     pub max_time: Option<Duration>,
     pub low_speed_limit: u64,
     pub low_speed_time: Duration,
+    pub limit_rate: u64,
     pub max_filesize: Option<u64>,
     pub ignore_content_length: bool,
     pub user_agent: Option<String>,
@@ -600,6 +601,7 @@ impl Default for TransferConfig {
             max_time: None,
             low_speed_limit: 0,
             low_speed_time: Duration::ZERO,
+            limit_rate: 0,
             max_filesize: None,
             ignore_content_length: false,
             user_agent: None,
@@ -1115,6 +1117,10 @@ impl Parser {
             "speed-time" => {
                 let value = self.value_for(name, inline_value)?;
                 self.set_low_speed_time(parse_c_long_u64(name, &value)?);
+            }
+            "limit-rate" => {
+                let value = self.value_for(name, inline_value)?;
+                self.current().limit_rate = parse_size_parameter(name, &value)?;
             }
             "max-filesize" => {
                 let value = self.value_for(name, inline_value)?;
@@ -1965,6 +1971,7 @@ impl TransferConfig {
             || self.max_time.is_some()
             || self.low_speed_limit != 0
             || self.low_speed_time != Duration::ZERO
+            || self.limit_rate != 0
             || self.max_filesize.is_some()
             || self.ignore_content_length
             || self.user_agent.is_some()
@@ -2080,6 +2087,7 @@ fn option_takes_value(name: &str) -> bool {
             | "max-time"
             | "speed-limit"
             | "speed-time"
+            | "limit-rate"
             | "max-filesize"
             | "user-agent"
             | "cookie"
@@ -3048,6 +3056,7 @@ fn print_common_help() {
                --retry <num>           Retry transient transfer problems\n\
                --retry-delay <seconds> Wait time between retries\n\
                --retry-max-time <sec>  Retry only within this period\n\
+               --limit-rate <speed>    Limit transfer speed\n\
                --max-filesize <bytes> Maximum file size to download\n\
                --ignore-content-length Ignore Content-Length headers\n\
            -o, --output <file>         Write output to file\n\
@@ -4210,11 +4219,29 @@ mod tests {
     }
 
     #[test]
+    fn parses_limit_rate_units_and_fractions() {
+        let config = parse_args(["-q", "--limit-rate", "1.5K", "https://example.com"]).unwrap();
+        assert_eq!(config.transfers[0].limit_rate, 1536);
+
+        let config = parse_args(["-q", "--limit-rate", "0", "https://example.com"]).unwrap();
+        assert_eq!(config.transfers[0].limit_rate, 0);
+    }
+
+    #[test]
     fn rejects_bad_max_filesize_values() {
         for value in ["3.4", "3.14b", "a", "-2", "+2", "2,2k", "8192P"] {
             let error =
                 parse_args(["-q", "--max-filesize", value, "https://example.com"]).unwrap_err();
             assert!(error.to_string().contains("max-filesize"));
+        }
+    }
+
+    #[test]
+    fn rejects_bad_limit_rate_values() {
+        for value in ["3.4", "3.14b", "a", "-2", "+2", "2,2k", "8192P"] {
+            let error =
+                parse_args(["-q", "--limit-rate", value, "https://example.com"]).unwrap_err();
+            assert!(error.to_string().contains("limit-rate"));
         }
     }
 

@@ -492,6 +492,18 @@ fn write_request(out: &mut String, render: &RenderTransfer<'_>, url: &str) -> Re
             i64::try_from(transfer.low_speed_time.as_secs()).unwrap_or(i64::MAX),
         );
     }
+    if transfer.limit_rate != 0 {
+        emit_raw_setopt(
+            out,
+            "CURLOPT_MAX_SEND_SPEED_LARGE",
+            &format!("(curl_off_t){}", transfer.limit_rate),
+        );
+        emit_raw_setopt(
+            out,
+            "CURLOPT_MAX_RECV_SPEED_LARGE",
+            &format!("(curl_off_t){}", transfer.limit_rate),
+        );
+    }
     if let Some(max_filesize) = transfer.max_filesize {
         emit_raw_setopt(
             out,
@@ -1203,6 +1215,8 @@ mod tests {
             "1000",
             "--speed-time",
             "2",
+            "--limit-rate",
+            "2K",
             "--interface",
             "host!127.0.0.1",
             "--local-port",
@@ -1220,6 +1234,8 @@ mod tests {
         assert!(source.contains("CURLOPT_TIMEOUT_MS, 3000L"));
         assert!(source.contains("CURLOPT_LOW_SPEED_LIMIT, 1000L"));
         assert!(source.contains("CURLOPT_LOW_SPEED_TIME, 2L"));
+        assert!(source.contains("CURLOPT_MAX_SEND_SPEED_LARGE, (curl_off_t)2048"));
+        assert!(source.contains("CURLOPT_MAX_RECV_SPEED_LARGE, (curl_off_t)2048"));
         assert!(source.contains("CURLOPT_INTERFACE, \"host!127.0.0.1\""));
         assert!(source.contains("CURLOPT_LOCALPORT, 4000L"));
         assert!(source.contains("CURLOPT_LOCALPORTRANGE, 3L"));

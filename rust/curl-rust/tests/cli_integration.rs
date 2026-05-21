@@ -2343,6 +2343,31 @@ fn writeout_json_reports_http_stats_shape() {
 }
 
 #[test]
+fn limit_rate_delays_http_downloads() {
+    let body = vec![b'x'; 128 * 1024];
+    let mut response = format!(
+        "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+        body.len()
+    )
+    .into_bytes();
+    response.extend_from_slice(&body);
+    let (url, rx) = spawn_server_bytes(response);
+
+    let started = Instant::now();
+    let mut command = Command::cargo_bin("curl").unwrap();
+    command.args(["-q", "-sS", "--out-null", "--limit-rate", "64K", &url]);
+    command.assert().success().stdout("");
+    let elapsed = started.elapsed();
+
+    assert!(
+        elapsed >= Duration::from_millis(750),
+        "expected --limit-rate to delay transfer, elapsed {elapsed:?}"
+    );
+    let request = rx.recv().unwrap();
+    assert!(request.start_line.starts_with("GET /resource HTTP/1.1"));
+}
+
+#[test]
 fn path_as_is_preserves_direct_http_dot_segments() {
     let (url, rx) = spawn_server(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok");
     let target = url.replace("/resource", "/a/../b/./c?x=1");
@@ -11810,6 +11835,8 @@ fn libcurl_writes_source_file_for_supported_options() {
         "--connect-to",
         connect_to_entry,
         "--disallow-username-in-url",
+        "--limit-rate",
+        "2M",
         "--max-filesize",
         "2M",
         "--ignore-content-length",
@@ -11852,6 +11879,8 @@ fn libcurl_writes_source_file_for_supported_options() {
     )));
     assert!(text.contains("CURLOPT_CONNECT_TO, slist3"));
     assert!(text.contains("CURLOPT_DISALLOW_USERNAME_IN_URL, 1"));
+    assert!(text.contains("CURLOPT_MAX_SEND_SPEED_LARGE, (curl_off_t)2097152"));
+    assert!(text.contains("CURLOPT_MAX_RECV_SPEED_LARGE, (curl_off_t)2097152"));
     assert!(text.contains("CURLOPT_MAXFILESIZE_LARGE, (curl_off_t)2097152"));
     assert!(text.contains("CURLOPT_IGNORE_CONTENT_LENGTH, 1"));
     assert!(text.contains("CURLOPT_REFERER, \"firstone.html\""));

@@ -12,7 +12,7 @@ use ssh2::{
     CheckResult, ErrorCode as SshErrorCode, FileStat as SftpFileStat, HashType, KnownHostFileKind,
     MethodType, OpenFlags, OpenType, RenameFlags, Session,
 };
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpStream, UdpSocket};
 use tokio::task::JoinSet;
 
@@ -397,6 +397,91 @@ fn remaining_timeout(timeout: Option<Duration>, started: Instant) -> Option<Dura
             .checked_sub(started.elapsed())
             .unwrap_or(Duration::ZERO),
     )
+}
+
+async fn enforce_transfer_rate_limit(
+    transfer: &TransferConfig,
+    metrics: &writeout::Metrics,
+    started: Instant,
+) -> Result<()> {
+    let Some(target_duration) =
+        transfer_rate_limited_duration(rate_limited_transfer_bytes(metrics), transfer.limit_rate)
+    else {
+        return Ok(());
+    };
+    let elapsed = started.elapsed();
+    let Some(delay) = target_duration.checked_sub(elapsed) else {
+        return Ok(());
+    };
+
+    if let Some(max_time) = active_timeout(transfer.max_time) {
+        let Some(remaining) = max_time.checked_sub(elapsed) else {
+            return Err(CurlError::Timeout);
+        };
+        if delay >= remaining {
+            tokio::time::sleep(remaining).await;
+            return Err(CurlError::Timeout);
+        }
+    }
+
+    tokio::time::sleep(delay).await;
+    Ok(())
+}
+
+fn rate_limited_transfer_bytes(metrics: &writeout::Metrics) -> u64 {
+    let mut bytes = metrics.size_upload;
+    if !metrics_url_has_http_scheme(metrics) {
+        bytes = bytes.saturating_add(metrics.size_download);
+    }
+    bytes
+}
+
+fn metrics_url_has_http_scheme(metrics: &writeout::Metrics) -> bool {
+    Url::parse(&metrics.url_effective)
+        .or_else(|_| Url::parse(&metrics.url))
+        .ok()
+        .is_some_and(|url| matches!(url.scheme(), "http" | "https"))
+}
+
+fn transfer_rate_limited_duration(transferred: u64, bytes_per_second: u64) -> Option<Duration> {
+    if bytes_per_second == 0 || transferred <= bytes_per_second {
+        return None;
+    }
+
+    let limited = transferred - bytes_per_second;
+    let secs = limited / bytes_per_second;
+    let nanos = ((u128::from(limited % bytes_per_second) * 1_000_000_000_u128)
+        / u128::from(bytes_per_second)) as u32;
+    Some(Duration::new(secs, nanos))
+}
+
+struct TransferRateLimiter {
+    rate: u64,
+    started: Instant,
+    transferred: u64,
+}
+
+impl TransferRateLimiter {
+    fn new(transfer: &TransferConfig) -> Option<Self> {
+        (transfer.limit_rate != 0).then(|| Self {
+            rate: transfer.limit_rate,
+            started: Instant::now(),
+            transferred: 0,
+        })
+    }
+
+    async fn record(&mut self, bytes: usize) {
+        let bytes = u64::try_from(bytes).unwrap_or(u64::MAX);
+        self.transferred = self.transferred.saturating_add(bytes);
+        let Some(target_duration) = transfer_rate_limited_duration(self.transferred, self.rate)
+        else {
+            return;
+        };
+        let Some(delay) = target_duration.checked_sub(self.started.elapsed()) else {
+            return;
+        };
+        tokio::time::sleep(delay).await;
+    }
 }
 
 fn spawn_parallel_job(active: &mut JoinSet<Result<(usize, i32)>>, job: ParallelJob) {
@@ -956,7 +1041,7 @@ async fn run_expanded_url(
         Ok(())
     };
 
-    let result = if let Err(error) = userinfo_check {
+    let mut result = if let Err(error) = userinfo_check {
         Err(error)
     } else if has_url_scheme(&expanded.url, "file") {
         run_file_transfer(transfer, &expanded, &method_label, &mut metrics).await
@@ -1059,6 +1144,12 @@ async fn run_expanded_url(
         )
         .await
     };
+
+    if result.is_ok()
+        && let Err(error) = enforce_transfer_rate_limit(transfer, &metrics, started).await
+    {
+        result = Err(error);
+    }
 
     metrics.time_total = started.elapsed();
     match result {
@@ -9418,11 +9509,7 @@ async fn run_http_transfer(
         {
             Vec::new()
         } else {
-            response
-                .bytes()
-                .await
-                .map_err(|error| http_send_error(error, transfer))?
-                .to_vec()
+            read_reqwest_body(response, transfer).await?
         };
         let body = decode_http_body_if_transfer_encoded(transfer, &headers, body)?;
         let body = decode_http_body_if_compressed(transfer, &headers, body)?;
@@ -9454,6 +9541,25 @@ async fn run_http_transfer(
             num_connects: metrics.num_connects,
         });
     }
+}
+
+async fn read_reqwest_body(
+    mut response: reqwest::Response,
+    transfer: &TransferConfig,
+) -> Result<Vec<u8>> {
+    let mut body = Vec::new();
+    let mut rate_limiter = TransferRateLimiter::new(transfer);
+    while let Some(chunk) = response
+        .chunk()
+        .await
+        .map_err(|error| http_send_error(error, transfer))?
+    {
+        if let Some(rate_limiter) = rate_limiter.as_mut() {
+            rate_limiter.record(chunk.len()).await;
+        }
+        body.extend_from_slice(&chunk);
+    }
+    Ok(body)
 }
 
 fn raw_http_proxy_supported(transfer: &TransferConfig, url: &Url, has_multipart: bool) -> bool {
@@ -9682,6 +9788,7 @@ async fn run_raw_http_proxy_transfer(context: RawHttpProxyContext<'_>) -> Result
     stream.write_all(&request).await.map_err(tcp_io_error)?;
     let mut attempt = raw_http_read_response(
         &mut stream,
+        context.transfer,
         context.method,
         context.url,
         context.resume_from,
@@ -9806,6 +9913,7 @@ async fn raw_http_send_direct_request(
     stream.write_all(request).await.map_err(tcp_io_error)?;
     raw_http_read_response(
         stream,
+        context.transfer,
         context.method,
         context.url,
         context.resume_from,
@@ -10253,12 +10361,14 @@ struct RawHttpReadOptions {
 
 async fn raw_http_read_response(
     stream: &mut TcpStream,
+    transfer: &TransferConfig,
     method: &Method,
     final_url: &Url,
     resume_from: u64,
     options: RawHttpReadOptions,
 ) -> Result<HttpAttempt> {
     let mut header_bytes = Vec::new();
+    let mut rate_limiter = TransferRateLimiter::new(transfer);
     let mut byte = [0_u8; 1];
     loop {
         let read = stream.read(&mut byte).await.map_err(tcp_io_error)?;
@@ -10278,7 +10388,7 @@ async fn raw_http_read_response(
         if !raw_http_header_prefix_possible(&header_bytes) {
             if options.http09_allowed {
                 let mut body = header_bytes;
-                stream.read_to_end(&mut body).await.map_err(tcp_io_error)?;
+                rate_limited_read_to_end(stream, &mut body, rate_limiter.as_mut()).await?;
                 return raw_http09_attempt(method, final_url, resume_from, true, body);
             }
             return Err(CurlError::UnsupportedProtocol("HTTP/0.9".to_string()));
@@ -10308,9 +10418,9 @@ async fn raw_http_read_response(
     {
         Vec::new()
     } else if options.raw_transfer_decoding && raw_http_response_is_chunked(&headers) {
-        raw_http_read_chunked_wire_body(stream).await?
+        raw_http_read_chunked_wire_body(stream, rate_limiter.as_mut()).await?
     } else if raw_http_response_is_chunked(&headers) {
-        raw_http_read_chunked_body(stream).await?
+        raw_http_read_chunked_body(stream, rate_limiter.as_mut()).await?
     } else if !options.ignore_content_length
         && let Some(length) = headers
             .get(CONTENT_LENGTH)
@@ -10319,14 +10429,14 @@ async fn raw_http_read_response(
     {
         let mut body = Vec::with_capacity(length);
         let mut limited = stream.take(length as u64);
-        limited.read_to_end(&mut body).await.map_err(tcp_io_error)?;
+        rate_limited_read_to_end(&mut limited, &mut body, rate_limiter.as_mut()).await?;
         if body.len() < length {
             deferred_error = Some(CurlError::PartialFile);
         }
         body
     } else {
         let mut body = Vec::new();
-        stream.read_to_end(&mut body).await.map_err(tcp_io_error)?;
+        rate_limited_read_to_end(stream, &mut body, rate_limiter.as_mut()).await?;
         body
     };
 
@@ -10367,7 +10477,28 @@ fn raw_http_status_has_no_body(status: StatusCode) -> bool {
         || status == StatusCode::NOT_MODIFIED
 }
 
-async fn raw_http_read_chunked_body(stream: &mut TcpStream) -> Result<Vec<u8>> {
+async fn rate_limited_read_to_end<R: AsyncRead + Unpin>(
+    reader: &mut R,
+    body: &mut Vec<u8>,
+    mut rate_limiter: Option<&mut TransferRateLimiter>,
+) -> Result<()> {
+    let mut buffer = [0_u8; 8192];
+    loop {
+        let read = reader.read(&mut buffer).await.map_err(tcp_io_error)?;
+        if read == 0 {
+            return Ok(());
+        }
+        if let Some(rate_limiter) = rate_limiter.as_mut() {
+            rate_limiter.record(read).await;
+        }
+        body.extend_from_slice(&buffer[..read]);
+    }
+}
+
+async fn raw_http_read_chunked_body(
+    stream: &mut TcpStream,
+    mut rate_limiter: Option<&mut TransferRateLimiter>,
+) -> Result<Vec<u8>> {
     let mut body = Vec::new();
     loop {
         let line = raw_http_read_line(stream).await?;
@@ -10383,6 +10514,9 @@ async fn raw_http_read_chunked_body(stream: &mut TcpStream) -> Result<Vec<u8>> {
 
         let mut chunk = vec![0_u8; size];
         stream.read_exact(&mut chunk).await.map_err(tcp_io_error)?;
+        if let Some(rate_limiter) = rate_limiter.as_mut() {
+            rate_limiter.record(chunk.len()).await;
+        }
         body.extend_from_slice(&chunk);
 
         let terminator = raw_http_read_line(stream).await?;
@@ -10392,15 +10526,24 @@ async fn raw_http_read_chunked_body(stream: &mut TcpStream) -> Result<Vec<u8>> {
     }
 }
 
-async fn raw_http_read_chunked_wire_body(stream: &mut TcpStream) -> Result<Vec<u8>> {
+async fn raw_http_read_chunked_wire_body(
+    stream: &mut TcpStream,
+    mut rate_limiter: Option<&mut TransferRateLimiter>,
+) -> Result<Vec<u8>> {
     let mut body = Vec::new();
     loop {
         let line = raw_http_read_line(stream).await?;
+        if let Some(rate_limiter) = rate_limiter.as_mut() {
+            rate_limiter.record(line.len()).await;
+        }
         body.extend_from_slice(line.as_bytes());
         let size = raw_http_chunk_size(&line)?;
         if size == 0 {
             loop {
                 let trailer = raw_http_read_line(stream).await?;
+                if let Some(rate_limiter) = rate_limiter.as_mut() {
+                    rate_limiter.record(trailer.len()).await;
+                }
                 body.extend_from_slice(trailer.as_bytes());
                 if trailer == "\r\n" || trailer == "\n" || trailer.trim().is_empty() {
                     return Ok(body);
@@ -10410,11 +10553,17 @@ async fn raw_http_read_chunked_wire_body(stream: &mut TcpStream) -> Result<Vec<u
 
         let mut chunk = vec![0_u8; size];
         stream.read_exact(&mut chunk).await.map_err(tcp_io_error)?;
+        if let Some(rate_limiter) = rate_limiter.as_mut() {
+            rate_limiter.record(chunk.len()).await;
+        }
         body.extend_from_slice(&chunk);
 
         let terminator = raw_http_read_line(stream).await?;
         if terminator != "\r\n" && terminator != "\n" {
             return Err(CurlError::WeirdServerReply);
+        }
+        if let Some(rate_limiter) = rate_limiter.as_mut() {
+            rate_limiter.record(terminator.len()).await;
         }
         body.extend_from_slice(terminator.as_bytes());
     }
