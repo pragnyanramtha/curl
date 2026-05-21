@@ -464,11 +464,16 @@ fn build_client(transfer: &TransferConfig, cookie_jar: Option<Arc<CookieJar>>) -
         builder = builder.max_tls_version(version);
     }
 
-    if let Some(path) = &transfer.cacert {
+    let origin_ca_env = origin_ca_env_defaults(transfer);
+    if transfer.cacert.is_some()
+        || transfer.capath.is_some()
+        || origin_ca_env.cacert.is_some()
+        || origin_ca_env.capath.is_some()
+    {
         builder = builder.tls_built_in_root_certs(false);
-        for certificate in load_ca_certificates(path)? {
-            builder = builder.add_root_certificate(certificate);
-        }
+    }
+    for certificate in load_configured_ca_certificates(transfer, &origin_ca_env)? {
+        builder = builder.add_root_certificate(certificate);
     }
 
     if transfer.ip_version != IpVersionPreference::Any {
@@ -533,6 +538,133 @@ fn load_ca_certificates(path: &Path) -> Result<Vec<reqwest::Certificate>> {
         return Err(CurlError::CaCert(format!(
             "{}: no certificates found",
             path.display()
+        )));
+    }
+    Ok(certificates)
+}
+
+#[derive(Default)]
+struct OriginCaEnv {
+    cacert: Option<PathBuf>,
+    capath: Option<PathBuf>,
+}
+
+fn origin_ca_env_defaults(transfer: &TransferConfig) -> OriginCaEnv {
+    origin_ca_env_defaults_from(transfer, |name| {
+        let value = std::env::var_os(name)?;
+        (!value.is_empty()).then(|| PathBuf::from(value))
+    })
+}
+
+fn origin_ca_env_defaults_from<F>(transfer: &TransferConfig, mut get_env: F) -> OriginCaEnv
+where
+    F: FnMut(&str) -> Option<PathBuf>,
+{
+    if transfer.insecure || transfer.cacert.is_some() || transfer.capath.is_some() {
+        return OriginCaEnv::default();
+    }
+
+    if let Some(cacert) = get_env("CURL_CA_BUNDLE") {
+        return OriginCaEnv {
+            cacert: Some(cacert),
+            capath: None,
+        };
+    }
+
+    OriginCaEnv {
+        capath: get_env("SSL_CERT_DIR"),
+        cacert: get_env("SSL_CERT_FILE"),
+    }
+}
+
+fn load_configured_ca_certificates(
+    transfer: &TransferConfig,
+    origin_ca_env: &OriginCaEnv,
+) -> Result<Vec<reqwest::Certificate>> {
+    let mut certificates = Vec::new();
+    if let Some(path) = &transfer.cacert {
+        certificates.extend(load_ca_certificates(path)?);
+    }
+    if let Some(path) = &transfer.capath {
+        certificates.extend(load_ca_path_list(path)?);
+    }
+    if let Some(path) = &origin_ca_env.cacert {
+        certificates.extend(load_ca_certificates(path)?);
+    }
+    if let Some(path) = &origin_ca_env.capath {
+        certificates.extend(load_ca_path_list(path)?);
+    }
+    if transfer_uses_https_proxy(transfer) {
+        if let Some(path) = &transfer.proxy_cacert {
+            certificates.extend(load_ca_certificates(path)?);
+        }
+        if let Some(path) = &transfer.proxy_capath {
+            certificates.extend(load_ca_path_list(path)?);
+        }
+    }
+    Ok(certificates)
+}
+
+fn transfer_uses_https_proxy(transfer: &TransferConfig) -> bool {
+    transfer.proxy.as_deref().is_some_and(|proxy| {
+        proxy
+            .get(..8)
+            .is_some_and(|scheme| scheme.eq_ignore_ascii_case("https://"))
+    })
+}
+
+fn load_ca_directory(path: &Path) -> Result<Vec<reqwest::Certificate>> {
+    let entries = std::fs::read_dir(path)
+        .map_err(|error| CurlError::CaCert(format!("{}: {error}", path.display())))?;
+    let mut certificates = Vec::new();
+    let mut read_errors = Vec::new();
+    for entry in entries {
+        let entry =
+            entry.map_err(|error| CurlError::CaCert(format!("{}: {error}", path.display())))?;
+        let file_type = entry
+            .file_type()
+            .map_err(|error| CurlError::CaCert(format!("{}: {error}", entry.path().display())))?;
+        if !file_type.is_file() {
+            continue;
+        }
+        match load_ca_certificates(&entry.path()) {
+            Ok(mut loaded) => certificates.append(&mut loaded),
+            Err(error) => read_errors.push(error),
+        }
+    }
+
+    if certificates.is_empty() {
+        if let Some(error) = read_errors.into_iter().next() {
+            return Err(error);
+        }
+        return Err(CurlError::CaCert(format!(
+            "{}: no certificates found",
+            path.display()
+        )));
+    }
+    Ok(certificates)
+}
+
+fn load_ca_path_list(path_list: &Path) -> Result<Vec<reqwest::Certificate>> {
+    let mut certificates = Vec::new();
+    let mut read_errors = Vec::new();
+    for path in std::env::split_paths(path_list.as_os_str()) {
+        if path.as_os_str().is_empty() {
+            continue;
+        }
+        match load_ca_directory(&path) {
+            Ok(mut loaded) => certificates.append(&mut loaded),
+            Err(error) => read_errors.push(error),
+        }
+    }
+
+    if certificates.is_empty() {
+        if let Some(error) = read_errors.into_iter().next() {
+            return Err(error);
+        }
+        return Err(CurlError::CaCert(format!(
+            "{}: no certificates found",
+            path_list.display()
         )));
     }
     Ok(certificates)
@@ -11977,4 +12109,106 @@ fn status_line(version: Version, status: StatusCode) -> String {
         status.as_u16(),
         status.canonical_reason().unwrap_or("")
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tempfile::tempdir;
+
+    #[test]
+    fn load_ca_directory_reads_pem_files() {
+        let temp = tempdir().unwrap();
+        let source = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../tests/certs/test-ca.crt")
+            .canonicalize()
+            .unwrap();
+        std::fs::copy(source, temp.path().join("cert.0")).unwrap();
+
+        let certificates = load_ca_directory(temp.path()).unwrap();
+
+        assert!(!certificates.is_empty());
+    }
+
+    #[test]
+    fn load_ca_directory_rejects_empty_directory() {
+        let temp = tempdir().unwrap();
+        let error = match load_ca_directory(temp.path()) {
+            Ok(_) => panic!("empty CA directory unexpectedly loaded certificates"),
+            Err(error) => error,
+        };
+
+        assert!(matches!(error, CurlError::CaCert(_)));
+    }
+
+    #[test]
+    fn proxy_ca_roots_only_load_for_https_proxy() {
+        let temp = tempdir().unwrap();
+        let ca = temp.path().join("proxy-ca.pem");
+        std::fs::write(&ca, "not a certificate").unwrap();
+        let mut transfer = TransferConfig {
+            proxy_cacert: Some(ca),
+            ..TransferConfig::default()
+        };
+
+        assert!(
+            load_configured_ca_certificates(&transfer, &OriginCaEnv::default())
+                .unwrap()
+                .is_empty()
+        );
+
+        transfer.proxy = Some("http://proxy.example".to_string());
+        assert!(
+            load_configured_ca_certificates(&transfer, &OriginCaEnv::default())
+                .unwrap()
+                .is_empty()
+        );
+
+        transfer.proxy = Some("https://proxy.example".to_string());
+        let error = match load_configured_ca_certificates(&transfer, &OriginCaEnv::default()) {
+            Ok(_) => panic!("HTTPS proxy CA unexpectedly loaded invalid certificate"),
+            Err(error) => error,
+        };
+        assert!(matches!(error, CurlError::CaCert(_)));
+    }
+
+    #[test]
+    fn origin_ca_env_defaults_match_curl_precedence() {
+        let transfer = TransferConfig::default();
+        let defaults = origin_ca_env_defaults_from(&transfer, |name| match name {
+            "CURL_CA_BUNDLE" => Some(PathBuf::from("bundle.pem")),
+            "SSL_CERT_DIR" => Some(PathBuf::from("certs")),
+            "SSL_CERT_FILE" => Some(PathBuf::from("file.pem")),
+            _ => None,
+        });
+
+        assert_eq!(defaults.cacert.as_deref(), Some(Path::new("bundle.pem")));
+        assert!(defaults.capath.is_none());
+
+        let defaults = origin_ca_env_defaults_from(&transfer, |name| match name {
+            "SSL_CERT_DIR" => Some(PathBuf::from("certs")),
+            "SSL_CERT_FILE" => Some(PathBuf::from("file.pem")),
+            _ => None,
+        });
+
+        assert_eq!(defaults.capath.as_deref(), Some(Path::new("certs")));
+        assert_eq!(defaults.cacert.as_deref(), Some(Path::new("file.pem")));
+    }
+
+    #[test]
+    fn origin_ca_env_defaults_skip_when_explicit_or_insecure() {
+        let mut transfer = TransferConfig {
+            insecure: true,
+            ..TransferConfig::default()
+        };
+        let defaults =
+            origin_ca_env_defaults_from(&transfer, |_| Some(PathBuf::from("bundle.pem")));
+        assert!(defaults.cacert.is_none());
+
+        transfer.insecure = false;
+        transfer.cacert = Some(PathBuf::from("explicit.pem"));
+        let defaults =
+            origin_ca_env_defaults_from(&transfer, |_| Some(PathBuf::from("bundle.pem")));
+        assert!(defaults.cacert.is_none());
+    }
 }

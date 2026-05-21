@@ -452,6 +452,15 @@ fn write_request(out: &mut String, render: &RenderTransfer<'_>, url: &str) -> Re
     if let Some(path) = &transfer.cacert {
         emit_string_setopt(out, "CURLOPT_CAINFO", &path.to_string_lossy());
     }
+    if let Some(path) = &transfer.capath {
+        emit_string_setopt(out, "CURLOPT_CAPATH", &path.to_string_lossy());
+    }
+    if let Some(path) = &transfer.proxy_cacert {
+        emit_string_setopt(out, "CURLOPT_PROXY_CAINFO", &path.to_string_lossy());
+    }
+    if let Some(path) = transfer.proxy_capath.as_ref().or(transfer.capath.as_ref()) {
+        emit_string_setopt(out, "CURLOPT_PROXY_CAPATH", &path.to_string_lossy());
+    }
     if let Some(timeout) = transfer
         .connect_timeout
         .filter(|timeout| !timeout.is_zero())
@@ -1084,7 +1093,11 @@ mod tests {
     fn renders_path_as_is_and_cainfo_options() {
         let temp = tempdir().unwrap();
         let ca = temp.path().join("ca.pem");
+        let proxy_ca = temp.path().join("proxy-ca.pem");
+        let capath = temp.path().join("hashdir");
         std::fs::write(&ca, "test ca").unwrap();
+        std::fs::write(&proxy_ca, "test proxy ca").unwrap();
+        std::fs::create_dir(&capath).unwrap();
 
         let config = parse_args([
             "-q",
@@ -1093,6 +1106,10 @@ mod tests {
             "--path-as-is",
             "--cacert",
             ca.to_str().unwrap(),
+            "--capath",
+            capath.to_str().unwrap(),
+            "--proxy-cacert",
+            proxy_ca.to_str().unwrap(),
             "https://example.com/a/../b",
         ])
         .unwrap();
@@ -1101,7 +1118,12 @@ mod tests {
 
         assert!(source.contains("CURLOPT_PATH_AS_IS, 1L"));
         assert!(source.contains("CURLOPT_CAINFO"));
+        assert!(source.contains("CURLOPT_CAPATH"));
+        assert!(source.contains("CURLOPT_PROXY_CAINFO"));
+        assert!(source.contains("CURLOPT_PROXY_CAPATH"));
         assert!(source.contains(ca.to_str().unwrap()));
+        assert!(source.contains(proxy_ca.to_str().unwrap()));
+        assert!(source.contains(capath.to_str().unwrap()));
     }
 
     #[test]

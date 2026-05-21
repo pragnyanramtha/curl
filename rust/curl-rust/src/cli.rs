@@ -113,6 +113,9 @@ pub struct TransferConfig {
     pub noproxy: Option<String>,
     pub insecure: bool,
     pub cacert: Option<PathBuf>,
+    pub capath: Option<PathBuf>,
+    pub proxy_cacert: Option<PathBuf>,
+    pub proxy_capath: Option<PathBuf>,
     pub interface: Option<String>,
     pub local_port: Option<LocalPortRange>,
     pub connect_timeout: Option<Duration>,
@@ -588,6 +591,9 @@ impl Default for TransferConfig {
             noproxy: None,
             insecure: false,
             cacert: None,
+            capath: None,
+            proxy_cacert: None,
+            proxy_capath: None,
             interface: None,
             local_port: None,
             connect_timeout: None,
@@ -1081,6 +1087,18 @@ impl Parser {
             "cacert" => {
                 let value = self.value_for(name, inline_value)?;
                 self.current().cacert = Some(parse_existing_path(name, &value)?);
+            }
+            "capath" => {
+                let value = self.value_for(name, inline_value)?;
+                self.current().capath = Some(parse_nonempty_path(name, &value)?);
+            }
+            "proxy-cacert" => {
+                let value = self.value_for(name, inline_value)?;
+                self.current().proxy_cacert = Some(parse_existing_path(name, &value)?);
+            }
+            "proxy-capath" => {
+                let value = self.value_for(name, inline_value)?;
+                self.current().proxy_capath = Some(parse_nonempty_path(name, &value)?);
             }
             "connect-timeout" => {
                 let value = self.value_for(name, inline_value)?;
@@ -1938,6 +1956,9 @@ impl TransferConfig {
             || self.noproxy.is_some()
             || self.insecure
             || self.cacert.is_some()
+            || self.capath.is_some()
+            || self.proxy_cacert.is_some()
+            || self.proxy_capath.is_some()
             || self.interface.is_some()
             || self.local_port.is_some()
             || self.connect_timeout.is_some()
@@ -2052,6 +2073,9 @@ fn option_takes_value(name: &str) -> bool {
             | "local-port"
             | "noproxy"
             | "cacert"
+            | "capath"
+            | "proxy-cacert"
+            | "proxy-capath"
             | "connect-timeout"
             | "max-time"
             | "speed-limit"
@@ -3071,6 +3095,9 @@ fn print_common_help() {
                --local-port <range>    Use a local port number within range\n\
            -k, --insecure              Allow insecure TLS/SSH\n\
                --cacert <file>         CA certificate bundle\n\
+               --capath <dir>          CA certificate directory\n\
+               --proxy-cacert <file>   HTTPS proxy CA certificate bundle\n\
+               --proxy-capath <dir>    HTTPS proxy CA certificate directory\n\
            -Y, --speed-limit <speed>   Stop transfers slower than this\n\
            -y, --speed-time <seconds>  Trigger speed-limit after this time\n\
            -s, --silent                Silent mode\n\
@@ -3802,16 +3829,28 @@ mod tests {
     }
 
     #[test]
-    fn parses_path_as_is_and_cacert_options() {
+    fn parses_path_as_is_and_ca_options() {
         let temp = tempdir().unwrap();
         let ca = temp.path().join("ca.pem");
+        let proxy_ca = temp.path().join("proxy-ca.pem");
+        let capath = temp.path().join("hashdir");
+        let proxy_capath = temp.path().join("proxy-hashdir");
         std::fs::write(&ca, "not a real cert").unwrap();
+        std::fs::write(&proxy_ca, "not a real proxy cert").unwrap();
+        std::fs::create_dir(&capath).unwrap();
+        std::fs::create_dir(&proxy_capath).unwrap();
 
         let config = parse_args([
             "-q",
             "--path-as-is",
             "--cacert",
             ca.to_str().unwrap(),
+            "--capath",
+            capath.to_str().unwrap(),
+            "--proxy-cacert",
+            proxy_ca.to_str().unwrap(),
+            "--proxy-capath",
+            proxy_capath.to_str().unwrap(),
             "https://example.com/a/../b",
         ])
         .unwrap();
@@ -3819,6 +3858,12 @@ mod tests {
         let transfer = &config.transfers[0];
         assert!(transfer.path_as_is);
         assert_eq!(transfer.cacert.as_deref(), Some(ca.as_path()));
+        assert_eq!(transfer.capath.as_deref(), Some(capath.as_path()));
+        assert_eq!(transfer.proxy_cacert.as_deref(), Some(proxy_ca.as_path()));
+        assert_eq!(
+            transfer.proxy_capath.as_deref(),
+            Some(proxy_capath.as_path())
+        );
 
         let config = parse_args([
             "-q",
@@ -3835,15 +3880,17 @@ mod tests {
 
     #[test]
     fn cacert_requires_existing_path() {
-        let error = parse_args([
-            "-q",
-            "--cacert",
-            "/tmp/curl-rust-missing-ca.pem",
-            "https://example.com/",
-        ])
-        .unwrap_err();
+        for option in ["--cacert", "--proxy-cacert"] {
+            let error = parse_args([
+                "-q",
+                option,
+                "/tmp/curl-rust-missing-ca.pem",
+                "https://example.com/",
+            ])
+            .unwrap_err();
 
-        assert!(matches!(error, CurlError::BadOptionUsage { .. }));
+            assert!(matches!(error, CurlError::BadOptionUsage { .. }));
+        }
     }
 
     #[test]
