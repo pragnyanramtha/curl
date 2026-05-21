@@ -1,8 +1,8 @@
 use std::collections::HashMap;
 use std::ffi::OsString;
 use std::io::Read;
-use std::path::PathBuf;
-use std::time::Duration;
+use std::path::{Path, PathBuf};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64_STANDARD};
 
@@ -906,7 +906,7 @@ impl Parser {
             }
             "time-cond" => {
                 let value = self.value_for(name, inline_value)?;
-                self.current().time_cond = Some(value);
+                self.current().time_cond = parse_time_cond_argument(&value);
             }
             "write-out" => {
                 let value = self.value_for(name, inline_value)?;
@@ -1274,7 +1274,7 @@ impl Parser {
                 }
                 'z' => {
                     let value = self.short_value('z', rest)?;
-                    self.current().time_cond = Some(value);
+                    self.current().time_cond = parse_time_cond_argument(&value);
                     break;
                 }
                 'w' => {
@@ -2417,6 +2417,192 @@ fn parse_nonempty_path(name: &str, value: &str) -> Result<PathBuf> {
     } else {
         Ok(PathBuf::from(value))
     }
+}
+
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+enum TimeConditionKind {
+    IfModifiedSince,
+    IfUnmodifiedSince,
+    LastModified,
+}
+
+fn parse_time_cond_argument(value: &str) -> Option<String> {
+    let (kind, date_expression) = match value.as_bytes().first() {
+        Some(b'+') => (TimeConditionKind::IfModifiedSince, &value[1..]),
+        Some(b'-') => (TimeConditionKind::IfUnmodifiedSince, &value[1..]),
+        Some(b'=') => (TimeConditionKind::LastModified, &value[1..]),
+        _ => (TimeConditionKind::IfModifiedSince, value),
+    };
+    let date_expression = date_expression.trim_start();
+
+    let Some(date) = resolve_time_condition_date(date_expression) else {
+        eprintln!(
+            "Warning: Illegal date format for -z, --time-cond (and not a filename). \
+             Disabling time condition. See curl_getdate(3) for valid date syntax."
+        );
+        return None;
+    };
+
+    match kind {
+        TimeConditionKind::IfModifiedSince => Some(date),
+        TimeConditionKind::IfUnmodifiedSince => Some(format!("-{date}")),
+        TimeConditionKind::LastModified => Some(format!("={date}")),
+    }
+}
+
+fn resolve_time_condition_date(value: &str) -> Option<String> {
+    if let Ok(time) = httpdate::parse_http_date(value) {
+        return Some(httpdate::fmt_http_date(time));
+    }
+    if let Some(time) = parse_curl_time_condition_date(value) {
+        return Some(httpdate::fmt_http_date(time));
+    }
+    std::fs::metadata(Path::new(value))
+        .and_then(|metadata| metadata.modified())
+        .ok()
+        .map(httpdate::fmt_http_date)
+}
+
+pub(crate) fn parse_curl_time_condition_date(value: &str) -> Option<SystemTime> {
+    let normalized = value.replace(',', " ");
+    let mut parts = normalized.split_whitespace().collect::<Vec<_>>();
+    if parts
+        .first()
+        .is_some_and(|part| parse_weekday_name(part).is_some())
+    {
+        parts.remove(0);
+    }
+
+    match parts.as_slice() {
+        [month, day, time, year, zone] if is_utc_zone(zone) && time.contains(':') => {
+            let month = parse_month_name(month)?;
+            let day = day.parse().ok()?;
+            let year = year.parse().ok()?;
+            let (hour, minute, second) = parse_hms(time)?;
+            system_time_from_utc(year, month, day, hour, minute, second)
+        }
+        [day, month, year, time, zone] if is_utc_zone(zone) && time.contains(':') => {
+            let month = parse_month_name(month)?;
+            let day = day.parse().ok()?;
+            let year = year.parse().ok()?;
+            let (hour, minute, second) = parse_hms(time)?;
+            system_time_from_utc(year, month, day, hour, minute, second)
+        }
+        [day, month, year, time] if time.contains(':') => {
+            let month = parse_month_name(month)?;
+            let day = day.parse().ok()?;
+            let year = year.parse().ok()?;
+            let (hour, minute, second) = parse_hms(time)?;
+            system_time_from_utc(year, month, day, hour, minute, second)
+        }
+        _ => None,
+    }
+}
+
+fn parse_weekday_name(value: &str) -> Option<()> {
+    let lower = value.to_ascii_lowercase();
+    matches!(
+        lower.as_str(),
+        "mon"
+            | "monday"
+            | "tue"
+            | "tues"
+            | "tuesday"
+            | "wed"
+            | "wednesday"
+            | "thu"
+            | "thur"
+            | "thurs"
+            | "thursday"
+            | "fri"
+            | "friday"
+            | "sat"
+            | "saturday"
+            | "sun"
+            | "sunday"
+    )
+    .then_some(())
+}
+
+fn parse_month_name(value: &str) -> Option<u32> {
+    match value.get(..3)?.to_ascii_lowercase().as_str() {
+        "jan" => Some(1),
+        "feb" => Some(2),
+        "mar" => Some(3),
+        "apr" => Some(4),
+        "may" => Some(5),
+        "jun" => Some(6),
+        "jul" => Some(7),
+        "aug" => Some(8),
+        "sep" => Some(9),
+        "oct" => Some(10),
+        "nov" => Some(11),
+        "dec" => Some(12),
+        _ => None,
+    }
+}
+
+fn parse_hms(value: &str) -> Option<(u32, u32, u32)> {
+    let mut parts = value.split(':');
+    let hour: u32 = parts.next()?.parse().ok()?;
+    let minute: u32 = parts.next()?.parse().ok()?;
+    let second: u32 = parts.next()?.parse().ok()?;
+    if parts.next().is_some() || hour > 23 || minute > 59 || second > 60 {
+        return None;
+    }
+    Some((hour, minute, second.min(59)))
+}
+
+fn is_utc_zone(value: &str) -> bool {
+    value.eq_ignore_ascii_case("gmt") || value.eq_ignore_ascii_case("utc")
+}
+
+fn system_time_from_utc(
+    year: i32,
+    month: u32,
+    day: u32,
+    hour: u32,
+    minute: u32,
+    second: u32,
+) -> Option<SystemTime> {
+    if !(1..=12).contains(&month) || day == 0 || day > days_in_month(year, month) || year < 1970 {
+        return None;
+    }
+    let days = days_from_civil(year, month, day);
+    let seconds = days
+        .checked_mul(86_400)?
+        .checked_add(i64::from(hour) * 3_600)?
+        .checked_add(i64::from(minute) * 60)?
+        .checked_add(i64::from(second))?;
+    let seconds = u64::try_from(seconds).ok()?;
+    UNIX_EPOCH.checked_add(Duration::from_secs(seconds))
+}
+
+fn days_in_month(year: i32, month: u32) -> u32 {
+    match month {
+        1 | 3 | 5 | 7 | 8 | 10 | 12 => 31,
+        4 | 6 | 9 | 11 => 30,
+        2 if is_leap_year(year) => 29,
+        2 => 28,
+        _ => 0,
+    }
+}
+
+fn is_leap_year(year: i32) -> bool {
+    (year % 4 == 0 && year % 100 != 0) || year % 400 == 0
+}
+
+fn days_from_civil(year: i32, month: u32, day: u32) -> i64 {
+    let mut year = i64::from(year);
+    let month = i64::from(month);
+    let day = i64::from(day);
+    year -= i64::from(month <= 2);
+    let era = year / 400;
+    let yoe = year - era * 400;
+    let month_for_formula = month + if month > 2 { -3 } else { 9 };
+    let doy = (153 * month_for_formula + 2) / 5 + day - 1;
+    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+    era * 146_097 + doe - 719_468
 }
 
 fn parse_nonempty_string(name: &str, value: String) -> Result<String> {
@@ -4315,6 +4501,75 @@ mod tests {
         assert_eq!(transfer.proxy.as_deref(), Some("http://proxy.example:8080"));
         assert_eq!(transfer.proxy_user.as_deref(), Some("proxy-user:secret"));
         assert_eq!(transfer.noproxy.as_deref(), Some("example.com"));
+    }
+
+    #[test]
+    fn time_cond_normalizes_curl_date_forms_and_file_mtime() {
+        let config = parse_args([
+            "-q",
+            "-z",
+            "dec 12 12:00:00 1999 GMT",
+            "https://example.com",
+        ])
+        .unwrap();
+        assert_eq!(
+            config.transfers[0].time_cond.as_deref(),
+            Some("Sun, 12 Dec 1999 12:00:00 GMT")
+        );
+
+        let config = parse_args([
+            "-q",
+            "--time-cond",
+            "-dec 12 12:00:00 1999 GMT",
+            "https://example.com",
+        ])
+        .unwrap();
+        assert_eq!(
+            config.transfers[0].time_cond.as_deref(),
+            Some("-Sun, 12 Dec 1999 12:00:00 GMT")
+        );
+
+        let config = parse_args([
+            "-q",
+            "--time-cond",
+            "+Wed 01 Sep 2021 12:18:00",
+            "https://example.com",
+        ])
+        .unwrap();
+        assert_eq!(
+            config.transfers[0].time_cond.as_deref(),
+            Some("Wed, 01 Sep 2021 12:18:00 GMT")
+        );
+        assert!(parse_curl_time_condition_date("Tue, 13 Jun 1990 12:10:00 GMT").is_some());
+
+        let temp = tempdir().unwrap();
+        let marker = temp.path().join("marker");
+        std::fs::write(&marker, "marker").unwrap();
+        let modified = std::fs::metadata(&marker).unwrap().modified().unwrap();
+        let config =
+            parse_args(["-q", "-z", marker.to_str().unwrap(), "https://example.com"]).unwrap();
+        let parsed =
+            httpdate::parse_http_date(config.transfers[0].time_cond.as_deref().unwrap()).unwrap();
+        assert!(
+            parsed
+                .duration_since(modified)
+                .unwrap_or_else(|error| error.duration())
+                < Duration::from_secs(2)
+        );
+    }
+
+    #[test]
+    fn time_cond_missing_file_disables_condition() {
+        let temp = tempdir().unwrap();
+        let missing = temp.path().join("missing");
+        let config = parse_args([
+            "-q",
+            "--time-cond",
+            missing.to_str().unwrap(),
+            "https://example.com",
+        ])
+        .unwrap();
+        assert!(config.transfers[0].time_cond.is_none());
     }
 
     #[test]

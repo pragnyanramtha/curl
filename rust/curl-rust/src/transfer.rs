@@ -27,6 +27,7 @@ use reqwest::{Client, Method, StatusCode, Url, Version};
 use crate::cli::{
     Config, ContinueAt, FtpFileMethod, HttpVersionPreference, IpVersionPreference, LocalPortRange,
     OutputTarget, SslVersionMaxPreference, SslVersionPreference, TransferConfig,
+    parse_curl_time_condition_date,
 };
 use crate::cookie::CookieJar;
 use crate::data::{self, PreparedBody};
@@ -8948,6 +8949,7 @@ async fn run_http_transfer(
             || raw_http_output_slot_wire_semantics(transfer)
             || raw_http_retry_wire_semantics(transfer, &method)
             || raw_http_default_get_version_wire_semantics(transfer, &method)
+            || raw_http_time_condition_wire_semantics(transfer, &method)
             || method == Method::HEAD
             || (method != Method::HEAD && max_filesize_limit(transfer).is_some()))
     {
@@ -9270,6 +9272,27 @@ fn raw_http_default_get_version_wire_semantics(transfer: &TransferConfig, method
         && transfer.referer.is_none()
         && transfer.range.is_none()
         && transfer.time_cond.is_none()
+        && transfer.etag_compare.is_none()
+}
+
+fn raw_http_time_condition_wire_semantics(transfer: &TransferConfig, method: &Method) -> bool {
+    transfer.time_cond.is_some()
+        && transfer.include_headers
+        && *method == Method::GET
+        && !transfer.verbose
+        && transfer.headers.is_empty()
+        && transfer.resolve.is_empty()
+        && transfer.proxy.is_none()
+        && transfer.http_version == HttpVersionPreference::Any
+        && transfer.data.is_empty()
+        && transfer.forms.is_empty()
+        && transfer.upload_file.is_none()
+        && transfer.user.is_none()
+        && transfer.oauth2_bearer.is_none()
+        && transfer.aws_sigv4.is_none()
+        && transfer.cookie.is_none()
+        && transfer.referer.is_none()
+        && transfer.range.is_none()
         && transfer.etag_compare.is_none()
 }
 
@@ -9624,9 +9647,9 @@ fn raw_http_direct_request(context: &RawHttpDirectContext<'_>) -> Result<Vec<u8>
         );
     }
     if let Some(time_cond) = &context.transfer.time_cond {
-        let (name, value) = time_condition_header(time_cond);
+        let (name, raw_name, value) = time_condition_header(time_cond);
         if !has_header(name.as_str()) {
-            request.extend_from_slice(name.as_str().as_bytes());
+            request.extend_from_slice(raw_name.as_bytes());
             request.extend_from_slice(b": ");
             request.extend_from_slice(value.as_bytes());
             request.extend_from_slice(b"\r\n");
@@ -9770,9 +9793,9 @@ fn raw_http_proxy_request(context: &RawHttpProxyContext<'_>) -> Result<Vec<u8>> 
         );
     }
     if let Some(time_cond) = &context.transfer.time_cond {
-        let (name, value) = time_condition_header(time_cond);
+        let (name, raw_name, value) = time_condition_header(time_cond);
         if !has_header(name.as_str()) {
-            request.extend_from_slice(name.as_str().as_bytes());
+            request.extend_from_slice(raw_name.as_bytes());
             request.extend_from_slice(b": ");
             request.extend_from_slice(value.as_bytes());
             request.extend_from_slice(b"\r\n");
@@ -10714,9 +10737,15 @@ fn write_http_attempt_output(
     let is_error = attempt.status.is_some_and(is_http_error_status);
     let etag_not_modified =
         transfer.etag_compare.is_some() && attempt.status == Some(StatusCode::NOT_MODIFIED);
+    let time_cond_not_modified =
+        time_condition_not_met(transfer, &attempt.headers, attempt.resume_from);
+    if time_cond_not_modified {
+        metrics.response_code = Some(StatusCode::NOT_MODIFIED.as_u16());
+    }
     let write_headers = transfer.include_headers || transfer.head;
     let write_body = method.as_str() != "HEAD"
         && !etag_not_modified
+        && !time_cond_not_modified
         && (!is_error || !transfer.fail || transfer.fail_with_body);
     let (body_bytes, max_filesize_exceeded) = if write_body {
         limit_body_for_max_filesize(transfer, &attempt.body)
@@ -11026,7 +11055,7 @@ fn apply_headers(
     }
 
     if let Some(time_cond) = &transfer.time_cond {
-        let (name, value) = time_condition_header(time_cond);
+        let (name, _, value) = time_condition_header(time_cond);
         if !has_header(name.as_str()) {
             request = request.header(name, value);
         }
@@ -11436,12 +11465,69 @@ fn load_etag_compare(path: &Path) -> Result<String> {
     }
 }
 
-fn time_condition_header(value: &str) -> (HeaderName, &str) {
-    value
+fn time_condition_header(value: &str) -> (HeaderName, &'static str, &str) {
+    if let Some(value) = value.strip_prefix('-') {
+        (IF_UNMODIFIED_SINCE, "If-Unmodified-Since", value)
+    } else if let Some(value) = value.strip_prefix('=') {
+        (LAST_MODIFIED, "Last-Modified", value)
+    } else {
+        (IF_MODIFIED_SINCE, "If-Modified-Since", value)
+    }
+}
+
+fn time_condition_not_met(
+    transfer: &TransferConfig,
+    headers: &HeaderMap,
+    resume_from: u64,
+) -> bool {
+    if transfer.range.is_some() || resume_from > 0 {
+        return false;
+    }
+
+    let Some(time_cond) = transfer.time_cond.as_deref() else {
+        return false;
+    };
+    let (if_unmodified_since, condition_value) = time_cond
         .strip_prefix('-')
-        .map_or((IF_MODIFIED_SINCE, value), |value| {
-            (IF_UNMODIFIED_SINCE, value.trim_start())
-        })
+        .map_or((false, time_cond), |value| (true, value));
+    let condition = match parse_time_condition_comparison_date(condition_value.trim()) {
+        Ok(condition) => condition,
+        Err(_) => return false,
+    };
+    let document_time = match headers
+        .get(LAST_MODIFIED)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| parse_time_condition_comparison_date(value.trim()).ok())
+    {
+        Some(document_time) => document_time,
+        None => return false,
+    };
+
+    if if_unmodified_since {
+        system_time_cmp_ge(document_time, condition)
+    } else {
+        system_time_cmp_le(document_time, condition)
+    }
+}
+
+fn parse_time_condition_comparison_date(value: &str) -> std::result::Result<SystemTime, ()> {
+    httpdate::parse_http_date(value)
+        .or_else(|_| parse_curl_time_condition_date(value).ok_or(()))
+        .map_err(|_| ())
+}
+
+fn system_time_cmp_le(left: SystemTime, right: SystemTime) -> bool {
+    match left.duration_since(right) {
+        Ok(duration) => duration.is_zero(),
+        Err(_) => true,
+    }
+}
+
+fn system_time_cmp_ge(left: SystemTime, right: SystemTime) -> bool {
+    match left.duration_since(right) {
+        Ok(_) => true,
+        Err(error) => error.duration().is_zero(),
+    }
 }
 
 fn save_etag(

@@ -12131,6 +12131,168 @@ fn time_cond_sends_if_modified_since() {
 }
 
 #[test]
+fn time_cond_normalizes_curl_date_string() {
+    let (url, rx) = spawn_server(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok");
+
+    let mut command = Command::cargo_bin("curl").unwrap();
+    command.args(["-q", "-sS", "-z", "dec 12 12:00:00 1999 GMT", &url]);
+    command.assert().success().stdout("ok");
+
+    let request = rx.recv().unwrap();
+    assert_eq!(
+        header(&request, "if-modified-since"),
+        Some("Sun, 12 Dec 1999 12:00:00 GMT")
+    );
+}
+
+#[test]
+fn time_cond_uses_file_mtime_when_date_parse_fails() {
+    let temp = tempdir().unwrap();
+    let marker = temp.path().join("marker");
+    std::fs::write(&marker, "marker").unwrap();
+    let modified = std::fs::metadata(&marker).unwrap().modified().unwrap();
+    let (url, rx) = spawn_server(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok");
+
+    let mut command = Command::cargo_bin("curl").unwrap();
+    command.args(["-q", "-sS", "-z", marker.to_str().unwrap(), &url]);
+    command.assert().success().stdout("ok");
+
+    let request = rx.recv().unwrap();
+    let header = header(&request, "if-modified-since").unwrap();
+    let parsed = httpdate::parse_http_date(header).unwrap();
+    assert!(
+        parsed
+            .duration_since(modified)
+            .unwrap_or_else(|error| error.duration())
+            < Duration::from_secs(2)
+    );
+}
+
+#[test]
+fn time_cond_missing_file_disables_header() {
+    let temp = tempdir().unwrap();
+    let missing = temp.path().join("missing");
+    let (url, rx) = spawn_server(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok");
+
+    let mut command = Command::cargo_bin("curl").unwrap();
+    command.args(["-q", "-sS", "-z", missing.to_str().unwrap(), &url]);
+    command
+        .assert()
+        .success()
+        .stdout("ok")
+        .stderr(predicates::str::contains(
+            "Illegal date format for -z, --time-cond",
+        ));
+
+    let request = rx.recv().unwrap();
+    assert_eq!(header(&request, "if-modified-since"), None);
+    assert_eq!(header(&request, "if-unmodified-since"), None);
+}
+
+#[test]
+fn time_cond_unmet_response_suppresses_body_and_reports_304() {
+    let (url, rx) = spawn_server(
+        b"HTTP/1.1 200 OK\r\nLast-Modified: Tue, 13 Jun 1990 12:10:00 GMT\r\nContent-Length: 6\r\n\r\n-foo-\n",
+    );
+
+    let mut command = Command::cargo_bin("curl").unwrap();
+    let output = command
+        .args([
+            "-q",
+            "-sS",
+            "-i",
+            "-w",
+            "%{response_code}",
+            "-z",
+            "dec 12 11:00:00 1999 GMT",
+            &url,
+        ])
+        .output()
+        .unwrap();
+
+    assert!(output.status.success());
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    assert!(stdout.starts_with("HTTP/1.1 200 OK\r\n"));
+    assert!(!stdout.contains("-foo-"));
+    assert!(stdout.ends_with("\r\n\r\n304"));
+
+    let request = rx.recv().unwrap();
+    assert_eq!(
+        header(&request, "if-modified-since"),
+        Some("Sun, 12 Dec 1999 11:00:00 GMT")
+    );
+}
+
+#[test]
+fn negative_time_cond_unmet_response_reports_304() {
+    let (url, rx) = spawn_server(
+        b"HTTP/1.1 200 OK\r\nLast-Modified: Tue, 13 Jun 2010 12:10:00 GMT\r\nContent-Length: 6\r\n\r\n-foo-\n",
+    );
+
+    let mut command = Command::cargo_bin("curl").unwrap();
+    let output = command
+        .args([
+            "-q",
+            "-sS",
+            "-i",
+            "-w",
+            "%{response_code}",
+            "--time-cond",
+            "-dec 12 12:00:00 1999 GMT",
+            &url,
+        ])
+        .output()
+        .unwrap();
+
+    assert!(output.status.success());
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    assert!(stdout.starts_with("HTTP/1.1 200 OK\r\n"));
+    assert!(!stdout.contains("-foo-"));
+    assert!(stdout.ends_with("\r\n\r\n304"));
+
+    let request = rx.recv().unwrap();
+    assert_eq!(
+        header(&request, "if-unmodified-since"),
+        Some("Sun, 12 Dec 1999 12:00:00 GMT")
+    );
+}
+
+#[test]
+fn time_cond_unmet_response_preserves_existing_output_file() {
+    let temp = tempdir().unwrap();
+    let output = temp.path().join("out");
+    std::fs::write(&output, "original contents\n").unwrap();
+    let (url, rx) = spawn_server(
+        b"HTTP/1.1 200 OK\r\nLast-Modified: Tue, 13 Jun 1990 12:10:00 GMT\r\nContent-Length: 6\r\n\r\n-foo-\n",
+    );
+
+    let mut command = Command::cargo_bin("curl").unwrap();
+    command
+        .args([
+            "-q",
+            "-sS",
+            "-z",
+            "dec 12 11:00:00 1999 GMT",
+            "-o",
+            output.to_str().unwrap(),
+            &url,
+        ])
+        .assert()
+        .success()
+        .stdout("");
+
+    assert_eq!(
+        std::fs::read_to_string(output).unwrap(),
+        "original contents\n"
+    );
+    let request = rx.recv().unwrap();
+    assert_eq!(
+        header(&request, "if-modified-since"),
+        Some("Sun, 12 Dec 1999 11:00:00 GMT")
+    );
+}
+
+#[test]
 fn negative_time_cond_sends_if_unmodified_since() {
     let (url, rx) = spawn_server(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok");
 
