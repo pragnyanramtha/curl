@@ -8741,6 +8741,94 @@ fn unknown_url_scheme_exits_unsupported_protocol() {
 }
 
 #[test]
+fn proto_denies_initial_protocol_before_connecting() {
+    let (url, rx) = spawn_server(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok");
+
+    let mut command = Command::cargo_bin("curl").unwrap();
+    command.args(["-q", "-sS", "--proto", "-http", &url]);
+    command.assert().failure().code(1).stdout("");
+
+    assert!(rx.recv_timeout(Duration::from_millis(100)).is_err());
+}
+
+#[test]
+fn proto_empty_allowlist_is_bad_option_usage() {
+    let (url, rx) = spawn_server(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok");
+
+    let mut command = Command::cargo_bin("curl").unwrap();
+    command.args(["-q", "-sS", "--proto", "-all", &url]);
+    command.assert().failure().code(2).stdout("");
+
+    assert!(rx.recv_timeout(Duration::from_millis(100)).is_err());
+}
+
+#[test]
+fn proto_redir_denies_http_redirect_before_followup() {
+    let (start_url, start_rx, target_rx) =
+        spawn_cross_origin_redirect(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok");
+
+    let mut command = Command::cargo_bin("curl").unwrap();
+    command.args([
+        "-q",
+        "-sS",
+        "--location",
+        "--proto-redir",
+        "-http",
+        &start_url,
+    ]);
+    command.assert().failure().code(1).stdout("");
+
+    let request = start_rx.recv().unwrap();
+    assert!(request.start_line.starts_with("GET /resource HTTP/1.1"));
+    assert!(target_rx.recv_timeout(Duration::from_millis(100)).is_err());
+}
+
+#[test]
+fn proto_redir_allows_selected_http_redirect() {
+    let (start_url, start_rx, target_rx) =
+        spawn_cross_origin_redirect(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok");
+
+    let mut command = Command::cargo_bin("curl").unwrap();
+    command.args([
+        "-q",
+        "-sS",
+        "--location",
+        "--proto-redir",
+        "-all,+http",
+        &start_url,
+    ]);
+    command.assert().success().stdout("ok");
+
+    let request = start_rx.recv().unwrap();
+    assert!(request.start_line.starts_with("GET /resource HTTP/1.1"));
+    let request = target_rx.recv().unwrap();
+    assert!(request.start_line.starts_with("GET /resource HTTP/1.1"));
+}
+
+#[test]
+fn proto_deny_overrides_proto_redir_allow() {
+    let redirect =
+        b"HTTP/1.1 302 Found\r\nLocation: ftp://127.0.0.1:9/file.txt\r\nContent-Length: 0\r\n\r\n";
+    let (url, rx) = spawn_server(redirect);
+
+    let mut command = Command::cargo_bin("curl").unwrap();
+    command.args([
+        "-q",
+        "-sS",
+        "--location",
+        "--proto",
+        "+all,-ftp",
+        "--proto-redir",
+        "-all,+ftp",
+        &url,
+    ]);
+    command.assert().failure().code(1).stdout("");
+
+    let request = rx.recv().unwrap();
+    assert!(request.start_line.starts_with("GET /resource HTTP/1.1"));
+}
+
+#[test]
 fn fail_early_stops_after_first_sequential_error() {
     let (url, rx) = spawn_server(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok");
 

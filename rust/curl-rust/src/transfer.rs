@@ -693,6 +693,14 @@ async fn run_expanded_url(
     let mut method_label = effective_method_label(transfer);
     let mut metrics = writeout::Metrics::empty(&expanded.url, &method_label);
     let started = Instant::now();
+    if let Err(error) = ensure_initial_protocol_allowed(transfer, &expanded.url) {
+        metrics.time_total = started.elapsed();
+        metrics.exit_code = error.exit_code();
+        metrics.errormsg = error.to_string();
+        report_error(transfer, &error);
+        write_writeout(transfer, &metrics)?;
+        return Ok(metrics.exit_code);
+    }
     let expanded = match ipfs::maybe_rewrite_url(&expanded.url, transfer.ipfs_gateway.as_deref()) {
         Ok(Some(url)) => glob::ExpandedUrl {
             url,
@@ -8664,6 +8672,17 @@ async fn run_http_transfer(
                     });
                 }
 
+                if !redirect_protocol_allowed(transfer, &next_url) {
+                    metrics.url_effective = attempt.final_url.to_string();
+                    metrics.response_code = Some(status.as_u16());
+                    metrics.referer = custom_referer.clone().or_else(|| current_referer.clone());
+                    metrics.redirect_url = Some(next_url.to_string());
+                    metrics.headers = attempt.headers;
+                    return Err(CurlError::UnsupportedProtocol(
+                        next_url.scheme().to_string(),
+                    ));
+                }
+
                 if next_url.scheme() != "http" {
                     if next_url.scheme() == "https"
                         && !transfer.raw
@@ -8848,6 +8867,17 @@ async fn run_http_transfer(
                     return Err(CurlError::TooManyRedirects {
                         max: transfer.max_redirs,
                     });
+                }
+
+                if !redirect_protocol_allowed(transfer, &next_url) {
+                    metrics.url_effective = attempt.final_url.to_string();
+                    metrics.response_code = Some(status.as_u16());
+                    metrics.referer = custom_referer.clone().or_else(|| current_referer.clone());
+                    metrics.redirect_url = Some(next_url.to_string());
+                    metrics.headers = attempt.headers;
+                    return Err(CurlError::UnsupportedProtocol(
+                        next_url.scheme().to_string(),
+                    ));
                 }
 
                 if next_url.scheme() != "http" {
@@ -9103,6 +9133,17 @@ async fn run_http_transfer(
                 return Err(CurlError::TooManyRedirects {
                     max: transfer.max_redirs,
                 });
+            }
+
+            if !redirect_protocol_allowed(transfer, &next_url) {
+                metrics.url_effective = final_url.to_string();
+                metrics.response_code = Some(status.as_u16());
+                metrics.referer = custom_referer.clone().or_else(|| current_referer.clone());
+                metrics.redirect_url = Some(next_url.to_string());
+                metrics.headers = headers;
+                return Err(CurlError::UnsupportedProtocol(
+                    next_url.scheme().to_string(),
+                ));
             }
 
             if !matches!(next_url.scheme(), "http" | "https") {
@@ -10954,6 +10995,26 @@ fn effective_http_method(transfer: &TransferConfig) -> Result<Method> {
 
 fn is_http_url(url: &str) -> bool {
     has_url_scheme_with_authority(url, "http") || has_url_scheme_with_authority(url, "https")
+}
+
+fn ensure_initial_protocol_allowed(transfer: &TransferConfig, url: &str) -> Result<()> {
+    if let Some(scheme) = valid_url_scheme(url)
+        && !transfer.allowed_protocols.allows_scheme(scheme)
+    {
+        return Err(CurlError::UnsupportedProtocol(scheme.to_string()));
+    }
+    Ok(())
+}
+
+fn redirect_protocol_allowed(transfer: &TransferConfig, url: &Url) -> bool {
+    let scheme = url.scheme();
+    transfer.allowed_protocols.allows_scheme(scheme)
+        && transfer.redirect_protocols.allows_scheme(scheme)
+}
+
+fn valid_url_scheme(url: &str) -> Option<&str> {
+    let (scheme, _) = url.split_once(':')?;
+    is_valid_url_scheme(scheme).then_some(scheme)
 }
 
 fn has_url_scheme(url: &str, expected: &str) -> bool {

@@ -6,7 +6,7 @@ use std::time::Duration;
 use url::Url;
 
 use crate::cli::{
-    Config, ContinueAt, FtpFileMethod, HttpVersionPreference, IpVersionPreference,
+    Config, ContinueAt, FtpFileMethod, HttpVersionPreference, IpVersionPreference, ProtocolSet,
     SslVersionMaxPreference, SslVersionPreference, TransferConfig,
 };
 use crate::data::{self, PreparedBody};
@@ -251,6 +251,16 @@ fn write_request(out: &mut String, render: &RenderTransfer<'_>, url: &str) -> Re
     emit_long_setopt(out, "CURLOPT_BUFFERSIZE", 102400);
     emit_string_setopt(out, "CURLOPT_URL", url);
 
+    if !transfer.allowed_protocols.is_all() {
+        emit_protocols_setopt(out, "CURLOPT_PROTOCOLS_STR", transfer.allowed_protocols);
+    }
+    if !transfer.redirect_protocols.is_default_redirect() {
+        emit_protocols_setopt(
+            out,
+            "CURLOPT_REDIR_PROTOCOLS_STR",
+            transfer.redirect_protocols,
+        );
+    }
     if let Some(method) = &transfer.method {
         emit_string_setopt(out, "CURLOPT_CUSTOMREQUEST", method);
     }
@@ -800,6 +810,10 @@ fn emit_string_setopt(out: &mut String, option: &str, value: &str) {
     emit_bytes_setopt(out, option, value.as_bytes());
 }
 
+fn emit_protocols_setopt(out: &mut String, option: &str, protocols: ProtocolSet) {
+    emit_string_setopt(out, option, &protocols.to_protocol_string());
+}
+
 fn emit_path_setopt(out: &mut String, option: &str, value: &Path) {
     emit_bytes_setopt(out, option, value.to_string_lossy().as_bytes());
 }
@@ -1196,6 +1210,21 @@ mod tests {
         let source = render_source(&config).unwrap();
         assert!(source.contains("CURLOPT_LOW_SPEED_LIMIT, 1L"));
         assert!(!source.contains("CURLOPT_LOW_SPEED_TIME"));
+
+        let config = parse_args([
+            "-q",
+            "--libcurl",
+            "client.c",
+            "--proto",
+            "=http,https",
+            "--proto-redir",
+            "-all,+https",
+            "https://example.com",
+        ])
+        .unwrap();
+        let source = render_source(&config).unwrap();
+        assert!(source.contains("CURLOPT_PROTOCOLS_STR, \"http,https\""));
+        assert!(source.contains("CURLOPT_REDIR_PROTOCOLS_STR, \"https\""));
     }
 
     #[test]

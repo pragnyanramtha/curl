@@ -68,6 +68,8 @@ pub struct TransferConfig {
     pub tftp_no_options: bool,
     pub telnet_options: Vec<String>,
     pub ipfs_gateway: Option<String>,
+    pub allowed_protocols: ProtocolSet,
+    pub redirect_protocols: ProtocolSet,
     pub proto_default: Option<String>,
     pub output: Option<String>,
     pub output_slots: Vec<OutputTarget>,
@@ -172,6 +174,65 @@ pub enum FtpFileMethod {
     MultiCwd,
     NoCwd,
     SingleCwd,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ProtocolSet(u64);
+
+impl ProtocolSet {
+    pub fn all() -> Self {
+        Self((1_u64 << PROTOCOL_NAMES.len()) - 1)
+    }
+
+    pub fn default_redirect() -> Self {
+        let mut set = Self::empty();
+        set.insert(protocol_bit("ftp").expect("known protocol"));
+        set.insert(protocol_bit("ftps").expect("known protocol"));
+        set.insert(protocol_bit("http").expect("known protocol"));
+        set.insert(protocol_bit("https").expect("known protocol"));
+        set
+    }
+
+    pub fn is_all(self) -> bool {
+        self == Self::all()
+    }
+
+    pub fn is_default_redirect(self) -> bool {
+        self == Self::default_redirect()
+    }
+
+    pub fn allows_scheme(self, scheme: &str) -> bool {
+        protocol_bit(scheme).is_some_and(|bit| self.contains(bit))
+    }
+
+    pub fn to_protocol_string(self) -> String {
+        PROTOCOL_NAMES
+            .iter()
+            .filter(|name| self.allows_scheme(name))
+            .copied()
+            .collect::<Vec<_>>()
+            .join(",")
+    }
+
+    fn empty() -> Self {
+        Self(0)
+    }
+
+    fn contains(self, bit: u64) -> bool {
+        self.0 & bit != 0
+    }
+
+    fn insert(&mut self, bit: u64) {
+        self.0 |= bit;
+    }
+
+    fn remove(&mut self, bit: u64) {
+        self.0 &= !bit;
+    }
+
+    fn is_empty(self) -> bool {
+        self.0 == 0
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -480,6 +541,8 @@ impl Default for TransferConfig {
             tftp_no_options: false,
             telnet_options: Vec::new(),
             ipfs_gateway: None,
+            allowed_protocols: ProtocolSet::all(),
+            redirect_protocols: ProtocolSet::default_redirect(),
             proto_default: None,
             output: None,
             output_slots: Vec::new(),
@@ -862,6 +925,16 @@ impl Parser {
             "ipfs-gateway" => {
                 let value = self.value_for(name, inline_value)?;
                 self.current().ipfs_gateway = Some(parse_nonempty_string(name, value)?);
+            }
+            "proto" => {
+                let value = self.value_for(name, inline_value)?;
+                self.current().allowed_protocols =
+                    parse_protocol_set(name, &value, ProtocolSet::all())?;
+            }
+            "proto-redir" => {
+                let value = self.value_for(name, inline_value)?;
+                self.current().redirect_protocols =
+                    parse_protocol_set(name, &value, ProtocolSet::default_redirect())?;
             }
             "proto-default" => {
                 let value = self.value_for(name, inline_value)?;
@@ -1800,6 +1873,8 @@ impl TransferConfig {
             || self.tftp_no_options
             || !self.telnet_options.is_empty()
             || self.ipfs_gateway.is_some()
+            || !self.allowed_protocols.is_all()
+            || !self.redirect_protocols.is_default_redirect()
             || self.proto_default.is_some()
             || self.output.is_some()
             || !self.output_slots.is_empty()
@@ -1929,6 +2004,8 @@ fn option_takes_value(name: &str) -> bool {
             | "tftp-blksize"
             | "telnet-option"
             | "ipfs-gateway"
+            | "proto"
+            | "proto-redir"
             | "proto-default"
             | "output"
             | "output-dir"
@@ -2615,14 +2692,83 @@ fn parse_nonempty_string(name: &str, value: String) -> Result<String> {
     }
 }
 
+const PROTOCOL_NAMES: &[&str] = &[
+    "dict", "file", "ftp", "ftps", "gopher", "gophers", "http", "https", "imap", "imaps", "ipfs",
+    "ipns", "ldap", "ldaps", "mqtt", "mqtts", "pop3", "pop3s", "rtsp", "scp", "sftp", "smb",
+    "smbs", "smtp", "smtps", "telnet", "tftp", "ws", "wss",
+];
+
+fn parse_protocol_set(name: &str, value: &str, default_set: ProtocolSet) -> Result<ProtocolSet> {
+    let value = parse_nonempty_string(name, value.to_string())?;
+    let mut set = default_set;
+
+    for raw_token in value.split(',') {
+        if raw_token.is_empty() {
+            continue;
+        }
+        let (action, token) = match raw_token.as_bytes()[0] {
+            b'=' => (ProtocolAction::Set, &raw_token[1..]),
+            b'-' => (ProtocolAction::Deny, &raw_token[1..]),
+            b'+' => (ProtocolAction::Allow, &raw_token[1..]),
+            _ => (ProtocolAction::Allow, raw_token),
+        };
+
+        if token.eq_ignore_ascii_case("all") {
+            match action {
+                ProtocolAction::Allow | ProtocolAction::Set => set = ProtocolSet::all(),
+                ProtocolAction::Deny => set = ProtocolSet::empty(),
+            }
+            continue;
+        }
+
+        let Some(bit) = protocol_bit(token) else {
+            if matches!(action, ProtocolAction::Set) {
+                set = ProtocolSet::empty();
+            }
+            eprintln!("Warning: unrecognized protocol '{token}'");
+            continue;
+        };
+
+        match action {
+            ProtocolAction::Allow => set.insert(bit),
+            ProtocolAction::Deny => set.remove(bit),
+            ProtocolAction::Set => {
+                set = ProtocolSet::empty();
+                set.insert(bit);
+            }
+        }
+    }
+
+    if set.is_empty() {
+        return Err(bad_option_usage(
+            format!("--{name} leaves no protocols enabled"),
+            format!("--{name}"),
+        ));
+    }
+
+    Ok(set)
+}
+
+#[derive(Clone, Copy)]
+enum ProtocolAction {
+    Allow,
+    Deny,
+    Set,
+}
+
+fn protocol_bit(value: &str) -> Option<u64> {
+    PROTOCOL_NAMES
+        .iter()
+        .position(|name| name.eq_ignore_ascii_case(value))
+        .map(|index| 1_u64 << index)
+}
+
 fn parse_protocol_name(name: &str, value: String) -> Result<String> {
     let value = parse_nonempty_string(name, value)?.to_ascii_lowercase();
-    match value.as_str() {
-        "dict" | "file" | "ftp" | "ftps" | "gopher" | "gophers" | "http" | "https" | "imap"
-        | "imaps" | "ipfs" | "ipns" | "ldap" | "ldaps" | "mqtt" | "mqtts" | "pop3" | "pop3s"
-        | "rtsp" | "scp" | "sftp" | "smb" | "smbs" | "smtp" | "smtps" | "telnet" | "tftp"
-        | "ws" | "wss" => Ok(value),
-        _ => Err(CurlError::UnsupportedProtocol(value)),
+    if protocol_bit(&value).is_some() {
+        Ok(value)
+    } else {
+        Err(CurlError::UnsupportedProtocol(value))
     }
 }
 
@@ -2817,8 +2963,10 @@ fn print_common_help() {
                --tftp-blksize <value>  Set TFTP BLKSIZE option\n\
                --tftp-no-options       Do not send TFTP options\n\
           -B, --use-ascii             Use ASCII/text transfer\n\
-          -t, --telnet-option <opt>    Set telnet option\n\
+         -t, --telnet-option <opt>    Set telnet option\n\
                --ipfs-gateway <URL>    Gateway for IPFS/IPNS URLs\n\
+               --proto <protocols>     Enable/disable protocols\n\
+               --proto-redir <protos>  Enable/disable redirect protocols\n\
                --proto-default <proto> Default protocol for schemeless URLs\n\
                --url-query <data>      Add URL query data\n\
                --json <data>           JSON request body\n\
@@ -4914,6 +5062,52 @@ mod tests {
         assert!(
             matches!(error, CurlError::UnsupportedProtocol(protocol) if protocol == "doesnotexist")
         );
+    }
+
+    #[test]
+    fn parses_protocol_allowlists() {
+        let config = parse_args([
+            "-q",
+            "--proto",
+            "=http,https",
+            "--proto-redir",
+            "-all,+https",
+            "https://example.com",
+        ])
+        .unwrap();
+        let transfer = &config.transfers[0];
+        assert!(transfer.allowed_protocols.allows_scheme("http"));
+        assert!(transfer.allowed_protocols.allows_scheme("https"));
+        assert!(!transfer.allowed_protocols.allows_scheme("ftp"));
+        assert!(transfer.redirect_protocols.allows_scheme("https"));
+        assert!(!transfer.redirect_protocols.allows_scheme("http"));
+        assert!(!transfer.redirect_protocols.allows_scheme("ftp"));
+        assert_eq!(
+            transfer.allowed_protocols.to_protocol_string(),
+            "http,https"
+        );
+        assert_eq!(transfer.redirect_protocols.to_protocol_string(), "https");
+    }
+
+    #[test]
+    fn protocol_allowlists_match_c_empty_set_rejection() {
+        let error = parse_args(["-q", "--proto", "-all", "https://example.com"]).unwrap_err();
+        assert!(matches!(error, CurlError::BadOptionUsage { .. }));
+
+        let error = parse_args(["-q", "--proto-redir", "-all", "https://example.com"]).unwrap_err();
+        assert!(matches!(error, CurlError::BadOptionUsage { .. }));
+
+        let config = parse_args([
+            "-q",
+            "--proto",
+            "=http",
+            "--proto",
+            "-http",
+            "https://example.com",
+        ])
+        .unwrap();
+        assert!(!config.transfers[0].allowed_protocols.allows_scheme("http"));
+        assert!(config.transfers[0].allowed_protocols.allows_scheme("https"));
     }
 
     #[test]
