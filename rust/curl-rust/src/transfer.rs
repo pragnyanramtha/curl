@@ -175,6 +175,7 @@ struct HttpAttempt {
     final_url: Url,
     headers: reqwest::header::HeaderMap,
     header_bytes: Option<Vec<u8>>,
+    header_size: Option<u64>,
     trailer_bytes: Vec<u8>,
     body: Vec<u8>,
     redirects: Vec<HttpAttempt>,
@@ -10070,6 +10071,7 @@ async fn run_http_transfer(
                 final_url,
                 headers,
                 header_bytes: None,
+                header_size: None,
                 trailer_bytes: Vec::new(),
                 body: Vec::new(),
                 redirects: Vec::new(),
@@ -10126,6 +10128,7 @@ async fn run_http_transfer(
             final_url,
             headers,
             header_bytes: None,
+            header_size: None,
             trailer_bytes: Vec::new(),
             body,
             redirects: redirect_attempts,
@@ -10471,8 +10474,7 @@ async fn run_raw_http_proxy_tunnel_transfer(
         },
     )
     .await?;
-    let connect_header_bytes = (!context.transfer.suppress_connect_headers)
-        .then(|| http_attempt_header_bytes(&connect_attempt));
+    let connect_header_bytes = http_attempt_header_bytes(&connect_attempt);
     let connect_status = connect_attempt.status.ok_or(CurlError::WeirdServerReply)?;
     if !connect_status.is_success() {
         return Err(CurlError::HttpStatus {
@@ -10499,8 +10501,14 @@ async fn run_raw_http_proxy_tunnel_transfer(
     let request = raw_http_direct_request(&direct_context)?;
     let mut attempt = raw_http_send_direct_request(&mut stream, &request, &direct_context).await?;
     record_raw_http_attempt_metrics(&mut attempt, &stream, true, request.len());
-    if let Some(mut header_bytes) = connect_header_bytes {
-        header_bytes.extend_from_slice(&http_attempt_header_bytes(&attempt));
+    let origin_header_bytes = http_attempt_header_bytes(&attempt);
+    attempt.header_size = Some(
+        (connect_header_bytes.len() + origin_header_bytes.len() + attempt.trailer_bytes.len())
+            as u64,
+    );
+    if !context.transfer.suppress_connect_headers {
+        let mut header_bytes = connect_header_bytes;
+        header_bytes.extend_from_slice(&origin_header_bytes);
         attempt.header_bytes = Some(header_bytes);
     }
     attempt.http_connect_code = Some(connect_status.as_u16());
@@ -11243,6 +11251,7 @@ async fn raw_http_read_response(
         final_url: final_url.clone(),
         headers,
         header_bytes: Some(header_bytes),
+        header_size: None,
         trailer_bytes,
         body,
         redirects: Vec::new(),
@@ -11511,6 +11520,7 @@ fn raw_http09_attempt(
         final_url: final_url.clone(),
         headers: reqwest::header::HeaderMap::new(),
         header_bytes: Some(Vec::new()),
+        header_size: None,
         trailer_bytes: Vec::new(),
         body: if method == Method::HEAD {
             Vec::new()
@@ -12283,10 +12293,21 @@ fn write_http_attempt_output(
     append_output: bool,
 ) -> Result<HttpAttemptWrite> {
     let header_bytes = http_attempt_header_bytes(attempt);
-    record_http_attempt_metrics(metrics, method, attempt, header_bytes.len() as u64);
+    let dump_headers_interleaved = persist_headers
+        && transfer.dump_header.as_deref() == Some(Path::new("-"))
+        && (transfer.include_headers || transfer.head)
+        && http_response_writes_stdout(transfer);
+    record_http_attempt_metrics(
+        metrics,
+        method,
+        attempt,
+        http_attempt_header_size(attempt, &header_bytes),
+    );
     if persist_headers && let Some(path) = &transfer.dump_header {
-        output::append_dump_headers(path, &header_bytes, transfer.create_dirs)?;
-        if !attempt.trailer_bytes.is_empty() {
+        if !dump_headers_interleaved {
+            output::append_dump_headers(path, &header_bytes, transfer.create_dirs)?;
+        }
+        if !attempt.trailer_bytes.is_empty() && !dump_headers_interleaved {
             output::append_dump_headers(path, &attempt.trailer_bytes, transfer.create_dirs)?;
         }
     }
@@ -12324,13 +12345,23 @@ fn write_http_attempt_output(
     if write_headers || write_body {
         let mut bytes = Vec::new();
         if write_headers {
-            bytes.extend_from_slice(&header_bytes);
+            if dump_headers_interleaved {
+                bytes.extend_from_slice(&interleaved_dump_and_include_headers(&header_bytes));
+            } else {
+                bytes.extend_from_slice(&header_bytes);
+            }
         }
         if write_body {
             bytes.extend_from_slice(body_bytes);
         }
         if write_headers && !attempt.trailer_bytes.is_empty() {
-            bytes.extend_from_slice(&attempt.trailer_bytes);
+            if dump_headers_interleaved {
+                bytes.extend_from_slice(&interleaved_dump_and_include_headers(
+                    &attempt.trailer_bytes,
+                ));
+            } else {
+                bytes.extend_from_slice(&attempt.trailer_bytes);
+            }
         }
         let filename = output::write_response(
             transfer,
@@ -12395,6 +12426,29 @@ fn http_attempt_header_bytes(attempt: &HttpAttempt) -> Vec<u8> {
             .map(|status| output::render_headers(attempt.version, status, &attempt.headers))
             .unwrap_or_default()
     })
+}
+
+fn http_attempt_header_size(attempt: &HttpAttempt, header_bytes: &[u8]) -> u64 {
+    attempt
+        .header_size
+        .unwrap_or((header_bytes.len() + attempt.trailer_bytes.len()) as u64)
+}
+
+fn http_response_writes_stdout(transfer: &TransferConfig) -> bool {
+    !transfer.out_null && transfer.output.is_none() && !transfer.remote_name
+}
+
+fn interleaved_dump_and_include_headers(header_bytes: &[u8]) -> Vec<u8> {
+    let mut interleaved = Vec::with_capacity(header_bytes.len() * 2);
+    let mut offset = 0;
+    while let Some((line, next_offset)) = next_raw_header_line(header_bytes, offset) {
+        interleaved.extend_from_slice(line);
+        interleaved.extend_from_slice(line);
+        offset = next_offset;
+    }
+    interleaved.extend_from_slice(&header_bytes[offset..]);
+    interleaved.extend_from_slice(&header_bytes[offset..]);
+    interleaved
 }
 
 async fn schedule_retry(

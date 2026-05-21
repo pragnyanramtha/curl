@@ -11894,6 +11894,47 @@ fn suppress_connect_headers_excludes_connect_headers_from_include_and_dump() {
 }
 
 #[test]
+fn suppress_connect_headers_still_counts_connect_headers_in_size_header() {
+    const CONNECT_RESPONSE: &[u8] =
+        b"HTTP/1.1 200 Connection Established\r\nProxy-Agent: tunnel\r\n\r\n";
+    const ORIGIN_RESPONSE: &[u8] =
+        b"HTTP/1.1 200 OK\r\nX-Origin: yes\r\nContent-Length: 2\r\n\r\nok";
+    let expected_size_header = CONNECT_RESPONSE.len() + (ORIGIN_RESPONSE.len() - 2);
+    let (proxy_url, rx) =
+        spawn_tunnel_proxy_with_connect_response(CONNECT_RESPONSE, ORIGIN_RESPONSE);
+
+    let mut command = Command::cargo_bin("curl").unwrap();
+    let assert = command
+        .args([
+            "-q",
+            "-sS",
+            "--suppress-connect-headers",
+            "-i",
+            "-D",
+            "-",
+            "--proxytunnel",
+            "-x",
+            &proxy_url,
+            "-w",
+            "\n%{http_connect} %{size_header}",
+            "http://example.test/resource",
+        ])
+        .assert()
+        .success();
+    let stdout = String::from_utf8(assert.get_output().stdout.clone()).unwrap();
+
+    assert!(!stdout.contains("Connection Established"));
+    assert!(!stdout.contains("Proxy-Agent: tunnel"));
+    assert!(stdout.starts_with("HTTP/1.1 200 OK\r\n"));
+    assert!(stdout.ends_with(&format!("ok\n200 {expected_size_header}")));
+
+    let connect = rx.recv().unwrap();
+    assert_eq!(connect.start_line, "CONNECT example.test:80 HTTP/1.1");
+    let origin = rx.recv().unwrap();
+    assert_eq!(origin.start_line, "GET /resource HTTP/1.1");
+}
+
+#[test]
 fn proxytunnel_writeout_reports_connect_status_and_proxy_used() {
     let (proxy_url, rx) =
         spawn_tunnel_proxy(b"HTTP/1.1 204 No Content\r\nContent-Length: 0\r\n\r\n");
