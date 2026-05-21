@@ -410,6 +410,24 @@ fn spawn_sequence_server_bytes(responses: Vec<Vec<u8>>) -> (String, Receiver<Req
     (format!("http://{addr}/resource"), rx)
 }
 
+fn spawn_tunnel_proxy(response: &'static [u8]) -> (String, Receiver<RequestRecord>) {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = listener.local_addr().unwrap();
+    let (tx, rx) = mpsc::channel();
+
+    thread::spawn(move || {
+        let (mut stream, _) = listener.accept().unwrap();
+        tx.send(read_request(&mut stream)).unwrap();
+        stream
+            .write_all(b"HTTP/1.1 200 Connection Established\r\n\r\n")
+            .unwrap();
+        tx.send(read_request(&mut stream)).unwrap();
+        stream.write_all(response).unwrap();
+    });
+
+    (format!("http://{addr}"), rx)
+}
+
 fn spawn_reusable_sequence_server(
     responses: Vec<&'static [u8]>,
 ) -> (String, Receiver<(usize, RequestRecord)>) {
@@ -11325,6 +11343,72 @@ fn raw_proxy_sends_proxy_headers_and_suppresses_proxy_connection_default() {
     assert_eq!(header(&request, "x-proxy-only"), Some("yes"));
     assert!(header(&request, "user-agent").unwrap().starts_with("curl/"));
     assert_eq!(header(&request, "accept"), Some("*/*"));
+}
+
+#[test]
+fn proxytunnel_connects_then_sends_origin_form_request() {
+    let (proxy_url, rx) = spawn_tunnel_proxy(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok");
+
+    let mut command = Command::cargo_bin("curl").unwrap();
+    command.args([
+        "-q",
+        "-sS",
+        "--proxytunnel",
+        "-x",
+        &proxy_url,
+        "--proxy-header",
+        "X-Proxy-Only: yes",
+        "-H",
+        "X-Origin: yes",
+        "http://example.test/resource?x=1",
+    ]);
+    command.assert().success().stdout("ok");
+
+    let connect = rx.recv().unwrap();
+    assert_eq!(connect.start_line, "CONNECT example.test:80 HTTP/1.1");
+    assert_eq!(header(&connect, "host"), Some("example.test:80"));
+    assert!(header(&connect, "user-agent").unwrap().starts_with("curl/"));
+    assert_eq!(header(&connect, "proxy-connection"), Some("Keep-Alive"));
+    assert_eq!(header(&connect, "x-proxy-only"), Some("yes"));
+    assert_eq!(header(&connect, "x-origin"), None);
+
+    let origin = rx.recv().unwrap();
+    assert_eq!(origin.start_line, "GET /resource?x=1 HTTP/1.1");
+    assert_eq!(header(&origin, "host"), Some("example.test"));
+    assert_eq!(header(&origin, "x-origin"), Some("yes"));
+    assert_eq!(header(&origin, "x-proxy-only"), None);
+}
+
+#[test]
+fn proxytunnel_writeout_reports_connect_status_and_proxy_used() {
+    let (proxy_url, rx) =
+        spawn_tunnel_proxy(b"HTTP/1.1 204 No Content\r\nContent-Length: 0\r\n\r\n");
+
+    let mut command = Command::cargo_bin("curl").unwrap();
+    let assert = command
+        .args([
+            "-q",
+            "-sS",
+            "-p",
+            "-x",
+            &proxy_url,
+            "--out-null",
+            "-w",
+            "%{http_connect} %{proxy_used} %{json}",
+            "http://example.test/resource",
+        ])
+        .assert()
+        .success();
+    let stdout = String::from_utf8(assert.get_output().stdout.clone()).unwrap();
+
+    assert!(stdout.starts_with("200 1 "));
+    assert!(stdout.contains("\"http_connect\":200"));
+    assert!(stdout.contains("\"proxy_used\":1"));
+
+    let connect = rx.recv().unwrap();
+    assert_eq!(connect.start_line, "CONNECT example.test:80 HTTP/1.1");
+    let origin = rx.recv().unwrap();
+    assert_eq!(origin.start_line, "GET /resource HTTP/1.1");
 }
 
 #[test]

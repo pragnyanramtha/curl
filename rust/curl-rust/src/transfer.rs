@@ -170,6 +170,8 @@ struct HttpAttempt {
     remote_port: Option<u16>,
     local_ip: Option<String>,
     local_port: Option<u16>,
+    http_connect_code: Option<u16>,
+    proxy_used: bool,
     num_connects: u64,
 }
 
@@ -8838,6 +8840,7 @@ async fn run_http_transfer(
     let mut redirects = 0usize;
 
     let explicit_proxy = explicit_http_proxy(transfer)?;
+    metrics.proxy_used = explicit_proxy.is_some();
     let initial_connect_to = connect_to_target(transfer, &url)?;
     record_http_endpoint_hint(
         metrics,
@@ -9090,6 +9093,7 @@ async fn run_http_transfer(
 
     if let Some(proxy) = explicit_proxy.as_ref()
         && transfer.follow_location
+        && !transfer.proxytunnel
         && raw_http_proxy_redirect_supported(transfer, &url, has_multipart)
         && (transfer.request_target.is_some()
             || path_as_is_requires_raw
@@ -9224,6 +9228,47 @@ async fn run_http_transfer(
             metrics.size_download = final_attempt.body.len() as u64;
             return Ok(final_attempt);
         }
+    }
+
+    if let Some(proxy) = explicit_proxy.as_ref()
+        && transfer.proxytunnel
+        && url.scheme() == "http"
+    {
+        if !raw_http_proxy_supported(transfer, &url, has_multipart) {
+            return Err(CurlError::Unsupported(
+                "--proxytunnel for plain http:// URLs is only implemented for simple raw HTTP proxy transfers in the Rust sidecar"
+                    .to_string(),
+            ));
+        }
+        let attempt = run_raw_http_proxy_tunnel_transfer(RawHttpProxyContext {
+            transfer,
+            url: &url,
+            path_as_is_url: path_as_is_url.as_deref(),
+            method: &method,
+            prepared_body: prepared_body.as_ref(),
+            upload_body: upload_body.as_deref(),
+            resume_from,
+            referer: custom_referer.as_deref().or(current_referer.as_deref()),
+            proxy,
+            sensitive_headers_allowed: true,
+            custom_host_allowed: true,
+        })
+        .await?;
+        metrics.url_effective = attempt.final_url.to_string();
+        metrics.response_code = attempt.status.map(|status| status.as_u16());
+        metrics.http_connect = attempt.http_connect_code;
+        metrics.proxy_used = attempt.proxy_used;
+        metrics.referer = custom_referer.clone().or_else(|| current_referer.clone());
+        metrics.content_type = attempt
+            .headers
+            .get(CONTENT_TYPE)
+            .and_then(|value| value.to_str().ok())
+            .map(ToString::to_string);
+        metrics.redirect_url = redirect_location_string(&attempt.headers)?;
+        metrics.headers = attempt.headers.clone();
+        check_http_content_length_max_filesize(transfer, &attempt.headers, method == Method::HEAD)?;
+        metrics.size_download = attempt.body.len() as u64;
+        return Ok(attempt);
     }
 
     if let Some(proxy) = explicit_proxy.as_ref()
@@ -9538,6 +9583,8 @@ async fn run_http_transfer(
             remote_port: metrics.remote_port,
             local_ip: metrics.local_ip.clone(),
             local_port: metrics.local_port,
+            http_connect_code: metrics.http_connect,
+            proxy_used: metrics.proxy_used,
             num_connects: metrics.num_connects,
         });
     }
@@ -9801,6 +9848,75 @@ async fn run_raw_http_proxy_transfer(context: RawHttpProxyContext<'_>) -> Result
     )
     .await?;
     record_raw_http_attempt_metrics(&mut attempt, &stream, true, request.len());
+    attempt.proxy_used = true;
+    decode_http_attempt_body(context.transfer, &mut attempt)?;
+    Ok(attempt)
+}
+
+async fn run_raw_http_proxy_tunnel_transfer(
+    context: RawHttpProxyContext<'_>,
+) -> Result<HttpAttempt> {
+    let connect_request = raw_http_proxy_connect_request(&context)?;
+    let mut stream = connect_tcp(
+        context.proxy.host.as_str(),
+        context.proxy.port,
+        context.transfer,
+    )
+    .await?;
+    stream
+        .write_all(&connect_request)
+        .await
+        .map_err(tcp_io_error)?;
+
+    let connect_method = Method::CONNECT;
+    let connect_attempt = raw_http_read_response(
+        &mut stream,
+        context.transfer,
+        &connect_method,
+        context.url,
+        0,
+        RawHttpReadOptions {
+            http09_allowed: false,
+            ignore_content_length: true,
+            raw_transfer_decoding: false,
+            skip_unbounded_redirect_body: false,
+        },
+    )
+    .await?;
+    let connect_status = connect_attempt.status.ok_or(CurlError::WeirdServerReply)?;
+    if !connect_status.is_success() {
+        return Err(CurlError::HttpStatus {
+            status: connect_status.as_u16(),
+        });
+    }
+
+    let connect_host = context
+        .url
+        .host_str()
+        .ok_or_else(|| CurlError::Url("URL is missing a host".to_string()))?;
+    let connect_port = context
+        .url
+        .port_or_known_default()
+        .ok_or_else(|| CurlError::Url("URL is missing a port".to_string()))?;
+    let direct_context = RawHttpDirectContext {
+        transfer: context.transfer,
+        url: context.url,
+        path_as_is_url: context.path_as_is_url,
+        connect_host,
+        connect_port,
+        method: context.method,
+        prepared_body: context.prepared_body,
+        upload_body: context.upload_body,
+        resume_from: context.resume_from,
+        referer: context.referer,
+        sensitive_headers_allowed: context.sensitive_headers_allowed,
+        custom_host_allowed: context.custom_host_allowed,
+    };
+    let request = raw_http_direct_request(&direct_context)?;
+    let mut attempt = raw_http_send_direct_request(&mut stream, &request, &direct_context).await?;
+    record_raw_http_attempt_metrics(&mut attempt, &stream, true, request.len());
+    attempt.http_connect_code = Some(connect_status.as_u16());
+    attempt.proxy_used = true;
     decode_http_attempt_body(context.transfer, &mut attempt)?;
     Ok(attempt)
 }
@@ -10112,6 +10228,41 @@ fn raw_http_request_version(transfer: &TransferConfig) -> &'static str {
     }
 }
 
+fn raw_http_proxy_connect_request(context: &RawHttpProxyContext<'_>) -> Result<Vec<u8>> {
+    let parsed_proxy_headers = parse_raw_headers(&context.transfer.proxy_headers)?;
+    let has_proxy_header = |name: &str| raw_headers_contain(&parsed_proxy_headers, name);
+    let authority = http_connect_authority(context.url)?;
+    let version = raw_http_request_version(context.transfer);
+    let mut request = Vec::new();
+    request.extend_from_slice(format!("CONNECT {authority} {version}\r\n").as_bytes());
+    if !has_proxy_header("host") {
+        request.extend_from_slice(format!("Host: {authority}\r\n").as_bytes());
+    }
+    if let Some(authorization) = &context.proxy.authorization
+        && !has_proxy_header("proxy-authorization")
+    {
+        request.extend_from_slice(format!("Proxy-Authorization: {authorization}\r\n").as_bytes());
+    }
+    if !has_proxy_header("user-agent")
+        && let Some(user_agent) = effective_user_agent(context.transfer)
+    {
+        request.extend_from_slice(format!("User-Agent: {user_agent}\r\n").as_bytes());
+    }
+    if !has_proxy_header("proxy-connection") {
+        request.extend_from_slice(b"Proxy-Connection: Keep-Alive\r\n");
+    }
+    for RawHeader {
+        wire_name, value, ..
+    } in parsed_proxy_headers
+    {
+        if let Some(value) = value {
+            append_raw_header(&mut request, &wire_name, &value);
+        }
+    }
+    request.extend_from_slice(b"\r\n");
+    Ok(request)
+}
+
 fn raw_http_proxy_request(context: &RawHttpProxyContext<'_>) -> Result<Vec<u8>> {
     let parsed_headers = parse_raw_headers(&context.transfer.headers)?;
     let parsed_proxy_headers = parse_raw_headers(&context.transfer.proxy_headers)?;
@@ -10412,6 +10563,7 @@ async fn raw_http_read_response(
         && !headers.contains_key(CONTENT_LENGTH);
     let mut deferred_error = None;
     let body = if method == Method::HEAD
+        || method == Method::CONNECT
         || resume_action == HttpResumeAction::AlreadyComplete
         || raw_http_status_has_no_body(status)
         || unbounded_redirect_body
@@ -10457,6 +10609,8 @@ async fn raw_http_read_response(
         remote_port: None,
         local_ip: None,
         local_port: None,
+        http_connect_code: None,
+        proxy_used: false,
         num_connects: 0,
     })
 }
@@ -10631,6 +10785,8 @@ fn raw_http09_attempt(
         remote_port: None,
         local_ip: None,
         local_port: None,
+        http_connect_code: None,
+        proxy_used: false,
         num_connects: 0,
     })
 }
@@ -10943,6 +11099,21 @@ fn http_host_header(url: &Url) -> String {
     }
 }
 
+fn http_connect_authority(url: &Url) -> Result<String> {
+    let host = url
+        .host_str()
+        .ok_or_else(|| CurlError::Url("URL is missing a host".to_string()))?;
+    let host = if host.contains(':') && !host.starts_with('[') {
+        format!("[{host}]")
+    } else {
+        host.to_string()
+    };
+    let port = url
+        .port_or_known_default()
+        .ok_or_else(|| CurlError::Url("URL is missing a port".to_string()))?;
+    Ok(format!("{host}:{port}"))
+}
+
 fn http_request_target(url: &Url) -> String {
     let path = if url.path().is_empty() {
         "/"
@@ -11207,6 +11378,8 @@ fn reset_attempt_metrics(metrics: &mut writeout::Metrics) {
     metrics.remote_port = None;
     metrics.local_ip = None;
     metrics.local_port = None;
+    metrics.http_connect = None;
+    metrics.proxy_used = false;
     metrics.num_connects = 0;
     metrics.num_redirects = 0;
     metrics.headers = reqwest::header::HeaderMap::new();
@@ -11453,6 +11626,8 @@ fn record_http_attempt_metrics(
     };
     metrics.num_redirects = attempt.redirects.len();
     metrics.num_connects = attempt.num_connects;
+    metrics.http_connect = attempt.http_connect_code;
+    metrics.proxy_used = attempt.proxy_used;
     if attempt.remote_ip.is_some() {
         metrics.remote_ip = attempt.remote_ip.clone();
     }

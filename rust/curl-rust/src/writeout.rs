@@ -33,6 +33,8 @@ pub struct Metrics {
     pub remote_port: Option<u16>,
     pub local_ip: Option<String>,
     pub local_port: Option<u16>,
+    pub http_connect: Option<u16>,
+    pub proxy_used: bool,
     pub num_connects: u64,
     pub num_redirects: usize,
     pub num_retries: usize,
@@ -77,6 +79,8 @@ impl Metrics {
             remote_port: None,
             local_ip: None,
             local_port: None,
+            http_connect: None,
+            proxy_used: false,
             num_connects: 0,
             num_redirects: 0,
             num_retries: 0,
@@ -202,6 +206,11 @@ fn variable(name: &str, metrics: &Metrics) -> String {
             .local_port
             .map(|port| port.to_string())
             .unwrap_or_else(|| "0".to_string()),
+        "http_connect" => metrics
+            .http_connect
+            .map(|code| format!("{code:03}"))
+            .unwrap_or_else(|| "000".to_string()),
+        "proxy_used" => u8::from(metrics.proxy_used).to_string(),
         "num_connects" => metrics.num_connects.to_string(),
         "num_redirects" => metrics.num_redirects.to_string(),
         "exitcode" => metrics.exit_code.to_string(),
@@ -228,7 +237,7 @@ fn json(metrics: &Metrics) -> String {
         json_optional("filename_effective", metrics.filename_effective.as_deref()),
         json_null("ftp_entry_path"),
         json_number("http_code", metrics.response_code.unwrap_or(0)),
-        json_number("http_connect", 0),
+        json_number("http_connect", metrics.http_connect.unwrap_or(0)),
         json_string("http_version", metrics.http_version.as_deref()),
         json_string("local_ip", metrics.local_ip.as_deref()),
         json_number("local_port", metrics.local_port.unwrap_or(0)),
@@ -239,7 +248,7 @@ fn json(metrics: &Metrics) -> String {
         json_number("num_redirects", metrics.num_redirects),
         json_number("num_retries", metrics.num_retries),
         json_number("proxy_ssl_verify_result", 0),
-        json_number("proxy_used", 0),
+        json_number("proxy_used", u8::from(metrics.proxy_used)),
         json_optional("redirect_url", metrics.redirect_url.as_deref()),
         json_optional("referer", metrics.referer.as_deref()),
         json_string("remote_ip", metrics.remote_ip.as_deref()),
@@ -459,6 +468,8 @@ mod tests {
         metrics.remote_ip = Some("127.0.0.1".to_string());
         metrics.remote_port = Some(8080);
         metrics.local_port = Some(49152);
+        metrics.http_connect = Some(200);
+        metrics.proxy_used = true;
         metrics.size_header = 42;
         metrics.size_request = 84;
         assert!(
@@ -469,6 +480,8 @@ mod tests {
         assert!(json.contains("\"remote_ip\":\"127.0.0.1\""));
         assert!(json.contains("\"remote_port\":8080"));
         assert!(json.contains("\"local_port\":49152"));
+        assert!(json.contains("\"http_connect\":200"));
+        assert!(json.contains("\"proxy_used\":1"));
         assert!(json.contains("\"size_header\":42"));
         assert!(json.contains("\"size_request\":84"));
         assert!(json.contains("\"time_queue\":"));

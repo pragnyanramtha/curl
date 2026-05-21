@@ -110,6 +110,7 @@ pub struct TransferConfig {
     pub proxy: Option<String>,
     pub proxy_user: Option<String>,
     pub proxy_auth: ProxyAuthMethods,
+    pub proxytunnel: bool,
     pub noproxy: Option<String>,
     pub insecure: bool,
     pub cacert: Option<PathBuf>,
@@ -589,6 +590,7 @@ impl Default for TransferConfig {
             proxy: None,
             proxy_user: None,
             proxy_auth: ProxyAuthMethods::default(),
+            proxytunnel: false,
             noproxy: None,
             insecure: false,
             cacert: None,
@@ -1081,6 +1083,7 @@ impl Parser {
             "proxy-digest" => self.current().proxy_auth.set_digest(true),
             "proxy-negotiate" => self.current().proxy_auth.set_negotiate(true),
             "proxy-ntlm" => self.current().proxy_auth.set_ntlm(true),
+            "proxytunnel" => self.current().proxytunnel = true,
             "noproxy" => {
                 let value = self.value_for(name, inline_value)?;
                 self.current().noproxy = Some(value);
@@ -1259,6 +1262,7 @@ impl Parser {
             "proxy-digest" => self.current().proxy_auth.set_digest(false),
             "proxy-negotiate" => self.current().proxy_auth.set_negotiate(false),
             "proxy-ntlm" => self.current().proxy_auth.set_ntlm(false),
+            "proxytunnel" => self.current().proxytunnel = false,
             "insecure" => self.current().insecure = false,
             "junk-session-cookies" => self.current().junk_session_cookies = false,
             "mail-rcpt-allowfails" => self.current().mail_rcpt_allowfails = false,
@@ -1417,6 +1421,7 @@ impl Parser {
                     self.current().proxy = Some(value);
                     break;
                 }
+                'p' => self.current().proxytunnel = true,
                 'k' => self.current().insecure = true,
                 'm' => {
                     let value = self.short_value('m', rest)?;
@@ -1959,6 +1964,7 @@ impl TransferConfig {
             || self.proxy.is_some()
             || self.proxy_user.is_some()
             || !self.proxy_auth.is_empty()
+            || self.proxytunnel
             || self.noproxy.is_some()
             || self.insecure
             || self.cacert.is_some()
@@ -3093,6 +3099,7 @@ fn print_common_help() {
            -j, --junk-session-cookies  Ignore session cookies from file\n\
                --oauth2-bearer <token> OAuth 2 Bearer token\n\
            -U, --proxy-user <user:pass> Proxy user and password\n\
+           -p, --proxytunnel          HTTP proxy tunnel using CONNECT\n\
                --proxy-header <header> Pass custom proxy header\n\
                --proxy-basic           Use Basic proxy authentication\n\
                --proxy-digest          Use Digest proxy authentication\n\
@@ -4785,6 +4792,7 @@ mod tests {
             "http://proxy.example:8080",
             "-U",
             "proxy-user:secret",
+            "-p",
             "--noproxy",
             "example.com",
             "https://example.com",
@@ -4807,6 +4815,7 @@ mod tests {
         );
         assert_eq!(transfer.proxy.as_deref(), Some("http://proxy.example:8080"));
         assert_eq!(transfer.proxy_user.as_deref(), Some("proxy-user:secret"));
+        assert!(transfer.proxytunnel);
         assert_eq!(transfer.noproxy.as_deref(), Some("example.com"));
     }
 
@@ -5122,8 +5131,10 @@ mod tests {
             "--no-basic",
             "--proxy-anyauth",
             "--proxy-basic",
+            "--proxytunnel",
             "--no-proxy-anyauth",
             "--no-proxy-basic",
+            "--no-proxytunnel",
             "https://example.com",
         ])
         .unwrap();
@@ -5133,6 +5144,7 @@ mod tests {
         assert!(transfer.http_auth.contains(AuthMethods::DIGEST));
         assert!(!transfer.proxy_auth.anyauth());
         assert!(!transfer.proxy_auth.basic());
+        assert!(!transfer.proxytunnel);
     }
 
     #[test]

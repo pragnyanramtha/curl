@@ -326,6 +326,9 @@ fn write_request(out: &mut String, render: &RenderTransfer<'_>, url: &str) -> Re
     }
     if let Some(slist) = &render.proxy_slist {
         emit_raw_setopt(out, "CURLOPT_PROXYHEADER", slist);
+        if transfer.proxytunnel || url.starts_with("https:") {
+            emit_raw_setopt(out, "CURLOPT_HEADEROPT", "CURLHEADER_SEPARATE");
+        }
     }
     if let Some(mail_from) = &transfer.mail_from {
         emit_string_setopt(out, "CURLOPT_MAIL_FROM", mail_from);
@@ -432,6 +435,9 @@ fn write_request(out: &mut String, render: &RenderTransfer<'_>, url: &str) -> Re
     }
     if let Some(proxy) = &transfer.proxy {
         emit_string_setopt(out, "CURLOPT_PROXY", proxy);
+    }
+    if transfer.proxytunnel {
+        emit_long_setopt(out, "CURLOPT_HTTPPROXYTUNNEL", 1);
     }
     if let Some(proxy_user) = &transfer.proxy_user {
         emit_string_setopt(out, "CURLOPT_PROXYUSERPWD", proxy_user);
@@ -929,6 +935,7 @@ mod tests {
             "http://proxy.example:8080",
             "--proxy-header",
             "Proxy-Connection: close",
+            "--proxytunnel",
             "--noproxy",
             "localhost",
             "-A",
@@ -945,10 +952,12 @@ mod tests {
         assert!(source.contains("curl_slist_append(slist2, \"Proxy-Connection: close\");"));
         assert!(source.contains("CURLOPT_HTTPHEADER, slist1"));
         assert!(source.contains("CURLOPT_PROXYHEADER, slist2"));
+        assert!(source.contains("CURLOPT_HEADEROPT, CURLHEADER_SEPARATE"));
         assert!(source.contains("CURLOPT_POSTFIELDS, \"a=b\""));
         assert!(source.contains("CURLOPT_POSTFIELDSIZE_LARGE, (curl_off_t)3"));
         assert!(source.contains("CURLOPT_USERPWD, \"alice:secret\""));
         assert!(source.contains("CURLOPT_PROXY, \"http://proxy.example:8080\""));
+        assert!(source.contains("CURLOPT_HTTPPROXYTUNNEL, 1L"));
         assert!(source.contains("CURLOPT_NOPROXY, \"localhost\""));
         assert!(source.contains("CURLOPT_USERAGENT, \"MyUA\""));
     }
