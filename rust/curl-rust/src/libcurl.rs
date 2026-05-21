@@ -279,6 +279,9 @@ fn write_request(out: &mut String, render: &RenderTransfer<'_>, url: &str) -> Re
     if transfer.include_headers {
         emit_long_setopt(out, "CURLOPT_HEADER", 1);
     }
+    if transfer.remote_time {
+        emit_long_setopt(out, "CURLOPT_FILETIME", 1);
+    }
     if transfer.list_only {
         emit_long_setopt(out, "CURLOPT_DIRLISTONLY", 1);
     }
@@ -1035,6 +1038,22 @@ mod tests {
         let source = render_source(&config).unwrap();
 
         assert!(!source.contains("CURLOPT_IGNORE_CONTENT_LENGTH"));
+    }
+
+    #[test]
+    fn renders_remote_time_option() {
+        let config = parse_args([
+            "-q",
+            "--libcurl",
+            "client.c",
+            "--remote-time",
+            "https://example.com",
+        ])
+        .unwrap();
+
+        let source = render_source(&config).unwrap();
+
+        assert!(source.contains("CURLOPT_FILETIME, 1L"));
     }
 
     #[test]

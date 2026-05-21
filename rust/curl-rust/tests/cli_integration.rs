@@ -3209,6 +3209,59 @@ fn remote_name_all_no_remote_name_outputs_stdout() {
     assert!(request.start_line.starts_with("GET /one.txt HTTP/1.1"));
 }
 
+#[cfg(unix)]
+#[test]
+fn remote_time_sets_output_file_mtime_from_last_modified() {
+    let temp = tempdir().unwrap();
+    let (url, rx) = spawn_server(
+        b"HTTP/1.1 200 OK\r\nLast-Modified: Tue, 13 Jun 2000 12:10:00 GMT\r\nContent-Length: 5\r\n\r\n12345",
+    );
+
+    let mut command = Command::cargo_bin("curl").unwrap();
+    command.args([
+        "-q",
+        "-sS",
+        "-O",
+        "--remote-time",
+        "--output-dir",
+        temp.path().to_str().unwrap(),
+        &url,
+    ]);
+    command.assert().success().stdout("");
+
+    let output = temp.path().join("resource");
+    assert_eq!(std::fs::read_to_string(&output).unwrap(), "12345");
+    assert_eq!(std::fs::metadata(output).unwrap().mtime(), 960_898_200);
+    rx.recv().unwrap();
+}
+
+#[cfg(unix)]
+#[test]
+fn remote_time_does_not_touch_partial_output_after_transfer_error() {
+    let temp = tempdir().unwrap();
+    let output = temp.path().join("partial.txt");
+    let (url, rx) = spawn_server(
+        b"HTTP/1.1 200 OK\r\nLast-Modified: Tue, 13 Jun 2000 12:10:00 GMT\r\nConnection: close\r\n\r\n12345",
+    );
+
+    let mut command = Command::cargo_bin("curl").unwrap();
+    command.args([
+        "-q",
+        "-sS",
+        "--remote-time",
+        "--max-filesize",
+        "1",
+        "-o",
+        output.to_str().unwrap(),
+        &url,
+    ]);
+    command.assert().code(63).stdout("");
+
+    assert_eq!(std::fs::read_to_string(&output).unwrap(), "1");
+    assert_ne!(std::fs::metadata(output).unwrap().mtime(), 960_898_200);
+    rx.recv().unwrap();
+}
+
 #[test]
 fn extra_output_slots_emit_warning() {
     let temp = tempdir().unwrap();

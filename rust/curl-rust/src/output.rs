@@ -1,6 +1,12 @@
 use std::fs::OpenOptions;
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
+use std::time::{SystemTime, UNIX_EPOCH};
+
+#[cfg(unix)]
+use std::ffi::CString;
+#[cfg(unix)]
+use std::os::unix::ffi::OsStrExt;
 
 use reqwest::header::{
     ACCEPT_RANGES, CONTENT_DISPOSITION, CONTENT_LENGTH, HeaderMap, HeaderValue, LAST_MODIFIED,
@@ -71,12 +77,12 @@ pub fn write_response(
             {
                 std::fs::create_dir_all(parent)?;
             }
-            if append {
-                OpenOptions::new()
-                    .create(true)
-                    .append(true)
-                    .open(&path)?
-                    .write_all(bytes)?;
+            let effective_path = if append {
+                {
+                    let mut file = OpenOptions::new().create(true).append(true).open(&path)?;
+                    file.write_all(bytes)?;
+                }
+                path
             } else {
                 let (mut file, effective_path) =
                     open_output_file(&path, transfer.file_clobber_mode, is_header_filename_output)?;
@@ -84,15 +90,236 @@ pub fn write_response(
                     remove_output_on_write_error(transfer, &effective_path);
                     return Err(error.into());
                 }
-                return Ok(Some(effective_path));
-            }
-            Ok(Some(path))
+                effective_path
+            };
+            Ok(Some(effective_path))
         }
         None => {
             io::stdout().write_all(bytes)?;
             Ok(None)
         }
     }
+}
+
+pub fn apply_remote_time(transfer: &TransferConfig, headers: &HeaderMap, path: Option<&Path>) {
+    if !transfer.remote_time {
+        return;
+    }
+    let Some(path) = path else {
+        return;
+    };
+    let Some(remote_time) = remote_file_time(headers) else {
+        return;
+    };
+    if let Err(error) = set_output_file_time(path, remote_time)
+        && !transfer.silent
+    {
+        eprintln!(
+            "Warning: Failed to set filetime {}: {error}",
+            unix_timestamp(remote_time)
+        );
+    }
+}
+
+fn remote_file_time(headers: &HeaderMap) -> Option<SystemTime> {
+    let value = headers.get(LAST_MODIFIED)?.to_str().ok()?;
+    httpdate::parse_http_date(value)
+        .ok()
+        .or_else(|| parse_curl_http_date(value))
+}
+
+fn unix_timestamp(time: SystemTime) -> i128 {
+    match time.duration_since(UNIX_EPOCH) {
+        Ok(duration) => i128::from(duration.as_secs()),
+        Err(error) => -i128::from(error.duration().as_secs()),
+    }
+}
+
+fn parse_curl_http_date(value: &str) -> Option<SystemTime> {
+    let normalized = value.replace(',', " ");
+    let mut parts = normalized.split_whitespace().collect::<Vec<_>>();
+    if parts
+        .first()
+        .is_some_and(|part| parse_weekday_name(part).is_some())
+    {
+        parts.remove(0);
+    }
+
+    match parts.as_slice() {
+        [month, day, time, year, zone] if time.contains(':') => {
+            let month = parse_month_name(month)?;
+            let day = day.parse().ok()?;
+            let year = year.parse().ok()?;
+            let (hour, minute, second) = parse_hms(time)?;
+            let zone_offset = parse_zone_offset_seconds(zone)?;
+            system_time_from_curl_date(year, month, day, hour, minute, second, zone_offset)
+        }
+        [day, month, year, time, zone] if time.contains(':') => {
+            let month = parse_month_name(month)?;
+            let day = day.parse().ok()?;
+            let year = year.parse().ok()?;
+            let (hour, minute, second) = parse_hms(time)?;
+            let zone_offset = parse_zone_offset_seconds(zone)?;
+            system_time_from_curl_date(year, month, day, hour, minute, second, zone_offset)
+        }
+        _ => None,
+    }
+}
+
+fn parse_weekday_name(value: &str) -> Option<()> {
+    matches!(
+        value.get(..3)?.to_ascii_lowercase().as_str(),
+        "mon" | "tue" | "wed" | "thu" | "fri" | "sat" | "sun"
+    )
+    .then_some(())
+}
+
+fn parse_month_name(value: &str) -> Option<u32> {
+    match value.get(..3)?.to_ascii_lowercase().as_str() {
+        "jan" => Some(1),
+        "feb" => Some(2),
+        "mar" => Some(3),
+        "apr" => Some(4),
+        "may" => Some(5),
+        "jun" => Some(6),
+        "jul" => Some(7),
+        "aug" => Some(8),
+        "sep" => Some(9),
+        "oct" => Some(10),
+        "nov" => Some(11),
+        "dec" => Some(12),
+        _ => None,
+    }
+}
+
+fn parse_hms(value: &str) -> Option<(u32, u32, u32)> {
+    let mut parts = value.split(':');
+    let hour: u32 = parts.next()?.parse().ok()?;
+    let minute: u32 = parts.next()?.parse().ok()?;
+    let second: u32 = parts.next()?.parse().ok()?;
+    if parts.next().is_some() || hour > 23 || minute > 59 || second > 60 {
+        return None;
+    }
+    Some((hour, minute, second.min(59)))
+}
+
+fn parse_zone_offset_seconds(value: &str) -> Option<i64> {
+    if value.eq_ignore_ascii_case("gmt") || value.eq_ignore_ascii_case("utc") {
+        return Some(0);
+    }
+    let bytes = value.as_bytes();
+    if bytes.len() != 5 || !matches!(bytes[0], b'+' | b'-') {
+        return None;
+    }
+    let hours: i64 = value[1..3].parse().ok()?;
+    let minutes: i64 = value[3..5].parse().ok()?;
+    if hours > 23 || minutes > 59 {
+        return None;
+    }
+    let seconds = hours.checked_mul(3_600)?.checked_add(minutes * 60)?;
+    Some(if bytes[0] == b'-' { -seconds } else { seconds })
+}
+
+fn system_time_from_curl_date(
+    year: i32,
+    month: u32,
+    day: u32,
+    hour: u32,
+    minute: u32,
+    second: u32,
+    zone_offset_seconds: i64,
+) -> Option<SystemTime> {
+    if !(1..=12).contains(&month) || day == 0 || day > days_in_month(year, month) {
+        return None;
+    }
+    let seconds = days_from_civil(year, month, day)
+        .checked_mul(86_400)?
+        .checked_add(i64::from(hour) * 3_600)?
+        .checked_add(i64::from(minute) * 60)?
+        .checked_add(i64::from(second))?
+        .checked_sub(zone_offset_seconds)?;
+    if seconds >= 0 {
+        UNIX_EPOCH.checked_add(std::time::Duration::from_secs(seconds as u64))
+    } else {
+        UNIX_EPOCH.checked_sub(std::time::Duration::from_secs(seconds.unsigned_abs()))
+    }
+}
+
+fn days_in_month(year: i32, month: u32) -> u32 {
+    match month {
+        1 | 3 | 5 | 7 | 8 | 10 | 12 => 31,
+        4 | 6 | 9 | 11 => 30,
+        2 if is_leap_year(year) => 29,
+        2 => 28,
+        _ => 0,
+    }
+}
+
+fn is_leap_year(year: i32) -> bool {
+    (year % 4 == 0 && year % 100 != 0) || year % 400 == 0
+}
+
+fn days_from_civil(year: i32, month: u32, day: u32) -> i64 {
+    let mut year = i64::from(year);
+    let month = i64::from(month);
+    let day = i64::from(day);
+    year -= i64::from(month <= 2);
+    let era = if year >= 0 { year } else { year - 399 } / 400;
+    let yoe = year - era * 400;
+    let month_for_formula = month + if month > 2 { -3 } else { 9 };
+    let doy = (153 * month_for_formula + 2) / 5 + day - 1;
+    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+    era * 146_097 + doe - 719_468
+}
+
+#[cfg(unix)]
+fn set_output_file_time(path: &Path, remote_time: SystemTime) -> io::Result<()> {
+    let times = [
+        system_time_to_timespec(remote_time)?,
+        system_time_to_timespec(remote_time)?,
+    ];
+    let c_path = CString::new(path.as_os_str().as_bytes())
+        .map_err(|error| io::Error::new(io::ErrorKind::InvalidInput, error))?;
+    let rc = unsafe { libc::utimensat(libc::AT_FDCWD, c_path.as_ptr(), times.as_ptr(), 0) };
+    if rc == 0 {
+        Ok(())
+    } else {
+        Err(io::Error::last_os_error())
+    }
+}
+
+#[cfg(not(unix))]
+fn set_output_file_time(_path: &Path, _remote_time: SystemTime) -> io::Result<()> {
+    Ok(())
+}
+
+#[cfg(unix)]
+fn system_time_to_timespec(time: SystemTime) -> io::Result<libc::timespec> {
+    let (seconds, nanos) = match time.duration_since(UNIX_EPOCH) {
+        Ok(duration) => (
+            i128::from(duration.as_secs()),
+            i128::from(duration.subsec_nanos()),
+        ),
+        Err(error) => {
+            let duration = error.duration();
+            if duration.subsec_nanos() == 0 {
+                (-i128::from(duration.as_secs()), 0)
+            } else {
+                (
+                    -i128::from(duration.as_secs()) - 1,
+                    i128::from(1_000_000_000 - duration.subsec_nanos()),
+                )
+            }
+        }
+    };
+    Ok(libc::timespec {
+        tv_sec: seconds
+            .try_into()
+            .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "filetime out of range"))?,
+        tv_nsec: nanos
+            .try_into()
+            .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "filetime out of range"))?,
+    })
 }
 
 fn open_output_file(
@@ -430,6 +657,13 @@ mod tests {
             parse_content_disposition_filename("inline; filename='name1313"),
             Some("name1313".to_string())
         );
+    }
+
+    #[test]
+    fn parses_pre_epoch_remote_file_time_with_numeric_zone() {
+        let remote_time = parse_curl_http_date("Wed, 09 Oct 1940 16:45:49 +0100").unwrap();
+
+        assert_eq!(unix_timestamp(remote_time), -922_349_651);
     }
 
     #[test]

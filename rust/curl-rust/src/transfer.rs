@@ -1324,10 +1324,11 @@ async fn run_file_transfer(
         &bytes,
         resume_from > 0,
     )?;
-    metrics.filename_effective = filename.map(|path| path.display().to_string());
+    metrics.filename_effective = filename.as_ref().map(|path| path.display().to_string());
     if max_filesize_exceeded {
         return Err(CurlError::FileSizeExceeded);
     }
+    output::apply_remote_time(transfer, &headers, filename.as_deref());
     Ok(())
 }
 
@@ -1602,6 +1603,16 @@ async fn run_ftp_exchange(
         )
         .await
     } else {
+        if transfer.remote_time {
+            ftp_fetch_file_time(
+                &mut stream,
+                &path,
+                metrics,
+                &mut control_headers,
+                &mut synthetic_headers,
+            )
+            .await?;
+        }
         match ftp_download_body(
             transfer,
             &mut stream,
@@ -1643,6 +1654,7 @@ async fn run_ftp_exchange(
 
     metrics.url_effective = url.to_string();
 
+    let mut output_filename: Option<PathBuf> = None;
     let local_result = (|| -> Result<()> {
         if uploaded {
             metrics.size_download = 0;
@@ -1664,22 +1676,25 @@ async fn run_ftp_exchange(
                 &header_bytes,
                 false,
             )?;
-            metrics.filename_effective = filename.map(|path| path.display().to_string());
+            metrics.filename_effective = filename.as_ref().map(|path| path.display().to_string());
+            output_filename = filename;
             metrics.size_download = 0;
             return Ok(());
         }
 
         let (body_bytes, max_filesize_exceeded) = limit_body_for_max_filesize(transfer, &body);
         metrics.size_download = body_bytes.len() as u64;
+        metrics.headers = synthetic_headers.clone();
         let filename = output::write_response(
             transfer,
             &url,
-            &reqwest::header::HeaderMap::new(),
+            &synthetic_headers,
             &expanded.variables,
             body_bytes,
             resume_from > 0,
         )?;
-        metrics.filename_effective = filename.map(|path| path.display().to_string());
+        metrics.filename_effective = filename.as_ref().map(|path| path.display().to_string());
+        output_filename = filename;
         if max_filesize_exceeded {
             Err(CurlError::FileSizeExceeded)
         } else {
@@ -1704,7 +1719,9 @@ async fn run_ftp_exchange(
     )
     .await;
     ftp_quit_preserving_response_code(&mut stream, metrics, &mut control_headers).await;
-    postquote_result
+    postquote_result?;
+    output::apply_remote_time(transfer, &synthetic_headers, output_filename.as_deref());
+    Ok(())
 }
 
 struct FtpPath {
@@ -1784,6 +1801,29 @@ async fn ftp_quit_preserving_response_code(
     metrics.response_code = response_code_before_quit;
 }
 
+async fn ftp_fetch_file_time(
+    stream: &mut TcpStream,
+    path: &FtpPath,
+    metrics: &mut writeout::Metrics,
+    control_headers: &mut Vec<u8>,
+    synthetic_headers: &mut reqwest::header::HeaderMap,
+) -> Result<()> {
+    let Some(file) = &path.file else {
+        return Ok(());
+    };
+
+    let mut mdtm = Vec::from(&b"MDTM "[..]);
+    mdtm.extend_from_slice(file);
+    let response = ftp_command(stream, &mdtm, metrics, control_headers).await?;
+    if response.code == 213
+        && let Some(modified) = ftp_mdtm_time(&response)
+        && let Ok(value) = HeaderValue::from_str(&httpdate::fmt_http_date(modified))
+    {
+        synthetic_headers.insert(LAST_MODIFIED, value);
+    }
+    Ok(())
+}
+
 async fn ftp_cwd(
     stream: &mut TcpStream,
     directory: &[u8],
@@ -1819,15 +1859,7 @@ async fn ftp_head_file(
         return Ok(());
     };
 
-    let mut mdtm = Vec::from(&b"MDTM "[..]);
-    mdtm.extend_from_slice(file);
-    let response = ftp_command(stream, &mdtm, metrics, control_headers).await?;
-    if response.code == 213
-        && let Some(modified) = ftp_mdtm_time(&response)
-        && let Ok(value) = HeaderValue::from_str(&httpdate::fmt_http_date(modified))
-    {
-        synthetic_headers.insert(LAST_MODIFIED, value);
-    }
+    ftp_fetch_file_time(stream, path, metrics, control_headers, synthetic_headers).await?;
 
     ftp_set_type(stream, b'I', metrics, control_headers).await?;
     ftp_run_quote_commands(stream, &transfer.ftp_prequote, metrics, control_headers).await?;
@@ -2861,11 +2893,12 @@ async fn run_ssh_transfer(
         &bytes,
         download.resume_from > 0,
     )?;
-    metrics.filename_effective = filename.map(|path| path.display().to_string());
+    metrics.filename_effective = filename.as_ref().map(|path| path.display().to_string());
     if max_filesize_exceeded {
         return Err(CurlError::FileSizeExceeded);
     }
     run_sftp_postquote(postquote, transfer).await?;
+    output::apply_remote_time(transfer, &download.headers, filename.as_deref());
     Ok(())
 }
 
@@ -5189,7 +5222,8 @@ async fn run_rtsp_transfer(
         &output_bytes,
         false,
     )?;
-    metrics.filename_effective = filename.map(|path| path.display().to_string());
+    metrics.filename_effective = filename.as_ref().map(|path| path.display().to_string());
+    output::apply_remote_time(transfer, &response.headers, filename.as_deref());
     Ok(())
 }
 
@@ -5567,7 +5601,10 @@ async fn run_ws_exchange(
             &output_bytes,
             false,
         )?;
-        metrics.filename_effective = filename.map(|path| path.display().to_string());
+        metrics.filename_effective = filename.as_ref().map(|path| path.display().to_string());
+        if !max_filesize_exceeded {
+            output::apply_remote_time(transfer, &response.headers, filename.as_deref());
+        }
     }
     if max_filesize_exceeded {
         return Err(CurlError::FileSizeExceeded);
@@ -12518,6 +12555,7 @@ fn finish_http_transfer(
         });
     }
 
+    output::apply_remote_time(transfer, &attempt.headers, write.output_path.as_deref());
     Ok(())
 }
 
