@@ -1297,8 +1297,21 @@ async fn run_file_transfer(
     };
     let headers = output::file_headers(header_size, modified);
     let header_bytes = output::render_file_headers(&headers);
-    if let Some(path) = &transfer.dump_header {
-        output::dump_headers(path, &header_bytes, transfer.create_dirs)?;
+    let write_file_headers = transfer.include_headers || method == "HEAD";
+    let header_block_bytes = if method == "HEAD" || header_bytes.is_empty() {
+        header_bytes.clone()
+    } else {
+        let mut bytes = header_bytes.clone();
+        bytes.extend_from_slice(b"\r\n");
+        bytes
+    };
+    let dump_headers_interleaved = transfer.dump_header.as_deref() == Some(Path::new("-"))
+        && write_file_headers
+        && http_response_writes_stdout(transfer);
+    if let Some(path) = &transfer.dump_header
+        && !dump_headers_interleaved
+    {
+        output::dump_headers(path, &header_block_bytes, transfer.create_dirs)?;
     }
     trace::dump(transfer, trace::TraceEvent::RecvHeader, &header_bytes)?;
     if method != "HEAD" {
@@ -1310,8 +1323,20 @@ async fn run_file_transfer(
     metrics.headers = headers.clone();
 
     let mut bytes = Vec::new();
-    if transfer.include_headers || method == "HEAD" {
-        bytes.extend_from_slice(&header_bytes);
+    if write_file_headers {
+        if dump_headers_interleaved {
+            if method == "HEAD" {
+                bytes.extend_from_slice(&interleaved_dump_and_include_headers(&header_bytes));
+            } else {
+                bytes.extend_from_slice(&interleaved_file_header_blocks(&header_bytes));
+            }
+        } else {
+            bytes.extend_from_slice(if method == "HEAD" {
+                &header_bytes
+            } else {
+                &header_block_bytes
+            });
+        }
     }
     if method != "HEAD" {
         bytes.extend_from_slice(body_bytes);
@@ -1558,6 +1583,7 @@ async fn run_ftp_exchange(
     let mut body = Vec::new();
     let mut uploaded = false;
     let mut deferred_download_error: Option<CurlError> = None;
+    let mut quit_after_deferred_download_error = true;
     let transfer_result = if let Some(upload) = upload.as_deref() {
         uploaded = true;
         ftp_upload_body(
@@ -1606,6 +1632,7 @@ async fn run_ftp_exchange(
             Ok(downloaded) => {
                 body = downloaded.body;
                 deferred_download_error = downloaded.deferred_error;
+                quit_after_deferred_download_error = downloaded.quit_after_deferred_error;
                 Ok(())
             }
             Err(error) => Err(error),
@@ -1686,7 +1713,9 @@ async fn run_ftp_exchange(
         return Err(error);
     }
     if let Some(error) = deferred_download_error {
-        ftp_quit_preserving_response_code(&mut stream, metrics, &mut control_headers).await;
+        if quit_after_deferred_download_error {
+            ftp_quit_preserving_response_code(&mut stream, metrics, &mut control_headers).await;
+        }
         return Err(error);
     }
 
@@ -1953,6 +1982,7 @@ async fn ftp_download_body(
             return Ok(FtpDownloadBody {
                 body,
                 deferred_error,
+                quit_after_deferred_error: true,
             });
         }
 
@@ -1962,6 +1992,12 @@ async fn ftp_download_body(
             .map_err(tcp_io_error)?;
         let response = ftp_read_response(stream, metrics, control_headers).await?;
         ftp_require_positive(&response, CurlError::FtpCouldntRetrFile)?;
+        if let Some(size) = remote_size {
+            let expected = size.saturating_sub(rest_offset);
+            if (body.len() as u64) < expected {
+                return Ok(FtpDownloadBody::partial_without_quit(body));
+            }
+        }
         return Ok(FtpDownloadBody::new(body));
     }
 
@@ -1988,6 +2024,7 @@ async fn ftp_download_body(
 struct FtpDownloadBody {
     body: Vec<u8>,
     deferred_error: Option<CurlError>,
+    quit_after_deferred_error: bool,
 }
 
 impl FtpDownloadBody {
@@ -1995,6 +2032,15 @@ impl FtpDownloadBody {
         Self {
             body,
             deferred_error: None,
+            quit_after_deferred_error: true,
+        }
+    }
+
+    fn partial_without_quit(body: Vec<u8>) -> Self {
+        Self {
+            body,
+            deferred_error: Some(CurlError::PartialFile),
+            quit_after_deferred_error: false,
         }
     }
 }
@@ -12861,6 +12907,33 @@ fn http_attempt_header_size(attempt: &HttpAttempt, header_bytes: &[u8]) -> u64 {
 
 fn http_response_writes_stdout(transfer: &TransferConfig) -> bool {
     !transfer.out_null && transfer.output.is_none() && !transfer.remote_name
+}
+
+fn interleaved_file_header_blocks(header_bytes: &[u8]) -> Vec<u8> {
+    let mut lines = Vec::new();
+    let mut offset = 0;
+    while let Some((line, next_offset)) = next_raw_header_line(header_bytes, offset) {
+        lines.push(line);
+        offset = next_offset;
+    }
+    if lines.is_empty() {
+        return Vec::new();
+    }
+
+    let mut interleaved = Vec::with_capacity((header_bytes.len() + b"\r\n".len()) * 2);
+    let last = lines.len() - 1;
+    for (index, line) in lines.into_iter().enumerate() {
+        if index == last {
+            interleaved.extend_from_slice(line);
+            interleaved.extend_from_slice(b"\r\n");
+            interleaved.extend_from_slice(line);
+            interleaved.extend_from_slice(b"\r\n");
+        } else {
+            interleaved.extend_from_slice(line);
+            interleaved.extend_from_slice(line);
+        }
+    }
+    interleaved
 }
 
 fn interleaved_dump_and_include_headers(header_bytes: &[u8]) -> Vec<u8> {

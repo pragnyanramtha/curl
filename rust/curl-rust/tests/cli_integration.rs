@@ -6603,16 +6603,18 @@ fn ftp_double_slash_cwds_to_root_before_file() {
 
 #[test]
 fn ftp_head_outputs_synthetic_file_headers_without_data_connection() {
-    let (url, rx) = spawn_ftp_server("/blalbla/141", ftp_options(Vec::new()));
+    let mut options = ftp_options(Vec::new());
+    options.size = Some(42);
+    let (url, rx) = spawn_ftp_server("/blalbla/141", options);
 
     let mut command = Command::cargo_bin("curl").unwrap();
     let output = command.args(["-q", "-sS", "-I", &url]).output().unwrap();
 
     assert!(output.status.success());
     let stdout = String::from_utf8(output.stdout).unwrap();
-    assert!(stdout.contains("last-modified: Wed, 09 Apr 2003 10:26:59 GMT\r\n"));
-    assert!(stdout.contains("content-length: 0\r\n"));
-    assert!(stdout.contains("accept-ranges: bytes\r\n"));
+    assert!(stdout.contains("Last-Modified: Wed, 09 Apr 2003 10:26:59 GMT\r\n"));
+    assert!(stdout.contains("Content-Length: 42\r\n"));
+    assert!(stdout.contains("Accept-ranges: bytes\r\n"));
 
     let record = rx.recv().unwrap();
     assert_eq!(
@@ -7099,6 +7101,21 @@ fn ftp_range_download_sends_rest_and_aborts_after_requested_bytes() {
 }
 
 #[test]
+fn ftp_range_open_ended_known_size_uses_rest_offset() {
+    let (url, rx) = spawn_ftp_server("/file.txt", ftp_options(b"abcdef"));
+
+    let mut command = Command::cargo_bin("curl").unwrap();
+    command.args(["-q", "-sS", "--range", "2-", &url]);
+    command.assert().success().stdout("cdef");
+
+    let record = rx.recv().unwrap();
+    assert_eq!(
+        record.commands,
+        b"USER anonymous\r\nPASS ftp@example.com\r\nPWD\r\nEPSV\r\nTYPE I\r\nSIZE file.txt\r\nREST 2\r\nRETR file.txt\r\nQUIT\r\n"
+    );
+}
+
+#[test]
 fn ftp_range_download_without_size_still_sends_rest() {
     let mut options = ftp_options(b"xxxdata to see");
     options.size = None;
@@ -7162,6 +7179,23 @@ fn ftp_range_short_data_writes_partial_body_then_fails() {
     assert_eq!(
         record.commands,
         b"USER anonymous\r\nPASS ftp@example.com\r\nPWD\r\nEPSV\r\nTYPE I\r\nSIZE file.txt\r\nREST 2\r\nRETR file.txt\r\nQUIT\r\n"
+    );
+}
+
+#[test]
+fn ftp_retr_short_known_size_writes_partial_body_then_fails_without_quit() {
+    let mut options = ftp_options(b"abcdef");
+    options.size_reply = Some(b"213 20\r\n");
+    let (url, rx) = spawn_ftp_server("/file.txt", options);
+
+    let mut command = Command::cargo_bin("curl").unwrap();
+    command.args(["-q", "-sS", &url]);
+    command.assert().failure().code(18).stdout("abcdef");
+
+    let record = rx.recv().unwrap();
+    assert_eq!(
+        record.commands,
+        b"USER anonymous\r\nPASS ftp@example.com\r\nPWD\r\nEPSV\r\nTYPE I\r\nSIZE file.txt\r\nRETR file.txt\r\n"
     );
 }
 
@@ -7591,7 +7625,7 @@ fn ftp_head_prequote_runs_before_size() {
 
     assert!(output.status.success());
     let stdout = String::from_utf8(output.stdout).unwrap();
-    assert!(stdout.contains("content-length: 0\r\n"));
+    assert!(stdout.contains("Content-Length: 0\r\n"));
 
     assert_eq!(
         rx.recv().unwrap().commands,
@@ -10938,7 +10972,7 @@ fn sftp_head_writes_headers_without_body() {
 
     assert!(output.status.success());
     let stdout = String::from_utf8(output.stdout).unwrap();
-    assert!(stdout.contains("content-length: 17\r\n"));
+    assert!(stdout.contains("Content-Length: 17\r\n"));
     assert!(!stdout.contains("ssh fixture body"));
 }
 
@@ -14265,8 +14299,75 @@ fn file_head_outputs_file_headers() {
     let output = command.output().unwrap();
     assert!(output.status.success());
     let stdout = String::from_utf8(output.stdout).unwrap();
-    assert!(stdout.contains("content-length: 5\r\n"));
+    assert!(stdout.contains("Content-Length: 5\r\n"));
     assert!(!stdout.contains("HTTP/"));
+}
+
+#[test]
+fn file_include_separates_file_headers_from_body() {
+    let temp = tempdir().unwrap();
+    let file = temp.path().join("plain.txt");
+    std::fs::write(&file, "hello").unwrap();
+    let url = Url::from_file_path(&file).unwrap().to_string();
+
+    let mut command = Command::cargo_bin("curl").unwrap();
+    command.args(["-q", "-sS", "-i", &url]);
+    let output = command.output().unwrap();
+    assert!(output.status.success());
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    assert!(stdout.contains("Content-Length: 5\r\n"));
+    assert!(stdout.ends_with("\r\n\r\nhello"));
+}
+
+#[test]
+fn file_dump_header_dash_separates_file_headers_from_body() {
+    let temp = tempdir().unwrap();
+    let file = temp.path().join("plain.txt");
+    std::fs::write(&file, "hello").unwrap();
+    let url = Url::from_file_path(&file).unwrap().to_string();
+
+    let mut command = Command::cargo_bin("curl").unwrap();
+    command.args(["-q", "-sS", "-D", "-", &url]);
+    let output = command.output().unwrap();
+    assert!(output.status.success());
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    assert!(stdout.contains("Content-Length: 5\r\n"));
+    assert!(stdout.ends_with("\r\n\r\nhello"));
+}
+
+#[test]
+fn file_head_dump_header_dash_interleaves_file_headers() {
+    let temp = tempdir().unwrap();
+    let file = temp.path().join("plain.txt");
+    std::fs::write(&file, "hello").unwrap();
+    let url = Url::from_file_path(&file).unwrap().to_string();
+
+    let mut command = Command::cargo_bin("curl").unwrap();
+    command.args(["-q", "-sS", "-I", "-D", "-", &url]);
+    let output = command.output().unwrap();
+    assert!(output.status.success());
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    assert!(!stdout.contains("\r\n\r\n"));
+    assert!(stdout.contains("Content-Length: 5\r\nContent-Length: 5\r\n"));
+    assert!(stdout.contains("Accept-ranges: bytes\r\nAccept-ranges: bytes\r\n"));
+}
+
+#[test]
+fn file_include_and_dump_header_dash_interleaves_file_headers() {
+    let temp = tempdir().unwrap();
+    let file = temp.path().join("plain.txt");
+    std::fs::write(&file, "hello").unwrap();
+    let url = Url::from_file_path(&file).unwrap().to_string();
+
+    let mut command = Command::cargo_bin("curl").unwrap();
+    command.args(["-q", "-sS", "-i", "-D", "-", &url]);
+    let output = command.output().unwrap();
+    assert!(output.status.success());
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    assert!(stdout.contains("Content-Length: 5\r\nContent-Length: 5\r\n"));
+    assert!(stdout.contains("Accept-ranges: bytes\r\nAccept-ranges: bytes\r\n"));
+    assert_eq!(stdout.matches("\r\n\r\n").count(), 2);
+    assert!(stdout.ends_with("\r\n\r\nhello"));
 }
 
 #[test]

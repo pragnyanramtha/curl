@@ -43,13 +43,24 @@ pub fn render_headers(version: Version, status: StatusCode, headers: &HeaderMap)
 pub fn render_file_headers(headers: &HeaderMap) -> Vec<u8> {
     let mut output = Vec::new();
     for (name, value) in headers {
-        output.extend_from_slice(name.as_str().as_bytes());
+        output.extend_from_slice(file_header_display_name(name).as_bytes());
         output.extend_from_slice(b": ");
         output.extend_from_slice(value.as_bytes());
         output.extend_from_slice(b"\r\n");
     }
-    output.extend_from_slice(b"\r\n");
     output
+}
+
+fn file_header_display_name(name: &reqwest::header::HeaderName) -> &str {
+    if *name == LAST_MODIFIED {
+        "Last-Modified"
+    } else if *name == CONTENT_LENGTH {
+        "Content-Length"
+    } else if *name == ACCEPT_RANGES {
+        "Accept-ranges"
+    } else {
+        name.as_str()
+    }
 }
 
 pub fn write_response(
@@ -632,7 +643,7 @@ mod tests {
         let rendered = render_file_headers(&headers);
         let rendered = String::from_utf8(rendered).unwrap();
 
-        assert_eq!(rendered, "content-length: 5\r\n\r\n");
+        assert_eq!(rendered, "Content-Length: 5\r\n");
     }
 
     #[test]
