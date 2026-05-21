@@ -175,6 +175,7 @@ struct HttpAttempt {
     final_url: Url,
     headers: reqwest::header::HeaderMap,
     header_bytes: Option<Vec<u8>>,
+    trailer_bytes: Vec<u8>,
     body: Vec<u8>,
     redirects: Vec<HttpAttempt>,
     retry_after: Option<Duration>,
@@ -9834,6 +9835,7 @@ async fn run_http_transfer(
             || raw_custom_header_wire_semantics
             || raw_http_output_slot_wire_semantics(transfer)
             || raw_http_retry_wire_semantics(transfer, &method)
+            || raw_http_simple_get_wire_semantics(transfer, &method)
             || raw_http_default_get_version_wire_semantics(transfer, &method)
             || raw_http_time_condition_wire_semantics(transfer, &method)
             || method == Method::HEAD
@@ -10068,6 +10070,7 @@ async fn run_http_transfer(
                 final_url,
                 headers,
                 header_bytes: None,
+                trailer_bytes: Vec::new(),
                 body: Vec::new(),
                 redirects: Vec::new(),
                 retry_after: None,
@@ -10123,6 +10126,7 @@ async fn run_http_transfer(
             final_url,
             headers,
             header_bytes: None,
+            trailer_bytes: Vec::new(),
             body,
             redirects: redirect_attempts,
             retry_after,
@@ -10191,6 +10195,25 @@ fn raw_http_retry_wire_semantics(transfer: &TransferConfig, method: &Method) -> 
         && transfer.resolve.is_empty()
         && transfer.proxy.is_none()
         && transfer.http_version == HttpVersionPreference::Any
+}
+
+fn raw_http_simple_get_wire_semantics(transfer: &TransferConfig, method: &Method) -> bool {
+    *method == Method::GET
+        && !transfer.verbose
+        && transfer.headers.is_empty()
+        && transfer.resolve.is_empty()
+        && transfer.proxy.is_none()
+        && transfer.http_version == HttpVersionPreference::Any
+        && transfer.data.is_empty()
+        && transfer.forms.is_empty()
+        && transfer.upload_file.is_none()
+        && transfer.user.is_none()
+        && transfer.oauth2_bearer.is_none()
+        && transfer.aws_sigv4.is_none()
+        && transfer.cookie.is_none()
+        && transfer.referer.is_none()
+        && transfer.range.is_none()
+        && transfer.time_cond.is_none()
 }
 
 fn raw_http_retry_redirect_wire_semantics(transfer: &TransferConfig) -> bool {
@@ -11167,6 +11190,7 @@ async fn raw_http_read_response(
         && !raw_http_response_is_chunked(&headers)
         && !headers.contains_key(CONTENT_LENGTH);
     let mut deferred_error = None;
+    let mut trailer_bytes = Vec::new();
     let body = if method == Method::HEAD
         || method == Method::CONNECT
         || resume_action == HttpResumeAction::AlreadyComplete
@@ -11175,9 +11199,18 @@ async fn raw_http_read_response(
     {
         Vec::new()
     } else if options.raw_transfer_decoding && raw_http_response_is_chunked(&headers) {
-        raw_http_read_chunked_wire_body(stream, rate_limiter.as_mut()).await?
+        let chunked = raw_http_read_chunked_wire_body(stream, rate_limiter.as_mut()).await?;
+        if chunked.partial {
+            deferred_error = Some(CurlError::PartialFile);
+        }
+        chunked.body
     } else if raw_http_response_is_chunked(&headers) {
-        raw_http_read_chunked_body(stream, rate_limiter.as_mut()).await?
+        let chunked = raw_http_read_chunked_body(stream, rate_limiter.as_mut()).await?;
+        if chunked.partial {
+            deferred_error = Some(CurlError::PartialFile);
+        }
+        trailer_bytes = chunked.trailer_bytes;
+        chunked.body
     } else if !options.ignore_content_length
         && let Some(length) = headers
             .get(CONTENT_LENGTH)
@@ -11199,6 +11232,9 @@ async fn raw_http_read_response(
     if !body.is_empty() {
         trace::dump(transfer, trace::TraceEvent::RecvData, &body)?;
     }
+    if !trailer_bytes.is_empty() {
+        trace::dump(transfer, trace::TraceEvent::RecvHeader, &trailer_bytes)?;
+    }
 
     Ok(HttpAttempt {
         method: method.clone(),
@@ -11207,6 +11243,7 @@ async fn raw_http_read_response(
         final_url: final_url.clone(),
         headers,
         header_bytes: Some(header_bytes),
+        trailer_bytes,
         body,
         redirects: Vec::new(),
         retry_after,
@@ -11257,31 +11294,66 @@ async fn rate_limited_read_to_end<R: AsyncRead + Unpin>(
     }
 }
 
+struct RawHttpChunkedBody {
+    body: Vec<u8>,
+    trailer_bytes: Vec<u8>,
+    partial: bool,
+}
+
 async fn raw_http_read_chunked_body(
     stream: &mut TcpStream,
     mut rate_limiter: Option<&mut TransferRateLimiter>,
-) -> Result<Vec<u8>> {
+) -> Result<RawHttpChunkedBody> {
     let mut body = Vec::new();
+    let mut trailer_bytes = Vec::new();
     loop {
-        let line = raw_http_read_line(stream).await?;
+        let Some(line) = raw_http_read_chunk_line(stream).await? else {
+            return Ok(RawHttpChunkedBody {
+                body,
+                trailer_bytes,
+                partial: true,
+            });
+        };
         let size = raw_http_chunk_size(&line)?;
         if size == 0 {
             loop {
-                let trailer = raw_http_read_line(stream).await?;
+                let Some(trailer) = raw_http_read_chunk_line(stream).await? else {
+                    return Ok(RawHttpChunkedBody {
+                        body,
+                        trailer_bytes,
+                        partial: true,
+                    });
+                };
                 if trailer == "\r\n" || trailer == "\n" || trailer.trim().is_empty() {
-                    return Ok(body);
+                    return Ok(RawHttpChunkedBody {
+                        body,
+                        trailer_bytes,
+                        partial: false,
+                    });
                 }
+                trailer_bytes.extend_from_slice(trailer.as_bytes());
             }
         }
 
-        let mut chunk = vec![0_u8; size];
-        stream.read_exact(&mut chunk).await.map_err(tcp_io_error)?;
-        if let Some(rate_limiter) = rate_limiter.as_mut() {
-            rate_limiter.record(chunk.len()).await;
+        let mut chunk = Vec::with_capacity(size);
+        if !raw_http_read_exact_chunk(stream, size, &mut chunk, rate_limiter.as_deref_mut()).await?
+        {
+            body.extend_from_slice(&chunk);
+            return Ok(RawHttpChunkedBody {
+                body,
+                trailer_bytes,
+                partial: true,
+            });
         }
         body.extend_from_slice(&chunk);
 
-        let terminator = raw_http_read_line(stream).await?;
+        let Some(terminator) = raw_http_read_chunk_line(stream).await? else {
+            return Ok(RawHttpChunkedBody {
+                body,
+                trailer_bytes,
+                partial: true,
+            });
+        };
         if terminator != "\r\n" && terminator != "\n" {
             return Err(CurlError::WeirdServerReply);
         }
@@ -11291,10 +11363,16 @@ async fn raw_http_read_chunked_body(
 async fn raw_http_read_chunked_wire_body(
     stream: &mut TcpStream,
     mut rate_limiter: Option<&mut TransferRateLimiter>,
-) -> Result<Vec<u8>> {
+) -> Result<RawHttpChunkedBody> {
     let mut body = Vec::new();
     loop {
-        let line = raw_http_read_line(stream).await?;
+        let Some(line) = raw_http_read_chunk_line(stream).await? else {
+            return Ok(RawHttpChunkedBody {
+                body,
+                trailer_bytes: Vec::new(),
+                partial: true,
+            });
+        };
         if let Some(rate_limiter) = rate_limiter.as_mut() {
             rate_limiter.record(line.len()).await;
         }
@@ -11302,25 +11380,46 @@ async fn raw_http_read_chunked_wire_body(
         let size = raw_http_chunk_size(&line)?;
         if size == 0 {
             loop {
-                let trailer = raw_http_read_line(stream).await?;
+                let Some(trailer) = raw_http_read_chunk_line(stream).await? else {
+                    return Ok(RawHttpChunkedBody {
+                        body,
+                        trailer_bytes: Vec::new(),
+                        partial: true,
+                    });
+                };
                 if let Some(rate_limiter) = rate_limiter.as_mut() {
                     rate_limiter.record(trailer.len()).await;
                 }
                 body.extend_from_slice(trailer.as_bytes());
                 if trailer == "\r\n" || trailer == "\n" || trailer.trim().is_empty() {
-                    return Ok(body);
+                    return Ok(RawHttpChunkedBody {
+                        body,
+                        trailer_bytes: Vec::new(),
+                        partial: false,
+                    });
                 }
             }
         }
 
-        let mut chunk = vec![0_u8; size];
-        stream.read_exact(&mut chunk).await.map_err(tcp_io_error)?;
-        if let Some(rate_limiter) = rate_limiter.as_mut() {
-            rate_limiter.record(chunk.len()).await;
+        let mut chunk = Vec::with_capacity(size);
+        if !raw_http_read_exact_chunk(stream, size, &mut chunk, rate_limiter.as_deref_mut()).await?
+        {
+            body.extend_from_slice(&chunk);
+            return Ok(RawHttpChunkedBody {
+                body,
+                trailer_bytes: Vec::new(),
+                partial: true,
+            });
         }
         body.extend_from_slice(&chunk);
 
-        let terminator = raw_http_read_line(stream).await?;
+        let Some(terminator) = raw_http_read_chunk_line(stream).await? else {
+            return Ok(RawHttpChunkedBody {
+                body,
+                trailer_bytes: Vec::new(),
+                partial: true,
+            });
+        };
         if terminator != "\r\n" && terminator != "\n" {
             return Err(CurlError::WeirdServerReply);
         }
@@ -11340,19 +11439,52 @@ fn raw_http_chunk_size(line: &str) -> Result<usize> {
     usize::from_str_radix(size_text, 16).map_err(|_| CurlError::WeirdServerReply)
 }
 
-async fn raw_http_read_line(stream: &mut TcpStream) -> Result<String> {
+async fn raw_http_read_chunk_line(stream: &mut TcpStream) -> Result<Option<String>> {
     let mut line = Vec::new();
     let mut byte = [0_u8; 1];
     loop {
-        stream.read_exact(&mut byte).await.map_err(tcp_io_error)?;
+        let read = stream.read(&mut byte).await.map_err(tcp_io_error)?;
+        if read == 0 {
+            return if line.is_empty() {
+                Ok(None)
+            } else {
+                Err(CurlError::PartialFile)
+            };
+        }
         line.push(byte[0]);
         if byte[0] == b'\n' {
-            return String::from_utf8(line).map_err(|_| CurlError::WeirdServerReply);
+            return String::from_utf8(line)
+                .map(Some)
+                .map_err(|_| CurlError::WeirdServerReply);
         }
         if line.len() > 16 * 1024 {
             return Err(CurlError::WeirdServerReply);
         }
     }
+}
+
+async fn raw_http_read_exact_chunk(
+    stream: &mut TcpStream,
+    size: usize,
+    chunk: &mut Vec<u8>,
+    mut rate_limiter: Option<&mut TransferRateLimiter>,
+) -> Result<bool> {
+    let mut buffer = [0_u8; 8192];
+    while chunk.len() < size {
+        let max_read = (size - chunk.len()).min(buffer.len());
+        let read = stream
+            .read(&mut buffer[..max_read])
+            .await
+            .map_err(tcp_io_error)?;
+        if read == 0 {
+            return Ok(false);
+        }
+        if let Some(rate_limiter) = rate_limiter.as_mut() {
+            rate_limiter.record(read).await;
+        }
+        chunk.extend_from_slice(&buffer[..read]);
+    }
+    Ok(true)
 }
 
 fn raw_http_header_prefix_possible(bytes: &[u8]) -> bool {
@@ -11379,6 +11511,7 @@ fn raw_http09_attempt(
         final_url: final_url.clone(),
         headers: reqwest::header::HeaderMap::new(),
         header_bytes: Some(Vec::new()),
+        trailer_bytes: Vec::new(),
         body: if method == Method::HEAD {
             Vec::new()
         } else {
@@ -12153,6 +12286,9 @@ fn write_http_attempt_output(
     record_http_attempt_metrics(metrics, method, attempt, header_bytes.len() as u64);
     if persist_headers && let Some(path) = &transfer.dump_header {
         output::append_dump_headers(path, &header_bytes, transfer.create_dirs)?;
+        if !attempt.trailer_bytes.is_empty() {
+            output::append_dump_headers(path, &attempt.trailer_bytes, transfer.create_dirs)?;
+        }
     }
     if persist_headers && let Some(path) = &transfer.etag_save {
         save_etag(path, attempt.status, &attempt.headers, transfer.create_dirs)?;
@@ -12192,6 +12328,9 @@ fn write_http_attempt_output(
         }
         if write_body {
             bytes.extend_from_slice(body_bytes);
+        }
+        if write_headers && !attempt.trailer_bytes.is_empty() {
+            bytes.extend_from_slice(&attempt.trailer_bytes);
         }
         let filename = output::write_response(
             transfer,

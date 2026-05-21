@@ -4630,6 +4630,69 @@ fn default_http_get_decodes_chunked_response() {
 }
 
 #[test]
+fn default_http_get_preserves_chunked_trailers_for_dump_header() {
+    let temp = tempdir().unwrap();
+    let headers = temp.path().join("headers");
+    let (url, rx) = spawn_server(
+        b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\nTrailer: X-Trailer\r\n\r\n5\r\nhello\r\n0\r\nX-Trailer: yes\r\n\r\n",
+    );
+
+    let mut command = Command::cargo_bin("curl").unwrap();
+    command.args(["-q", "-sS", "-D", headers.to_str().unwrap(), &url]);
+    command.assert().success().stdout("hello").stderr("");
+
+    assert_eq!(
+        std::fs::read_to_string(headers).unwrap(),
+        "HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\nTrailer: X-Trailer\r\n\r\nX-Trailer: yes\r\n"
+    );
+    let request = rx.recv().unwrap();
+    assert!(request.start_line.starts_with("GET /resource HTTP/1.1"));
+}
+
+#[test]
+fn include_writes_chunked_trailers_after_body() {
+    let (url, rx) = spawn_server(
+        b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\nTrailer: X-Trailer\r\n\r\n5\r\nhello\r\n0\r\nX-Trailer: yes\r\n\r\n",
+    );
+
+    let mut command = Command::cargo_bin("curl").unwrap();
+    command.args(["-q", "-sS", "-i", &url]);
+    command.assert().success().stdout(
+        "HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\nTrailer: X-Trailer\r\n\r\nhelloX-Trailer: yes\r\n",
+    );
+
+    let request = rx.recv().unwrap();
+    assert!(request.start_line.starts_with("GET /resource HTTP/1.1"));
+}
+
+#[test]
+fn default_http_get_decodes_lf_only_chunked_response() {
+    let (url, rx) = spawn_server(
+        b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n5\nhello\n0\nX-Trailer: yes\n\n",
+    );
+
+    let mut command = Command::cargo_bin("curl").unwrap();
+    command.args(["-q", "-sS", &url]);
+    command.assert().success().stdout("hello").stderr("");
+
+    let request = rx.recv().unwrap();
+    assert!(request.start_line.starts_with("GET /resource HTTP/1.1"));
+}
+
+#[test]
+fn chunked_premature_eof_writes_partial_body_and_fails() {
+    let (url, rx) =
+        spawn_server(b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n5\r\nhello");
+
+    let mut command = Command::cargo_bin("curl").unwrap();
+    command.args(["-q", "-sS", &url]);
+    command.assert().failure().code(18).stdout("hello");
+
+    let request = rx.recv().unwrap();
+    assert!(request.start_line.starts_with("GET /resource HTTP/1.1"));
+}
+
+#[test]
 fn raw_http09_response_requires_opt_in() {
     let (url, rx) = spawn_server(b"raw http09");
 
@@ -5166,7 +5229,7 @@ fn fail_include_outputs_headers_without_error_body() {
     assert_eq!(output.status.code(), Some(22));
     let stdout = String::from_utf8(output.stdout).unwrap();
     assert!(stdout.starts_with("HTTP/1.1 404 Not Found\r\n"));
-    assert!(stdout.contains("x-test: yes\r\n"));
+    assert!(stdout.contains("X-Test: yes\r\n"));
     assert!(!stdout.contains("missing"));
     rx.recv().unwrap();
 }
@@ -11961,6 +12024,22 @@ fn etag_save_writes_response_etag() {
 }
 
 #[test]
+fn etag_save_decodes_lf_only_chunked_response() {
+    let temp = tempdir().unwrap();
+    let etag = temp.path().join("etag.txt");
+    let (url, rx) = spawn_server(
+        b"HTTP/1.1 200 OK\r\nETag: W/\"saved\"\r\nTransfer-Encoding: chunked\r\n\r\n5\nhello\n0\n\n",
+    );
+
+    let mut command = Command::cargo_bin("curl").unwrap();
+    command.args(["-q", "-sS", "--etag-save", etag.to_str().unwrap(), &url]);
+    command.assert().success().stdout("hello").stderr("");
+
+    rx.recv().unwrap();
+    assert_eq!(std::fs::read_to_string(etag).unwrap(), "W/\"saved\"\n");
+}
+
+#[test]
 fn etag_save_dash_writes_response_etag_to_stdout() {
     let temp = tempdir().unwrap();
     let (url, rx) =
@@ -14401,7 +14480,7 @@ fn dump_header_dash_writes_headers_to_stdout() {
     command
         .assert()
         .success()
-        .stdout("HTTP/1.1 200 OK\r\nx-test: yes\r\ncontent-length: 2\r\n\r\nok");
+        .stdout("HTTP/1.1 200 OK\r\nX-Test: yes\r\nContent-Length: 2\r\n\r\nok");
     rx.recv().unwrap();
 }
 
@@ -14415,7 +14494,7 @@ fn dump_header_percent_writes_headers_to_stderr() {
         .assert()
         .success()
         .stdout("ok")
-        .stderr("HTTP/1.1 200 OK\r\nx-test: yes\r\ncontent-length: 2\r\n\r\n");
+        .stderr("HTTP/1.1 200 OK\r\nX-Test: yes\r\nContent-Length: 2\r\n\r\n");
     rx.recv().unwrap();
 }
 
