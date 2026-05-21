@@ -99,7 +99,9 @@ struct ExplicitHttpProxy {
 struct RawHttpProxyContext<'a> {
     transfer: &'a TransferConfig,
     url: &'a Url,
+    host_override: Option<&'a str>,
     path_as_is_url: Option<&'a str>,
+    tunnel_connect_to: Option<&'a ConnectToTarget>,
     method: &'a Method,
     prepared_body: Option<&'a PreparedBody>,
     upload_body: Option<&'a [u8]>,
@@ -113,6 +115,7 @@ struct RawHttpProxyContext<'a> {
 struct RawHttpDirectContext<'a> {
     transfer: &'a TransferConfig,
     url: &'a Url,
+    host_override: Option<&'a str>,
     path_as_is_url: Option<&'a str>,
     connect_host: &'a str,
     connect_port: u16,
@@ -151,6 +154,11 @@ struct ConnectToRule<'a> {
 struct ConnectToTarget {
     host: String,
     port: u16,
+}
+
+struct ParsedHttpUrl {
+    url: Url,
+    host_override: Option<String>,
 }
 
 struct HttpAttempt {
@@ -601,7 +609,8 @@ fn build_client(transfer: &TransferConfig, cookie_jar: Option<Arc<CookieJar>>) -
     if let Some(proxy) = &transfer.proxy
         && !transfer.noproxy.as_deref().is_some_and(is_global_noproxy)
     {
-        let mut proxy = reqwest::Proxy::all(proxy).transfer_err()?;
+        let proxy_url = proxy_url_with_default_scheme(proxy);
+        let mut proxy = reqwest::Proxy::all(&proxy_url).transfer_err()?;
         if let Some(proxy_user) = &transfer.proxy_user {
             let (login, password) = split_user_password(proxy_user);
             proxy = proxy.basic_auth(login, password);
@@ -8754,6 +8763,59 @@ fn gopher_selector(url: &Url) -> Result<Vec<u8>> {
     Ok(decoded)
 }
 
+fn parse_http_url(raw_url: &str) -> Result<ParsedHttpUrl> {
+    match Url::parse(raw_url) {
+        Ok(url) => Ok(ParsedHttpUrl {
+            url,
+            host_override: None,
+        }),
+        Err(error) if error.to_string().contains("invalid IPv4 address") => {
+            parse_http_url_with_numeric_host(raw_url, error)
+        }
+        Err(error) => Err(CurlError::Url(error.to_string())),
+    }
+}
+
+fn parse_http_url_with_numeric_host(
+    raw_url: &str,
+    original_error: url::ParseError,
+) -> Result<ParsedHttpUrl> {
+    let Some((scheme, rest)) = raw_url
+        .strip_prefix("http://")
+        .map(|rest| ("http", rest))
+        .or_else(|| raw_url.strip_prefix("https://").map(|rest| ("https", rest)))
+    else {
+        return Err(CurlError::Url(original_error.to_string()));
+    };
+    let authority_end = rest.find(['/', '?', '#']).unwrap_or(rest.len());
+    let authority = &rest[..authority_end];
+    let tail = &rest[authority_end..];
+    let host_port = authority
+        .rsplit_once('@')
+        .map_or(authority, |(_, host)| host);
+    if host_port.starts_with('[') {
+        return Err(CurlError::Url(original_error.to_string()));
+    }
+    let (host, port) = host_port
+        .rsplit_once(':')
+        .filter(|(_, port)| !port.is_empty() && port.chars().all(|byte| byte.is_ascii_digit()))
+        .map_or((host_port, ""), |(host, port)| (host, port));
+    if host.is_empty() {
+        return Err(CurlError::Url(original_error.to_string()));
+    }
+    let normalized_port = if port.is_empty() {
+        String::new()
+    } else {
+        format!(":{port}")
+    };
+    let normalized = format!("{scheme}://curl-rust.invalid{normalized_port}{tail}");
+    let url = Url::parse(&normalized).map_err(|error| CurlError::Url(error.to_string()))?;
+    Ok(ParsedHttpUrl {
+        url,
+        host_override: Some(host.to_string()),
+    })
+}
+
 async fn run_http_transfer(
     transfer: &TransferConfig,
     client: &Client,
@@ -8800,7 +8862,9 @@ async fn run_http_transfer(
     }
     metrics.size_upload =
         http_upload_size(transfer, prepared_body.as_ref(), upload_body.as_deref());
-    let mut url = Url::parse(&expanded.url).map_err(|error| CurlError::Url(error.to_string()))?;
+    let parsed_url = parse_http_url(&expanded.url)?;
+    let mut url = parsed_url.url;
+    let mut current_host_override = parsed_url.host_override;
     let path_as_is_url = transfer.path_as_is.then(|| expanded.url.clone());
     let before_upload_append_path = url.path().to_string();
     data::append_upload_filename_to_url(&mut url, transfer.upload_file.as_deref());
@@ -8859,18 +8923,11 @@ async fn run_http_transfer(
         ));
     }
     let mut raw_redirect_handoff = None;
-    if initial_connect_to.is_some() {
-        if url.scheme() != "http" {
-            return Err(CurlError::Unsupported(
-                "--connect-to is only implemented for plain http:// URLs in the Rust sidecar"
-                    .to_string(),
-            ));
-        }
-        if explicit_proxy.is_some() {
-            return Err(CurlError::Unsupported(
-                "--connect-to with HTTP proxy is not implemented in the Rust sidecar".to_string(),
-            ));
-        }
+    if initial_connect_to.is_some() && url.scheme() != "http" {
+        return Err(CurlError::Unsupported(
+            "--connect-to is only implemented for plain http:// URLs in the Rust sidecar"
+                .to_string(),
+        ));
     }
 
     if explicit_proxy.is_none()
@@ -8913,6 +8970,7 @@ async fn run_http_transfer(
                 RawHttpDirectContext {
                     transfer,
                     url: &url,
+                    host_override: current_host_override.as_deref(),
                     path_as_is_url: current_path_as_is_url.as_deref(),
                     connect_host: &connect_host,
                     connect_port,
@@ -9022,6 +9080,7 @@ async fn run_http_transfer(
                     send_request_body = false;
                 }
                 url = next_url;
+                current_host_override = None;
                 current_path_as_is_url = next_path_as_is_url;
                 redirects += 1;
                 redirect_attempts.push(attempt);
@@ -9050,7 +9109,9 @@ async fn run_http_transfer(
         }
     }
 
-    if let Some(connect_to) = initial_connect_to.as_ref() {
+    if explicit_proxy.is_none()
+        && let Some(connect_to) = initial_connect_to.as_ref()
+    {
         if !raw_http_direct_supported(transfer, &url, has_multipart) {
             return Err(CurlError::Unsupported(
                 "--connect-to is not implemented for this HTTP request shape in the Rust sidecar"
@@ -9061,6 +9122,7 @@ async fn run_http_transfer(
             RawHttpDirectContext {
                 transfer,
                 url: &url,
+                host_override: current_host_override.as_deref(),
                 path_as_is_url: path_as_is_url.as_deref(),
                 connect_host: &connect_to.host,
                 connect_port: connect_to.port,
@@ -9124,7 +9186,9 @@ async fn run_http_transfer(
             let attempt = run_raw_http_proxy_transfer(RawHttpProxyContext {
                 transfer,
                 url: &url,
+                host_override: current_host_override.as_deref(),
                 path_as_is_url: current_path_as_is_url.as_deref(),
+                tunnel_connect_to: None,
                 method: &current_method,
                 prepared_body: request_body,
                 upload_body: upload,
@@ -9200,6 +9264,7 @@ async fn run_http_transfer(
                     send_request_body = false;
                 }
                 url = next_url;
+                current_host_override = None;
                 current_path_as_is_url = next_path_as_is_url;
                 redirects += 1;
                 redirect_attempts.push(attempt);
@@ -9229,15 +9294,19 @@ async fn run_http_transfer(
     }
 
     if let Some(proxy) = explicit_proxy.as_ref()
-        && transfer.proxytunnel
+        && (transfer.proxytunnel || initial_connect_to.is_some())
         && transfer.follow_location
         && url.scheme() == "http"
     {
         if !raw_http_proxy_redirect_supported(transfer, &url, has_multipart) {
-            return Err(CurlError::Unsupported(
-                "--proxytunnel redirects for plain http:// URLs are only implemented for simple raw HTTP proxy transfers in the Rust sidecar"
-                    .to_string(),
-            ));
+            let option = if initial_connect_to.is_some() && !transfer.proxytunnel {
+                "--connect-to with HTTP proxy redirects"
+            } else {
+                "--proxytunnel redirects"
+            };
+            return Err(CurlError::Unsupported(format!(
+                "{option} for plain http:// URLs are only implemented for simple raw HTTP proxy transfers in the Rust sidecar"
+            )));
         }
 
         let custom_method = transfer.method.is_some();
@@ -9261,10 +9330,13 @@ async fn run_http_transfer(
             let sensitive_headers_allowed =
                 transfer.location_trusted || same_redirect_origin(&initial_url, &url);
             let custom_host_allowed = same_redirect_origin(&initial_url, &url);
+            let tunnel_connect_to = connect_to_target(transfer, &url)?;
             let attempt = run_raw_http_proxy_tunnel_transfer(RawHttpProxyContext {
                 transfer,
                 url: &url,
+                host_override: current_host_override.as_deref(),
                 path_as_is_url: current_path_as_is_url.as_deref(),
+                tunnel_connect_to: tunnel_connect_to.as_ref(),
                 method: &current_method,
                 prepared_body: request_body,
                 upload_body: upload,
@@ -9346,6 +9418,7 @@ async fn run_http_transfer(
                     send_request_body = false;
                 }
                 url = next_url;
+                current_host_override = None;
                 current_path_as_is_url = next_path_as_is_url;
                 redirects += 1;
                 redirect_attempts.push(attempt);
@@ -9377,19 +9450,25 @@ async fn run_http_transfer(
     }
 
     if let Some(proxy) = explicit_proxy.as_ref()
-        && transfer.proxytunnel
+        && (transfer.proxytunnel || initial_connect_to.is_some())
         && url.scheme() == "http"
     {
         if !raw_http_proxy_supported(transfer, &url, has_multipart) {
-            return Err(CurlError::Unsupported(
-                "--proxytunnel for plain http:// URLs is only implemented for simple raw HTTP proxy transfers in the Rust sidecar"
-                    .to_string(),
-            ));
+            let option = if initial_connect_to.is_some() && !transfer.proxytunnel {
+                "--connect-to with HTTP proxy"
+            } else {
+                "--proxytunnel"
+            };
+            return Err(CurlError::Unsupported(format!(
+                "{option} for plain http:// URLs is only implemented for simple raw HTTP proxy transfers in the Rust sidecar"
+            )));
         }
         let attempt = run_raw_http_proxy_tunnel_transfer(RawHttpProxyContext {
             transfer,
             url: &url,
+            host_override: current_host_override.as_deref(),
             path_as_is_url: path_as_is_url.as_deref(),
+            tunnel_connect_to: initial_connect_to.as_ref(),
             method: &method,
             prepared_body: prepared_body.as_ref(),
             upload_body: upload_body.as_deref(),
@@ -9423,7 +9502,9 @@ async fn run_http_transfer(
         let attempt = run_raw_http_proxy_transfer(RawHttpProxyContext {
             transfer,
             url: &url,
+            host_override: current_host_override.as_deref(),
             path_as_is_url: path_as_is_url.as_deref(),
+            tunnel_connect_to: None,
             method: &method,
             prepared_body: prepared_body.as_ref(),
             upload_body: upload_body.as_deref(),
@@ -9469,6 +9550,7 @@ async fn run_http_transfer(
             RawHttpDirectContext {
                 transfer,
                 url: &url,
+                host_override: current_host_override.as_deref(),
                 path_as_is_url: path_as_is_url.as_deref(),
                 connect_host: url
                     .host_str()
@@ -9939,7 +10021,7 @@ fn explicit_http_proxy(transfer: &TransferConfig) -> Result<Option<ExplicitHttpP
     let Some(raw_proxy) = &transfer.proxy else {
         return Ok(None);
     };
-    let proxy = Url::parse(raw_proxy).map_err(|error| CurlError::Url(error.to_string()))?;
+    let proxy = parse_proxy_url(raw_proxy)?;
     if proxy.scheme() != "http" {
         return Ok(None);
     }
@@ -9960,6 +10042,19 @@ fn explicit_http_proxy(transfer: &TransferConfig) -> Result<Option<ExplicitHttpP
         port,
         authorization,
     }))
+}
+
+fn parse_proxy_url(raw_proxy: &str) -> Result<Url> {
+    let proxy = proxy_url_with_default_scheme(raw_proxy);
+    Url::parse(&proxy).map_err(|error| CurlError::Url(error.to_string()))
+}
+
+fn proxy_url_with_default_scheme(raw_proxy: &str) -> String {
+    if raw_proxy.contains("://") {
+        raw_proxy.to_string()
+    } else {
+        format!("http://{raw_proxy}")
+    }
 }
 
 fn proxy_url_credentials(proxy: &Url) -> Option<String> {
@@ -10038,17 +10133,11 @@ async fn run_raw_http_proxy_tunnel_transfer(
         });
     }
 
-    let connect_host = context
-        .url
-        .host_str()
-        .ok_or_else(|| CurlError::Url("URL is missing a host".to_string()))?;
-    let connect_port = context
-        .url
-        .port_or_known_default()
-        .ok_or_else(|| CurlError::Url("URL is missing a port".to_string()))?;
+    let (connect_host, connect_port) = raw_http_tunnel_endpoint(&context)?;
     let direct_context = RawHttpDirectContext {
         transfer: context.transfer,
         url: context.url,
+        host_override: context.host_override,
         path_as_is_url: context.path_as_is_url,
         connect_host,
         connect_port,
@@ -10071,6 +10160,22 @@ async fn run_raw_http_proxy_tunnel_transfer(
     attempt.proxy_used = true;
     decode_http_attempt_body(context.transfer, &mut attempt)?;
     Ok(attempt)
+}
+
+fn raw_http_tunnel_endpoint<'a>(context: &'a RawHttpProxyContext<'a>) -> Result<(&'a str, u16)> {
+    if let Some(connect_to) = context.tunnel_connect_to {
+        return Ok((connect_to.host.as_str(), connect_to.port));
+    }
+
+    let connect_host = context
+        .url
+        .host_str()
+        .ok_or_else(|| CurlError::Url("URL is missing a host".to_string()))?;
+    let connect_port = context
+        .url
+        .port_or_known_default()
+        .ok_or_else(|| CurlError::Url("URL is missing a port".to_string()))?;
+    Ok((connect_host, connect_port))
 }
 
 impl RawHttpConnectionPool {
@@ -10262,6 +10367,7 @@ fn raw_http_direct_request(context: &RawHttpDirectContext<'_>) -> Result<Vec<u8>
     append_raw_http_host_header(
         &mut request,
         context.url,
+        context.host_override,
         &parsed_headers,
         context.custom_host_allowed,
     );
@@ -10383,7 +10489,8 @@ fn raw_http_request_version(transfer: &TransferConfig) -> &'static str {
 fn raw_http_proxy_connect_request(context: &RawHttpProxyContext<'_>) -> Result<Vec<u8>> {
     let parsed_proxy_headers = parse_raw_headers(&context.transfer.proxy_headers)?;
     let has_proxy_header = |name: &str| raw_headers_contain(&parsed_proxy_headers, name);
-    let authority = http_connect_authority(context.url)?;
+    let (connect_host, connect_port) = raw_http_tunnel_endpoint(context)?;
+    let authority = http_connect_authority_from_parts(connect_host, connect_port);
     let version = raw_http_request_version(context.transfer);
     let mut request = Vec::new();
     request.extend_from_slice(format!("CONNECT {authority} {version}\r\n").as_bytes());
@@ -10442,6 +10549,7 @@ fn raw_http_proxy_request(context: &RawHttpProxyContext<'_>) -> Result<Vec<u8>> 
     append_raw_http_host_header(
         &mut request,
         context.url,
+        context.host_override,
         &parsed_headers,
         context.custom_host_allowed,
     );
@@ -10600,6 +10708,7 @@ fn raw_http_body<'a>(
 fn append_raw_http_host_header(
     request: &mut Vec<u8>,
     url: &Url,
+    host_override: Option<&str>,
     parsed_headers: &[RawHeader],
     custom_host_allowed: bool,
 ) {
@@ -10614,7 +10723,13 @@ fn append_raw_http_host_header(
         return;
     }
 
-    request.extend_from_slice(format!("Host: {}\r\n", http_host_header(url)).as_bytes());
+    request.extend_from_slice(
+        format!(
+            "Host: {}\r\n",
+            http_host_header_with_override(url, host_override)
+        )
+        .as_bytes(),
+    );
 }
 
 fn append_raw_http_transfer_connection(
@@ -11234,7 +11349,12 @@ fn reqwest_error_is_http09_denial(error: &reqwest::Error) -> bool {
 }
 
 fn http_host_header(url: &Url) -> String {
+    http_host_header_with_override(url, None)
+}
+
+fn http_host_header_with_override(url: &Url, host_override: Option<&str>) -> String {
     let host = url.host_str().unwrap_or("");
+    let host = host_override.unwrap_or(host);
     let host = if host.contains(':') && !host.starts_with('[') {
         format!("[{host}]")
     } else {
@@ -11251,19 +11371,13 @@ fn http_host_header(url: &Url) -> String {
     }
 }
 
-fn http_connect_authority(url: &Url) -> Result<String> {
-    let host = url
-        .host_str()
-        .ok_or_else(|| CurlError::Url("URL is missing a host".to_string()))?;
+fn http_connect_authority_from_parts(host: &str, port: u16) -> String {
     let host = if host.contains(':') && !host.starts_with('[') {
         format!("[{host}]")
     } else {
         host.to_string()
     };
-    let port = url
-        .port_or_known_default()
-        .ok_or_else(|| CurlError::Url("URL is missing a port".to_string()))?;
-    Ok(format!("{host}:{port}"))
+    format!("{host}:{port}")
 }
 
 fn http_request_target(url: &Url) -> String {
@@ -12168,7 +12282,7 @@ fn proxy_auth_credentials_configured(transfer: &TransferConfig) -> Result<bool> 
     let Some(proxy) = &transfer.proxy else {
         return Ok(false);
     };
-    let proxy = Url::parse(proxy).map_err(|error| CurlError::Url(error.to_string()))?;
+    let proxy = parse_proxy_url(proxy)?;
     Ok(proxy_url_credentials(&proxy).is_some())
 }
 

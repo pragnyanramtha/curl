@@ -4692,6 +4692,43 @@ fn connect_to_location_follows_redirect_through_remap() {
 }
 
 #[test]
+fn connect_to_http_proxy_automatically_tunnels_plain_http() {
+    let (proxy_url, rx) = spawn_tunnel_proxy(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok");
+    let proxy_port = Url::parse(&proxy_url).unwrap().port().unwrap();
+    let schemeless_proxy = proxy_url.strip_prefix("http://").unwrap();
+    let rule = format!("example.test:80:connect.example.test:{proxy_port}");
+
+    let mut command = Command::cargo_bin("curl").unwrap();
+    command.args([
+        "-q",
+        "-sS",
+        "-x",
+        schemeless_proxy,
+        "--connect-to",
+        &rule,
+        "--proxy-header",
+        "X-Proxy-Only: yes",
+        "-H",
+        "X-Origin: yes",
+        "http://example.test/resource",
+    ]);
+    command.assert().success().stdout("ok");
+
+    let authority = format!("connect.example.test:{proxy_port}");
+    let connect = rx.recv().unwrap();
+    assert_eq!(connect.start_line, format!("CONNECT {authority} HTTP/1.1"));
+    assert_eq!(header(&connect, "host"), Some(authority.as_str()));
+    assert_eq!(header(&connect, "x-proxy-only"), Some("yes"));
+    assert_eq!(header(&connect, "x-origin"), None);
+
+    let origin = rx.recv().unwrap();
+    assert_eq!(origin.start_line, "GET /resource HTTP/1.1");
+    assert_eq!(header(&origin, "host"), Some("example.test"));
+    assert_eq!(header(&origin, "x-origin"), Some("yes"));
+    assert_eq!(header(&origin, "x-proxy-only"), None);
+}
+
+#[test]
 fn connect_to_nonmatching_rule_does_not_remap_or_fail() {
     let (url, rx) = spawn_server(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok");
 
