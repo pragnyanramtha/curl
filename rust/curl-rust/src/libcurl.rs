@@ -547,7 +547,11 @@ fn write_request(out: &mut String, render: &RenderTransfer<'_>, url: &str) -> Re
         }
     }
     if transfer.follow_location {
-        emit_long_setopt(out, "CURLOPT_FOLLOWLOCATION", 1);
+        emit_long_setopt(
+            out,
+            "CURLOPT_FOLLOWLOCATION",
+            if transfer.follow_obey_code { 2 } else { 1 },
+        );
     }
     if transfer.location_trusted {
         emit_long_setopt(out, "CURLOPT_UNRESTRICTED_AUTH", 1);
@@ -1061,6 +1065,22 @@ mod tests {
         let source = render_source(&config).unwrap();
 
         assert!(source.contains("CURLOPT_FOLLOWLOCATION, 1L"));
+    }
+
+    #[test]
+    fn renders_follow_obey_code_option() {
+        let config = parse_args([
+            "-q",
+            "--libcurl",
+            "client.c",
+            "--follow",
+            "https://example.com",
+        ])
+        .unwrap();
+
+        let source = render_source(&config).unwrap();
+
+        assert!(source.contains("CURLOPT_FOLLOWLOCATION, 2L"));
     }
 
     #[test]

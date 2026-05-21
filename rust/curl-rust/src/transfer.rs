@@ -8943,6 +8943,7 @@ async fn run_http_transfer(
             || custom_host_header
             || raw_http_retry_redirect_wire_semantics(transfer)
             || raw_http_remote_header_redirect_wire_semantics(transfer, &method)
+            || (transfer.include_headers && transfer.follow_obey_code)
             || (method != Method::HEAD && max_filesize_limit(transfer).is_some()))
     {
         let custom_method = transfer.method.is_some();
@@ -9614,6 +9615,7 @@ async fn run_http_transfer(
     let custom_method = transfer.method.is_some();
     let post_redirect_body =
         !transfer.get && (!transfer.data.is_empty() || !transfer.forms.is_empty());
+    let mut redirect_attempts = Vec::new();
 
     loop {
         metrics.method = current_method.as_str().to_string();
@@ -9746,6 +9748,12 @@ async fn run_http_transfer(
             if transfer.auto_referer && custom_referer.is_none() {
                 current_referer = Some(auto_referer_value(&final_url));
             }
+            let redirect_method = current_method.clone();
+            let redirect_size_request = estimate_http_request_size(
+                redirect_method.as_str(),
+                final_url.as_str(),
+                metrics.size_upload,
+            );
             let followup = redirect_followup(
                 transfer,
                 status,
@@ -9761,6 +9769,27 @@ async fn run_http_transfer(
             }
             url = next_url;
             redirects += 1;
+            redirect_attempts.push(HttpAttempt {
+                method: redirect_method,
+                status: Some(status),
+                version,
+                final_url,
+                headers,
+                header_bytes: None,
+                body: Vec::new(),
+                redirects: Vec::new(),
+                retry_after: None,
+                resume_from,
+                deferred_error: None,
+                size_request: redirect_size_request,
+                remote_ip: metrics.remote_ip.clone(),
+                remote_port: metrics.remote_port,
+                local_ip: metrics.local_ip.clone(),
+                local_port: metrics.local_port,
+                http_connect_code: metrics.http_connect,
+                proxy_used: metrics.proxy_used,
+                num_connects: metrics.num_connects,
+            });
             continue;
         }
 
@@ -9803,7 +9832,7 @@ async fn run_http_transfer(
             headers,
             header_bytes: None,
             body,
-            redirects: Vec::new(),
+            redirects: redirect_attempts,
             retry_after,
             resume_from,
             deferred_error: None,
@@ -12328,14 +12357,26 @@ fn redirect_followup(
 
     match status {
         StatusCode::MOVED_PERMANENTLY if post_redirect_body && !transfer.post301 => {
-            RedirectFollowup::drop_post_body(custom_method)
+            if transfer.follow_obey_code {
+                RedirectFollowup::switch_to_get()
+            } else {
+                RedirectFollowup::drop_post_body(custom_method)
+            }
         }
         StatusCode::FOUND if post_redirect_body && !transfer.post302 => {
-            RedirectFollowup::drop_post_body(custom_method)
+            if transfer.follow_obey_code {
+                RedirectFollowup::switch_to_get()
+            } else {
+                RedirectFollowup::drop_post_body(custom_method)
+            }
         }
         StatusCode::SEE_OTHER if post_redirect_body && transfer.post303 => RedirectFollowup::keep(),
         StatusCode::SEE_OTHER if *method != Method::GET || post_redirect_body => {
-            RedirectFollowup::drop_post_body(custom_method)
+            if transfer.follow_obey_code {
+                RedirectFollowup::switch_to_get()
+            } else {
+                RedirectFollowup::drop_post_body(custom_method)
+            }
         }
         _ => RedirectFollowup::keep(),
     }
@@ -12352,6 +12393,13 @@ impl RedirectFollowup {
     fn drop_post_body(custom_method: bool) -> Self {
         Self {
             method: (!custom_method).then_some(Method::GET),
+            drop_body: true,
+        }
+    }
+
+    fn switch_to_get() -> Self {
+        Self {
+            method: Some(Method::GET),
             drop_body: true,
         }
     }

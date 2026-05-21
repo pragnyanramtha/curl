@@ -13656,6 +13656,297 @@ fn custom_method_post_redirect_drops_body_when_post_flag_does_not_apply() {
 }
 
 #[test]
+fn location_custom_post_302_keeps_custom_method_without_body() {
+    let (url, rx) = spawn_sequence_server(vec![
+        b"HTTP/1.1 302 Found\r\nLocation: /next\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+        b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok",
+    ]);
+
+    let mut command = Command::cargo_bin("curl").unwrap();
+    command.args([
+        "-q",
+        "-sS",
+        "--location",
+        "-X",
+        "IGLOO",
+        "-d",
+        "moo",
+        "-w",
+        " %{method}",
+        &url,
+    ]);
+    command.assert().success().stdout("ok IGLOO");
+
+    let first = rx.recv().unwrap();
+    let second = rx.recv().unwrap();
+    assert!(first.start_line.starts_with("IGLOO /resource HTTP/1.1"));
+    assert_eq!(first.body, b"moo");
+    assert!(second.start_line.starts_with("IGLOO /next HTTP/1.1"));
+    assert!(second.body.is_empty());
+    assert_eq!(header(&second, "content-length"), None);
+}
+
+#[test]
+fn follow_custom_post_302_switches_to_get() {
+    let (url, rx) = spawn_sequence_server(vec![
+        b"HTTP/1.1 302 Found\r\nLocation: /next\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+        b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok",
+    ]);
+
+    let mut command = Command::cargo_bin("curl").unwrap();
+    command.args([
+        "-q",
+        "-sS",
+        "--follow",
+        "-X",
+        "IGLOO",
+        "-d",
+        "moo",
+        "-w",
+        " %{method}",
+        &url,
+    ]);
+    command.assert().success().stdout("ok GET");
+
+    let first = rx.recv().unwrap();
+    let second = rx.recv().unwrap();
+    assert!(first.start_line.starts_with("IGLOO /resource HTTP/1.1"));
+    assert_eq!(first.body, b"moo");
+    assert!(second.start_line.starts_with("GET /next HTTP/1.1"));
+    assert!(second.body.is_empty());
+    assert_eq!(header(&second, "content-length"), None);
+}
+
+#[test]
+fn follow_custom_put_302_keeps_custom_method_and_body() {
+    let temp = tempdir().unwrap();
+    let upload = temp.path().join("upload.txt");
+    std::fs::write(&upload, "body").unwrap();
+    let (url, rx) = spawn_sequence_server(vec![
+        b"HTTP/1.1 302 Found\r\nLocation: /next\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+        b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok",
+    ]);
+
+    let mut command = Command::cargo_bin("curl").unwrap();
+    command.args([
+        "-q",
+        "-sS",
+        "--follow",
+        "-X",
+        "CURL",
+        "-T",
+        upload.to_str().unwrap(),
+        "-w",
+        " %{method}",
+        &url,
+    ]);
+    command.assert().success().stdout("ok CURL");
+
+    let first = rx.recv().unwrap();
+    let second = rx.recv().unwrap();
+    assert!(first.start_line.starts_with("CURL /resource HTTP/1.1"));
+    assert_eq!(first.body, b"body");
+    assert!(second.start_line.starts_with("CURL /next HTTP/1.1"));
+    assert_eq!(second.body, b"body");
+}
+
+#[test]
+fn follow_custom_post_308_preserves_custom_method_and_body() {
+    let (url, rx) = spawn_sequence_server(vec![
+        b"HTTP/1.1 308 Permanent Redirect\r\nLocation: /next\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+        b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok",
+    ]);
+
+    let mut command = Command::cargo_bin("curl").unwrap();
+    command.args([
+        "-q",
+        "-sS",
+        "--follow",
+        "-X",
+        "IGLOO",
+        "-d",
+        "moo",
+        "-w",
+        " %{method}",
+        &url,
+    ]);
+    command.assert().success().stdout("ok IGLOO");
+
+    let first = rx.recv().unwrap();
+    let second = rx.recv().unwrap();
+    assert!(first.start_line.starts_with("IGLOO /resource HTTP/1.1"));
+    assert_eq!(first.body, b"moo");
+    assert!(second.start_line.starts_with("IGLOO /next HTTP/1.1"));
+    assert_eq!(second.body, b"moo");
+}
+
+#[test]
+fn follow_custom_delete_303_switches_to_get() {
+    let (url, rx) = spawn_sequence_server(vec![
+        b"HTTP/1.1 303 See Other\r\nLocation: /next\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+        b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok",
+    ]);
+
+    let mut command = Command::cargo_bin("curl").unwrap();
+    command.args([
+        "-q",
+        "-sS",
+        "--follow",
+        "-X",
+        "DELETE",
+        "-w",
+        " %{method}",
+        &url,
+    ]);
+    command.assert().success().stdout("ok GET");
+
+    let first = rx.recv().unwrap();
+    let second = rx.recv().unwrap();
+    assert!(first.start_line.starts_with("DELETE /resource HTTP/1.1"));
+    assert!(first.body.is_empty());
+    assert!(second.start_line.starts_with("GET /next HTTP/1.1"));
+    assert!(second.body.is_empty());
+}
+
+#[test]
+fn follow_custom_upload_303_switches_to_get() {
+    let temp = tempdir().unwrap();
+    let upload = temp.path().join("upload.txt");
+    std::fs::write(&upload, "body").unwrap();
+    let (url, rx) = spawn_sequence_server(vec![
+        b"HTTP/1.1 303 See Other\r\nLocation: /next\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+        b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok",
+    ]);
+
+    let mut command = Command::cargo_bin("curl").unwrap();
+    command.args([
+        "-q",
+        "-sS",
+        "--follow",
+        "-X",
+        "CURL",
+        "-T",
+        upload.to_str().unwrap(),
+        "-w",
+        " %{method}",
+        &url,
+    ]);
+    command.assert().success().stdout("ok GET");
+
+    let first = rx.recv().unwrap();
+    let second = rx.recv().unwrap();
+    assert!(first.start_line.starts_with("CURL /resource HTTP/1.1"));
+    assert_eq!(first.body, b"body");
+    assert!(second.start_line.starts_with("GET /next HTTP/1.1"));
+    assert!(second.body.is_empty());
+    assert_eq!(header(&second, "content-length"), None);
+}
+
+#[test]
+fn follow_overrides_location_with_warning() {
+    let (url, rx) = spawn_sequence_server(vec![
+        b"HTTP/1.1 302 Found\r\nLocation: /next\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+        b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok",
+    ]);
+
+    let mut command = Command::cargo_bin("curl").unwrap();
+    command.args([
+        "-q",
+        "-sS",
+        "--location",
+        "--follow",
+        "-X",
+        "IGLOO",
+        "-d",
+        "moo",
+        "-w",
+        " %{method}",
+        &url,
+    ]);
+    command
+        .assert()
+        .success()
+        .stdout("ok GET")
+        .stderr("Warning: --follow overrides --location\n");
+
+    let first = rx.recv().unwrap();
+    let second = rx.recv().unwrap();
+    assert!(first.start_line.starts_with("IGLOO /resource HTTP/1.1"));
+    assert!(second.start_line.starts_with("GET /next HTTP/1.1"));
+}
+
+#[test]
+fn follow_include_outputs_redirect_headers() {
+    let (url, rx) = spawn_sequence_server(vec![
+        b"HTTP/1.1 302 Found\r\nLocation: /next\r\nX-Hop: one\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+        b"HTTP/1.1 200 OK\r\nX-Hop: two\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok",
+    ]);
+
+    let mut command = Command::cargo_bin("curl").unwrap();
+    command.args([
+        "-q",
+        "-sS",
+        "--include",
+        "--follow",
+        "-X",
+        "IGLOO",
+        "-d",
+        "moo",
+        &url,
+    ]);
+    let output = command.assert().success().get_output().stdout.clone();
+    let stdout = String::from_utf8(output).unwrap();
+    assert!(stdout.contains("HTTP/1.1 302 Found\r\n"));
+    assert!(stdout.contains("X-Hop: one\r\n"));
+    assert!(stdout.contains("HTTP/1.1 200 OK\r\n"));
+    assert!(stdout.contains("X-Hop: two\r\n"));
+    assert!(stdout.ends_with("\r\nok"));
+
+    let first = rx.recv().unwrap();
+    let second = rx.recv().unwrap();
+    assert!(first.start_line.starts_with("IGLOO /resource HTTP/1.1"));
+    assert!(second.start_line.starts_with("GET /next HTTP/1.1"));
+}
+
+#[test]
+fn no_location_overrides_follow_with_warning() {
+    let (url, rx) = spawn_sequence_server(vec![
+        b"HTTP/1.1 302 Found\r\nLocation: /next\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+    ]);
+
+    let mut command = Command::cargo_bin("curl").unwrap();
+    command.args(["-q", "-sS", "--follow", "--no-location", &url]);
+    command
+        .assert()
+        .success()
+        .stdout("")
+        .stderr("Warning: --location overrides --follow\n");
+
+    let request = rx.recv().unwrap();
+    assert!(request.start_line.starts_with("GET /resource HTTP/1.1"));
+    assert!(rx.try_recv().is_err());
+}
+
+#[test]
+fn no_follow_overrides_location_with_warning() {
+    let (url, rx) = spawn_sequence_server(vec![
+        b"HTTP/1.1 302 Found\r\nLocation: /next\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+    ]);
+
+    let mut command = Command::cargo_bin("curl").unwrap();
+    command.args(["-q", "-sS", "--location", "--no-follow", &url]);
+    command
+        .assert()
+        .success()
+        .stdout("")
+        .stderr("Warning: --follow overrides --location\n");
+
+    let request = rx.recv().unwrap();
+    assert!(request.start_line.starts_with("GET /resource HTTP/1.1"));
+    assert!(rx.try_recv().is_err());
+}
+
+#[test]
 fn mismatched_post_redirect_flag_rewrites_post_to_get() {
     let (url, rx) = spawn_sequence_server(vec![
         b"HTTP/1.1 302 Found\r\nLocation: /next\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",

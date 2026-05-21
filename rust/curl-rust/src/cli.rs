@@ -88,6 +88,7 @@ pub struct TransferConfig {
     pub time_cond: Option<String>,
     pub write_out: Option<String>,
     pub follow_location: bool,
+    pub follow_obey_code: bool,
     pub location_trusted: bool,
     pub post301: bool,
     pub post302: bool,
@@ -577,6 +578,7 @@ impl Default for TransferConfig {
             time_cond: None,
             write_out: None,
             follow_location: false,
+            follow_obey_code: false,
             location_trusted: false,
             post301: false,
             post302: false,
@@ -1011,11 +1013,30 @@ impl Parser {
                 let value = self.value_for(name, inline_value)?;
                 self.current().write_out = Some(self.read_write_out_value(&value)?);
             }
-            "location" => self.current().follow_location = true,
+            "location" => {
+                let transfer = self.current();
+                if transfer.follow_location && transfer.follow_obey_code {
+                    eprintln!("Warning: --location overrides --follow");
+                }
+                transfer.follow_location = true;
+                transfer.follow_obey_code = false;
+            }
             "location-trusted" => {
                 let transfer = self.current();
+                if transfer.follow_location && transfer.follow_obey_code {
+                    eprintln!("Warning: --location overrides --follow");
+                }
                 transfer.follow_location = true;
+                transfer.follow_obey_code = false;
                 transfer.location_trusted = true;
+            }
+            "follow" => {
+                let transfer = self.current();
+                if transfer.follow_location && !transfer.follow_obey_code {
+                    eprintln!("Warning: --follow overrides --location");
+                }
+                transfer.follow_location = true;
+                transfer.follow_obey_code = true;
             }
             "post301" => self.current().post301 = true,
             "post302" => self.current().post302 = true,
@@ -1253,11 +1274,30 @@ impl Parser {
                 self.current().file_clobber_mode = FileClobberMode::Never;
             }
             "remove-on-error" => self.current().remove_on_error = false,
-            "location" => self.current().follow_location = false,
+            "location" => {
+                let transfer = self.current();
+                if transfer.follow_location && transfer.follow_obey_code {
+                    eprintln!("Warning: --location overrides --follow");
+                }
+                transfer.follow_location = false;
+                transfer.follow_obey_code = false;
+            }
             "location-trusted" => {
                 let transfer = self.current();
+                if transfer.follow_location && transfer.follow_obey_code {
+                    eprintln!("Warning: --location overrides --follow");
+                }
                 transfer.follow_location = false;
+                transfer.follow_obey_code = false;
                 transfer.location_trusted = false;
+            }
+            "follow" => {
+                let transfer = self.current();
+                if transfer.follow_location && !transfer.follow_obey_code {
+                    eprintln!("Warning: --follow overrides --location");
+                }
+                transfer.follow_location = false;
+                transfer.follow_obey_code = false;
             }
             "post301" => self.current().post301 = false,
             "post302" => self.current().post302 = false,
@@ -1425,7 +1465,14 @@ impl Parser {
                     self.current().write_out = Some(self.read_write_out_value(&value)?);
                     break;
                 }
-                'L' => self.current().follow_location = true,
+                'L' => {
+                    let transfer = self.current();
+                    if transfer.follow_location && transfer.follow_obey_code {
+                        eprintln!("Warning: --location overrides --follow");
+                    }
+                    transfer.follow_location = true;
+                    transfer.follow_obey_code = false;
+                }
                 'f' => self.set_fail_without_body(),
                 'u' => {
                     let value = self.short_value('u', rest)?;
@@ -3079,6 +3126,7 @@ fn print_common_help() {
            -l, --list-only             List only mode\n\
                --tr-encoding           Request compressed transfer encoding\n\
            -L, --location              Follow redirects\n\
+               --follow                Follow redirects per spec\n\
                --post301               Keep POST after 301 redirect\n\
                --post302               Keep POST after 302 redirect\n\
                --post303               Keep POST after 303 redirect\n\
@@ -3651,6 +3699,7 @@ mod tests {
     fn parses_location_trusted_separately_from_location() {
         let config = parse_args(["-q", "--location-trusted", "https://example.com"]).unwrap();
         assert!(config.transfers[0].follow_location);
+        assert!(!config.transfers[0].follow_obey_code);
         assert!(config.transfers[0].location_trusted);
 
         let config = parse_args([
@@ -3661,7 +3710,27 @@ mod tests {
         ])
         .unwrap();
         assert!(!config.transfers[0].follow_location);
+        assert!(!config.transfers[0].follow_obey_code);
         assert!(!config.transfers[0].location_trusted);
+    }
+
+    #[test]
+    fn parses_follow_separately_from_location() {
+        let config = parse_args(["-q", "--follow", "https://example.com"]).unwrap();
+        assert!(config.transfers[0].follow_location);
+        assert!(config.transfers[0].follow_obey_code);
+
+        let config = parse_args(["-q", "--follow", "--location", "https://example.com"]).unwrap();
+        assert!(config.transfers[0].follow_location);
+        assert!(!config.transfers[0].follow_obey_code);
+
+        let config = parse_args(["-q", "--location", "--follow", "https://example.com"]).unwrap();
+        assert!(config.transfers[0].follow_location);
+        assert!(config.transfers[0].follow_obey_code);
+
+        let config = parse_args(["-q", "--follow", "--no-follow", "https://example.com"]).unwrap();
+        assert!(!config.transfers[0].follow_location);
+        assert!(!config.transfers[0].follow_obey_code);
     }
 
     #[test]
@@ -5707,6 +5776,7 @@ mod tests {
 
         let transfer = &config.transfers[0];
         assert!(!transfer.follow_location);
+        assert!(!transfer.follow_obey_code);
         assert!(!transfer.compressed);
         assert!(!transfer.tr_encoding);
         assert!(!transfer.raw);
