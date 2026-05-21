@@ -3208,7 +3208,7 @@ pub fn print_version() {
     );
     println!("Release-Date: [unreleased]");
     println!(
-        "Protocols: DICT FILE FTP GOPHER HTTP HTTPS IMAP IPFS IPNS LDAP MQTT POP3 RTSP SCP SFTP SMB SMTP TELNET TFTP WS"
+        "Protocols: DICT FILE FTP GOPHER GOPHERS HTTP HTTPS IMAP IPFS IPNS LDAP MQTT POP3 RTSP SCP SFTP SMB SMTP TELNET TFTP WS"
     );
     println!("Features: AsynchDNS IPv6 Largefile SSL libz threadsafe");
 }

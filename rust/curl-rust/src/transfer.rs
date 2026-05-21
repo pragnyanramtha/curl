@@ -12,9 +12,15 @@ use ssh2::{
     CheckResult, ErrorCode as SshErrorCode, FileStat as SftpFileStat, HashType, KnownHostFileKind,
     MethodType, OpenFlags, OpenType, RenameFlags, Session,
 };
-use tokio::io::{AsyncRead, AsyncReadExt, AsyncWriteExt};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::{TcpStream, UdpSocket};
 use tokio::task::JoinSet;
+use tokio_rustls::TlsConnector;
+use tokio_rustls::rustls::{
+    self, DigitallySignedStruct, RootCertStore, SignatureScheme,
+    client::danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier},
+    pki_types::{CertificateDer, ServerName, UnixTime, pem::PemObject},
+};
 
 use reqwest::header::{
     ACCEPT, ACCEPT_ENCODING, ACCEPT_RANGES, AUTHORIZATION, CONNECTION, CONTENT_ENCODING,
@@ -1065,12 +1071,10 @@ async fn run_expanded_url(
         Err(CurlError::Unsupported(
             "ftps:// URLs are not implemented in the Rust sidecar".to_string(),
         ))
-    } else if has_url_scheme_with_authority(&expanded.url, "gopher") {
+    } else if has_url_scheme_with_authority(&expanded.url, "gopher")
+        || has_url_scheme_with_authority(&expanded.url, "gophers")
+    {
         run_gopher_transfer(transfer, &expanded, &method_label, &mut metrics).await
-    } else if has_url_scheme_with_authority(&expanded.url, "gophers") {
-        Err(CurlError::Unsupported(
-            "gophers:// URLs are not implemented in the Rust sidecar".to_string(),
-        ))
     } else if has_url_scheme_with_authority(&expanded.url, "telnet") {
         run_telnet_transfer(transfer, &expanded, &method_label, &mut metrics).await
     } else if has_url_scheme_with_authority(&expanded.url, "pop3") {
@@ -6787,31 +6791,33 @@ async fn run_gopher_transfer(
     method: &str,
     metrics: &mut writeout::Metrics,
 ) -> Result<()> {
+    let url = Url::parse(&expanded.url).map_err(|error| CurlError::Url(error.to_string()))?;
+    let scheme = url.scheme();
     if method != "GET" && method != "HEAD" {
         return Err(CurlError::Unsupported(format!(
-            "{method} requests for gopher:// URLs"
+            "{method} requests for {scheme}:// URLs"
         )));
     }
-    reject_upload_file_for_scheme(transfer, "gopher://")?;
+    reject_upload_file_for_scheme(transfer, &format!("{scheme}://"))?;
 
-    let url = Url::parse(&expanded.url).map_err(|error| CurlError::Url(error.to_string()))?;
     output::validate_output_target(transfer, &url)?;
     let host = url
         .host_str()
-        .ok_or_else(|| CurlError::Url("gopher URL is missing a host".to_string()))?;
+        .ok_or_else(|| CurlError::Url(format!("{scheme} URL is missing a host")))?;
     let port = url.port().unwrap_or(70);
     let selector = gopher_selector(&url)?;
     let mut header_bytes = selector.clone();
     header_bytes.extend_from_slice(b"\r\n");
 
-    let mut stream = connect_tcp(host, port, transfer).await?;
+    let mut stream = connect_gopher_stream(scheme == "gophers", host, port, transfer).await?;
     stream
         .write_all(&header_bytes)
         .await
-        .map_err(tcp_io_error)?;
+        .map_err(gopher_io_error)?;
+    stream.flush().await.map_err(gopher_io_error)?;
 
     let mut body = Vec::new();
-    stream.read_to_end(&mut body).await.map_err(tcp_io_error)?;
+    read_gopher_response(stream.as_mut(), &mut body).await?;
     metrics.url_effective = url.to_string();
 
     if method == "HEAD" {
@@ -6871,6 +6877,270 @@ async fn connect_tcp(host: &str, port: u16, transfer: &TransferConfig) -> Result
     }
 }
 
+trait AsyncReadWrite: AsyncRead + AsyncWrite + Unpin + Send {}
+
+impl<T> AsyncReadWrite for T where T: AsyncRead + AsyncWrite + Unpin + Send {}
+
+async fn connect_gopher_stream(
+    tls: bool,
+    host: &str,
+    port: u16,
+    transfer: &TransferConfig,
+) -> Result<Box<dyn AsyncReadWrite>> {
+    if tls {
+        let stream = connect_tls_tcp(host, port, transfer).await?;
+        Ok(Box::new(stream))
+    } else {
+        let stream = connect_tcp(host, port, transfer).await?;
+        Ok(Box::new(stream))
+    }
+}
+
+async fn read_gopher_response(stream: &mut dyn AsyncReadWrite, body: &mut Vec<u8>) -> Result<()> {
+    let mut buffer = [0; 8192];
+    loop {
+        match stream.read(&mut buffer).await {
+            Ok(0) => return Ok(()),
+            Ok(read) => body.extend_from_slice(&buffer[..read]),
+            Err(error) if error.kind() == io::ErrorKind::UnexpectedEof => return Ok(()),
+            Err(error) => return Err(gopher_io_error(error)),
+        }
+    }
+}
+
+async fn connect_tls_tcp(
+    host: &str,
+    port: u16,
+    transfer: &TransferConfig,
+) -> Result<tokio_rustls::client::TlsStream<TcpStream>> {
+    let stream = connect_tcp(host, port, transfer).await?;
+    let server_name = ServerName::try_from(host.to_string())
+        .map_err(|error| CurlError::Url(format!("invalid TLS server name: {error}")))?;
+    let connector = TlsConnector::from(Arc::new(rustls_client_config(transfer)?));
+    connector
+        .connect(server_name, stream)
+        .await
+        .map_err(gopher_io_error)
+}
+
+fn rustls_client_config(transfer: &TransferConfig) -> Result<rustls::ClientConfig> {
+    let versions = rustls_protocol_versions(transfer)?;
+    let provider = rustls::crypto::CryptoProvider::get_default()
+        .cloned()
+        .unwrap_or_else(|| Arc::new(rustls::crypto::ring::default_provider()));
+    let builder = rustls::ClientConfig::builder_with_provider(provider)
+        .with_protocol_versions(&versions)
+        .map_err(|error| CurlError::Transfer(error.to_string()))?;
+
+    let config = if transfer.insecure {
+        builder
+            .dangerous()
+            .with_custom_certificate_verifier(Arc::new(NoCertificateVerification))
+            .with_no_client_auth()
+    } else {
+        builder
+            .with_root_certificates(rustls_root_store(transfer)?)
+            .with_no_client_auth()
+    };
+    Ok(config)
+}
+
+fn rustls_protocol_versions(
+    transfer: &TransferConfig,
+) -> Result<Vec<&'static rustls::SupportedProtocolVersion>> {
+    let mut versions = Vec::new();
+    if !matches!(transfer.ssl_version, Some(SslVersionPreference::TlsV1_3)) {
+        versions.push(&rustls::version::TLS12);
+    }
+    if !matches!(
+        transfer.ssl_version_max,
+        Some(SslVersionMaxPreference::TlsV1_2)
+    ) {
+        versions.insert(0, &rustls::version::TLS13);
+    }
+    if versions.is_empty() {
+        return Err(CurlError::Usage(
+            "--tls-max set lower than minimum accepted version".to_string(),
+        ));
+    }
+    Ok(versions)
+}
+
+fn rustls_root_store(transfer: &TransferConfig) -> Result<RootCertStore> {
+    let origin_ca_env = origin_ca_env_defaults(transfer);
+    if transfer.cacert.is_none()
+        && transfer.capath.is_none()
+        && origin_ca_env.cacert.is_none()
+        && origin_ca_env.capath.is_none()
+    {
+        return Ok(RootCertStore {
+            roots: webpki_roots::TLS_SERVER_ROOTS.to_vec(),
+        });
+    }
+
+    let certificates = load_configured_ca_certificate_der(transfer, &origin_ca_env)?;
+    let mut roots = RootCertStore::empty();
+    let (valid, _invalid) = roots.add_parsable_certificates(certificates);
+    if valid == 0 {
+        return Err(CurlError::CaCert(
+            "no usable certificates found".to_string(),
+        ));
+    }
+    Ok(roots)
+}
+
+fn load_ca_certificate_der(path: &Path) -> Result<Vec<CertificateDer<'static>>> {
+    let bytes = std::fs::read(path)
+        .map_err(|error| CurlError::CaCert(format!("{}: {error}", path.display())))?;
+    let certificates = CertificateDer::pem_slice_iter(&bytes)
+        .collect::<std::result::Result<Vec<_>, _>>()
+        .map_err(|error| CurlError::CaCert(format!("{}: {error}", path.display())))?;
+    if certificates.is_empty() {
+        return Err(CurlError::CaCert(format!(
+            "{}: no certificates found",
+            path.display()
+        )));
+    }
+    Ok(certificates)
+}
+
+fn load_configured_ca_certificate_der(
+    transfer: &TransferConfig,
+    origin_ca_env: &OriginCaEnv,
+) -> Result<Vec<CertificateDer<'static>>> {
+    let mut certificates = Vec::new();
+    if let Some(path) = &transfer.cacert {
+        certificates.extend(load_ca_certificate_der(path)?);
+    }
+    if let Some(path) = &transfer.capath {
+        certificates.extend(load_ca_path_list_der(path)?);
+    }
+    if let Some(path) = &origin_ca_env.cacert {
+        certificates.extend(load_ca_certificate_der(path)?);
+    }
+    if let Some(path) = &origin_ca_env.capath {
+        certificates.extend(load_ca_path_list_der(path)?);
+    }
+    if transfer_uses_https_proxy(transfer) {
+        if let Some(path) = &transfer.proxy_cacert {
+            certificates.extend(load_ca_certificate_der(path)?);
+        }
+        if let Some(path) = &transfer.proxy_capath {
+            certificates.extend(load_ca_path_list_der(path)?);
+        }
+    }
+    Ok(certificates)
+}
+
+fn load_ca_directory_der(path: &Path) -> Result<Vec<CertificateDer<'static>>> {
+    let entries = std::fs::read_dir(path)
+        .map_err(|error| CurlError::CaCert(format!("{}: {error}", path.display())))?;
+    let mut certificates = Vec::new();
+    let mut read_errors = Vec::new();
+    for entry in entries {
+        let entry =
+            entry.map_err(|error| CurlError::CaCert(format!("{}: {error}", path.display())))?;
+        let file_type = entry
+            .file_type()
+            .map_err(|error| CurlError::CaCert(format!("{}: {error}", entry.path().display())))?;
+        if !file_type.is_file() {
+            continue;
+        }
+        match load_ca_certificate_der(&entry.path()) {
+            Ok(mut loaded) => certificates.append(&mut loaded),
+            Err(error) => read_errors.push(error),
+        }
+    }
+
+    if certificates.is_empty() {
+        if let Some(error) = read_errors.into_iter().next() {
+            return Err(error);
+        }
+        return Err(CurlError::CaCert(format!(
+            "{}: no certificates found",
+            path.display()
+        )));
+    }
+    Ok(certificates)
+}
+
+fn load_ca_path_list_der(path_list: &Path) -> Result<Vec<CertificateDer<'static>>> {
+    let mut certificates = Vec::new();
+    let mut read_errors = Vec::new();
+    for path in std::env::split_paths(path_list.as_os_str()) {
+        if path.as_os_str().is_empty() {
+            continue;
+        }
+        match load_ca_directory_der(&path) {
+            Ok(mut loaded) => certificates.append(&mut loaded),
+            Err(error) => read_errors.push(error),
+        }
+    }
+
+    if certificates.is_empty() {
+        if let Some(error) = read_errors.into_iter().next() {
+            return Err(error);
+        }
+        return Err(CurlError::CaCert(format!(
+            "{}: no certificates found",
+            path_list.display()
+        )));
+    }
+    Ok(certificates)
+}
+
+#[derive(Debug)]
+struct NoCertificateVerification;
+
+impl ServerCertVerifier for NoCertificateVerification {
+    fn verify_server_cert(
+        &self,
+        _end_entity: &CertificateDer<'_>,
+        _intermediates: &[CertificateDer<'_>],
+        _server_name: &ServerName<'_>,
+        _ocsp_response: &[u8],
+        _now: UnixTime,
+    ) -> std::result::Result<ServerCertVerified, rustls::Error> {
+        Ok(ServerCertVerified::assertion())
+    }
+
+    fn verify_tls12_signature(
+        &self,
+        _message: &[u8],
+        _cert: &CertificateDer<'_>,
+        _dss: &DigitallySignedStruct,
+    ) -> std::result::Result<HandshakeSignatureValid, rustls::Error> {
+        Ok(HandshakeSignatureValid::assertion())
+    }
+
+    fn verify_tls13_signature(
+        &self,
+        _message: &[u8],
+        _cert: &CertificateDer<'_>,
+        _dss: &DigitallySignedStruct,
+    ) -> std::result::Result<HandshakeSignatureValid, rustls::Error> {
+        Ok(HandshakeSignatureValid::assertion())
+    }
+
+    fn supported_verify_schemes(&self) -> Vec<SignatureScheme> {
+        vec![
+            SignatureScheme::RSA_PKCS1_SHA1,
+            SignatureScheme::ECDSA_SHA1_Legacy,
+            SignatureScheme::RSA_PKCS1_SHA256,
+            SignatureScheme::ECDSA_NISTP256_SHA256,
+            SignatureScheme::RSA_PKCS1_SHA384,
+            SignatureScheme::ECDSA_NISTP384_SHA384,
+            SignatureScheme::RSA_PKCS1_SHA512,
+            SignatureScheme::ECDSA_NISTP521_SHA512,
+            SignatureScheme::RSA_PSS_SHA256,
+            SignatureScheme::RSA_PSS_SHA384,
+            SignatureScheme::RSA_PSS_SHA512,
+            SignatureScheme::ED25519,
+            SignatureScheme::ED448,
+        ]
+    }
+}
+
 fn resolve_std_socket_addrs(
     host: &str,
     port: u16,
@@ -6923,6 +7193,21 @@ fn socket_addr_matches_ip_version(address: &SocketAddr, ip_version: IpVersionPre
 
 fn tcp_io_error(error: io::Error) -> CurlError {
     CurlError::Transfer(error.to_string())
+}
+
+fn gopher_io_error(error: io::Error) -> CurlError {
+    let message = error.to_string();
+    let debug = format!("{error:?}");
+    if message.contains("invalid peer certificate")
+        || message.contains("certificate verify failed")
+        || debug.contains("InvalidCertificate")
+        || debug.contains("UnknownIssuer")
+        || debug.contains("NotValidForName")
+    {
+        CurlError::PeerVerificationFailed
+    } else {
+        CurlError::Transfer(message)
+    }
 }
 
 fn reject_upload_file_for_scheme(transfer: &TransferConfig, scheme: &str) -> Result<()> {

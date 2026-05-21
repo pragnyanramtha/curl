@@ -5,13 +5,21 @@ use std::net::{IpAddr, Ipv4Addr, Shutdown, SocketAddr, TcpListener, UdpSocket};
 use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command as StdCommand, Stdio};
-use std::sync::mpsc::{self, Receiver};
+use std::sync::{
+    Arc,
+    mpsc::{self, Receiver},
+};
 use std::thread;
 use std::time::{Duration, Instant};
 
 use assert_cmd::Command;
 use flate2::{Compression, write::GzEncoder};
 use tempfile::{TempDir, tempdir, tempdir_in};
+use tokio_rustls::TlsAcceptor;
+use tokio_rustls::rustls::{
+    ServerConfig,
+    pki_types::{CertificateDer, PrivateKeyDer, pem::PemObject},
+};
 use url::Url;
 
 const DICT_GREETING: &[u8] = b"220 dictserver <xnooptions> <msgid@msgid>\n";
@@ -2187,6 +2195,16 @@ fn spawn_gopher_server(response: &'static [u8]) -> (String, Receiver<Vec<u8>>) {
     spawn_gopher_server_with_listener(listener, format!("gopher://{addr}/1/resource"), response)
 }
 
+fn spawn_gophers_server(response: &'static [u8]) -> (String, Receiver<Vec<u8>>) {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+    spawn_gophers_server_with_listener(
+        listener,
+        format!("gophers://localhost:{port}/1/resource"),
+        response,
+    )
+}
+
 fn spawn_gopher_ipv6_server(response: &'static [u8]) -> Option<(String, Receiver<Vec<u8>>)> {
     let listener = TcpListener::bind("[::1]:0").ok()?;
     let port = listener.local_addr().ok()?.port();
@@ -2225,6 +2243,61 @@ fn spawn_gopher_server_with_listener(
     });
 
     (url, rx)
+}
+
+fn spawn_gophers_server_with_listener(
+    listener: TcpListener,
+    url: String,
+    response: &'static [u8],
+) -> (String, Receiver<Vec<u8>>) {
+    let (tx, rx) = mpsc::channel();
+    listener.set_nonblocking(true).unwrap();
+
+    thread::spawn(move || {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        runtime.block_on(async move {
+            use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+
+            let listener = tokio::net::TcpListener::from_std(listener).unwrap();
+            let (stream, _) = listener.accept().await.unwrap();
+            let acceptor = TlsAcceptor::from(Arc::new(test_tls_server_config()));
+            let mut stream = acceptor.accept(stream).await.unwrap();
+            let mut bytes = Vec::new();
+            let mut buffer = [0; 1024];
+
+            loop {
+                let read = stream.read(&mut buffer).await.unwrap();
+                if read == 0 {
+                    break;
+                }
+                bytes.extend_from_slice(&buffer[..read]);
+                if bytes.ends_with(b"\r\n") {
+                    break;
+                }
+            }
+
+            tx.send(bytes).unwrap();
+            stream.write_all(response).await.unwrap();
+            stream.flush().await.unwrap();
+        });
+    });
+
+    (url, rx)
+}
+
+fn test_tls_server_config() -> ServerConfig {
+    let pem = include_bytes!("../../../tests/certs/test-localhost.pem");
+    let certs = CertificateDer::pem_slice_iter(pem)
+        .collect::<std::result::Result<Vec<_>, _>>()
+        .unwrap();
+    let key = PrivateKeyDer::from_pem_slice(pem).unwrap();
+    ServerConfig::builder()
+        .with_no_client_auth()
+        .with_single_cert(certs, key)
+        .unwrap()
 }
 
 fn read_request(stream: &mut impl Read) -> RequestRecord {
@@ -10972,6 +11045,44 @@ fn downloads_gopher_selector() {
         .stdout("iMenu results\t\terror.host\t1\r\n.\r\n");
 
     assert_eq!(rx.recv().unwrap(), b"/selector/SELECTOR/1201\r\n");
+}
+
+#[test]
+fn downloads_gophers_selector_with_insecure_tls() {
+    let (url, rx) = spawn_gophers_server(b"secure menu\r\n");
+    let url = url.replace("/1/resource", "/1/selector/1272");
+
+    let mut command = Command::cargo_bin("curl").unwrap();
+    command.args(["-q", "-sS", "--insecure", &url]);
+    command.assert().success().stdout("secure menu\r\n");
+
+    assert_eq!(rx.recv().unwrap(), b"/selector/1272\r\n");
+}
+
+#[test]
+fn gophers_verifies_with_cacert() {
+    let (url, rx) = spawn_gophers_server(b"trusted menu\r\n");
+    let ca = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../../tests/certs/test-ca.crt")
+        .canonicalize()
+        .unwrap();
+
+    let mut command = Command::cargo_bin("curl").unwrap();
+    command.args(["-q", "-sS", "--cacert", ca.to_str().unwrap(), &url]);
+    command.assert().success().stdout("trusted menu\r\n");
+
+    assert_eq!(rx.recv().unwrap(), b"/resource\r\n");
+}
+
+#[test]
+fn version_lists_gopher_and_gophers_protocols() {
+    let mut command = Command::cargo_bin("curl").unwrap();
+    let output = command.args(["-q", "-V"]).output().unwrap();
+    let stdout = String::from_utf8(output.stdout).unwrap();
+
+    assert!(output.status.success());
+    assert!(stdout.contains("GOPHER"));
+    assert!(stdout.contains("GOPHERS"));
 }
 
 #[test]
