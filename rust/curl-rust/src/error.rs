@@ -68,7 +68,7 @@ pub enum CurlError {
     BadFunctionArgument(String),
     #[error("Maximum ({max}) redirects followed")]
     TooManyRedirects { max: usize },
-    #[error("HTTP response code said error: {status}")]
+    #[error("The requested URL returned error: {status}")]
     HttpStatus { status: u16 },
     #[error("HTTP server does not seem to support byte ranges. Cannot resume.")]
     RangeError,

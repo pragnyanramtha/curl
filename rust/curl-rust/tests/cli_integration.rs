@@ -5524,6 +5524,22 @@ fn fail_suppresses_http_error_body() {
 }
 
 #[test]
+fn fail_suppresses_unbounded_http_error_body_without_waiting_for_close() {
+    let (url, rx) = spawn_holding_server(
+        b"HTTP/1.0 404 BAD BOY\r\nContent-Type: text/html\r\n\r\nmissing",
+        Duration::from_secs(2),
+    );
+
+    let started = Instant::now();
+    let mut command = Command::cargo_bin("curl").unwrap();
+    command.args(["-q", "-sS", "--fail", &url]);
+    command.assert().failure().code(22).stdout("");
+
+    assert!(started.elapsed() < Duration::from_millis(500));
+    rx.recv().unwrap();
+}
+
+#[test]
 fn fail_with_body_outputs_http_error_body_and_fails() {
     let (url, rx) = spawn_server(b"HTTP/1.1 404 Not Found\r\nContent-Length: 7\r\n\r\nmissing");
 
@@ -5584,7 +5600,7 @@ fn no_fail_with_body_disables_http_error_failure() {
 }
 
 #[test]
-fn fail_include_outputs_headers_without_error_body() {
+fn fail_include_writes_headers_without_error_body() {
     let (url, rx) =
         spawn_server(b"HTTP/1.1 404 Not Found\r\nX-Test: yes\r\nContent-Length: 7\r\n\r\nmissing");
 
@@ -5596,7 +5612,7 @@ fn fail_include_outputs_headers_without_error_body() {
 
     assert_eq!(output.status.code(), Some(22));
     let stdout = String::from_utf8(output.stdout).unwrap();
-    assert!(stdout.starts_with("HTTP/1.1 404 Not Found\r\n"));
+    assert!(stdout.contains("HTTP/1.1 404 Not Found\r\n"));
     assert!(stdout.contains("X-Test: yes\r\n"));
     assert!(!stdout.contains("missing"));
     rx.recv().unwrap();

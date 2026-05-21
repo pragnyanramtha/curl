@@ -10449,6 +10449,7 @@ async fn run_http_transfer(
 
         let body = if current_method == Method::HEAD
             || resume_action == HttpResumeAction::AlreadyComplete
+            || http_fail_without_body(transfer, status)
         {
             Vec::new()
         } else {
@@ -10507,6 +10508,10 @@ async fn read_reqwest_body(
         body.extend_from_slice(&chunk);
     }
     Ok(body)
+}
+
+fn http_fail_without_body(transfer: &TransferConfig, status: StatusCode) -> bool {
+    transfer.fail && !transfer.fail_with_body && is_http_error_status(status)
 }
 
 fn raw_http_proxy_supported(transfer: &TransferConfig, url: &Url, has_multipart: bool) -> bool {
@@ -11546,6 +11551,7 @@ async fn raw_http_read_response(
         || method == Method::CONNECT
         || resume_action == HttpResumeAction::AlreadyComplete
         || raw_http_status_has_no_body(status)
+        || http_fail_without_body(transfer, status)
         || unbounded_redirect_body
     {
         Vec::new()
