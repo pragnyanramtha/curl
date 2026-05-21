@@ -932,6 +932,82 @@ fn spawn_pop3_server_with_greeting(
     (format!("pop3://{addr}{path}"), rx)
 }
 
+fn spawn_pop3_auth_plain_server(
+    path: &str,
+    command_response: &'static [u8],
+) -> (String, Receiver<Vec<u8>>) {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = listener.local_addr().unwrap();
+    let (tx, rx) = mpsc::channel();
+
+    thread::spawn(move || {
+        let (mut stream, _) = listener.accept().unwrap();
+        stream.write_all(b"+OK curl POP3 test server\r\n").unwrap();
+
+        let mut commands = Vec::new();
+        while let Some(line) = read_pop3_client_line(&mut stream) {
+            commands.extend_from_slice(&line);
+            let command = String::from_utf8_lossy(&line);
+            let command = command.trim_end_matches(['\r', '\n']);
+            let response = if command == "CAPA" {
+                b"+OK capabilities\r\nSASL PLAIN\r\n.\r\n".as_slice()
+            } else if command == "AUTH PLAIN" {
+                b"+\r\n".as_slice()
+            } else if command == "AHVzZXIAc2VjcmV0" {
+                b"+OK Login successful\r\n".as_slice()
+            } else if command == "QUIT" {
+                let _ = stream.write_all(b"+OK bye\r\n");
+                break;
+            } else {
+                command_response
+            };
+            stream.write_all(response).unwrap();
+        }
+
+        tx.send(commands).unwrap();
+    });
+
+    (format!("pop3://{addr}{path}"), rx)
+}
+
+fn spawn_pop3_auth_keyword_capa_server(
+    path: &str,
+    command_response: &'static [u8],
+) -> (String, Receiver<Vec<u8>>) {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = listener.local_addr().unwrap();
+    let (tx, rx) = mpsc::channel();
+
+    thread::spawn(move || {
+        let (mut stream, _) = listener.accept().unwrap();
+        stream.write_all(b"+OK curl POP3 test server\r\n").unwrap();
+
+        let mut commands = Vec::new();
+        while let Some(line) = read_pop3_client_line(&mut stream) {
+            commands.extend_from_slice(&line);
+            let command = String::from_utf8_lossy(&line);
+            let command = command.trim_end_matches(['\r', '\n']);
+            let response = if command == "CAPA" {
+                b"+OK capabilities\r\nAUTH PLAIN\r\nUSER\r\n.\r\n".as_slice()
+            } else if command == "AUTH PLAIN" {
+                b"-ERR unsupported\r\n".as_slice()
+            } else if command.starts_with("USER ") || command.starts_with("PASS ") {
+                b"+OK\r\n".as_slice()
+            } else if command == "QUIT" {
+                let _ = stream.write_all(b"+OK bye\r\n");
+                break;
+            } else {
+                command_response
+            };
+            stream.write_all(response).unwrap();
+        }
+
+        tx.send(commands).unwrap();
+    });
+
+    (format!("pop3://{addr}{path}"), rx)
+}
+
 fn spawn_pop3_login_denied_server(path: &str) -> (String, Receiver<Vec<u8>>) {
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let addr = listener.local_addr().unwrap();
@@ -7181,6 +7257,35 @@ fn pop3_uses_url_userinfo_when_user_option_is_absent() {
     assert_eq!(
         rx.recv().unwrap(),
         b"CAPA\r\nUSER alice\r\nPASS secret\r\nRETR 42\r\nQUIT\r\n"
+    );
+}
+
+#[test]
+fn pop3_auth_plain_without_sasl_ir_when_advertised() {
+    let (url, rx) = spawn_pop3_auth_plain_server("/865", b"+OK message follows\r\nhello\r\n.\r\n");
+
+    let mut command = Command::cargo_bin("curl").unwrap();
+    command.args(["-q", "-sS", "-u", "user:secret", &url]);
+    command.assert().success().stdout("hello\r\n");
+
+    assert_eq!(
+        rx.recv().unwrap(),
+        b"CAPA\r\nAUTH PLAIN\r\nAHVzZXIAc2VjcmV0\r\nRETR 865\r\nQUIT\r\n"
+    );
+}
+
+#[test]
+fn pop3_auth_capability_line_falls_back_to_user_pass() {
+    let (url, rx) =
+        spawn_pop3_auth_keyword_capa_server("/42", b"+OK message follows\r\nhello\r\n.\r\n");
+
+    let mut command = Command::cargo_bin("curl").unwrap();
+    command.args(["-q", "-sS", "-u", "user:secret", &url]);
+    command.assert().success().stdout("hello\r\n");
+
+    assert_eq!(
+        rx.recv().unwrap(),
+        b"CAPA\r\nUSER user\r\nPASS secret\r\nRETR 42\r\nQUIT\r\n"
     );
 }
 

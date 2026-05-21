@@ -4218,17 +4218,21 @@ async fn run_pop3_exchange(
     pop3_expect_ok(pop3_read_greeting(&mut stream).await?, false)?;
 
     pop3_send_line(&mut stream, b"CAPA").await?;
-    pop3_read_capa(&mut stream).await?;
+    let capabilities = pop3_read_capa(&mut stream).await?;
 
-    let mut user_command = Vec::from(&b"USER "[..]);
-    user_command.extend_from_slice(&user);
-    pop3_send_line(&mut stream, &user_command).await?;
-    pop3_expect_ok(pop3_read_line(&mut stream).await?, true)?;
+    if capabilities.auth_plain {
+        pop3_auth_plain(&mut stream, &user, &password).await?;
+    } else {
+        let mut user_command = Vec::from(&b"USER "[..]);
+        user_command.extend_from_slice(&user);
+        pop3_send_line(&mut stream, &user_command).await?;
+        pop3_expect_ok(pop3_read_line(&mut stream).await?, true)?;
 
-    let mut pass_command = Vec::from(&b"PASS "[..]);
-    pass_command.extend_from_slice(&password);
-    pop3_send_line(&mut stream, &pass_command).await?;
-    pop3_expect_ok(pop3_read_line(&mut stream).await?, true)?;
+        let mut pass_command = Vec::from(&b"PASS "[..]);
+        pass_command.extend_from_slice(&password);
+        pop3_send_line(&mut stream, &pass_command).await?;
+        pop3_expect_ok(pop3_read_line(&mut stream).await?, true)?;
+    }
 
     pop3_send_line(&mut stream, &command).await?;
     let command_response = pop3_read_line(&mut stream).await?;
@@ -7307,6 +7311,25 @@ fn has_control_byte(bytes: &[u8]) -> bool {
     bytes.iter().any(|byte| *byte < 32 || *byte == 127)
 }
 
+#[derive(Default)]
+struct Pop3Capabilities {
+    auth_plain: bool,
+}
+
+async fn pop3_auth_plain(stream: &mut TcpStream, user: &[u8], password: &[u8]) -> Result<()> {
+    pop3_send_line(stream, b"AUTH PLAIN").await?;
+    pop3_expect_auth_continuation(pop3_read_line(stream).await?)?;
+
+    let mut response = Vec::with_capacity(user.len() + password.len() + 2);
+    response.push(0);
+    response.extend_from_slice(user);
+    response.push(0);
+    response.extend_from_slice(password);
+    let response = base64_padded(&response);
+    pop3_send_line(stream, response.as_bytes()).await?;
+    pop3_expect_ok(pop3_read_line(stream).await?, true)
+}
+
 async fn pop3_send_line(stream: &mut TcpStream, line: &[u8]) -> Result<()> {
     stream.write_all(line).await.map_err(tcp_io_error)?;
     stream.write_all(b"\r\n").await.map_err(tcp_io_error)
@@ -7343,21 +7366,35 @@ async fn pop3_read_greeting(stream: &mut TcpStream) -> Result<Vec<u8>> {
     Err(CurlError::WeirdServerReply)
 }
 
-async fn pop3_read_capa(stream: &mut TcpStream) -> Result<()> {
+async fn pop3_read_capa(stream: &mut TcpStream) -> Result<Pop3Capabilities> {
     let line = pop3_read_line(stream).await?;
     if line.starts_with(b"+OK") {
+        let mut capabilities = Pop3Capabilities::default();
         loop {
             let line = pop3_read_line(stream).await?;
             if pop3_is_terminator_line(&line) {
                 break;
             }
+            if pop3_capa_supports_auth_plain(&line) {
+                capabilities.auth_plain = true;
+            }
         }
-        Ok(())
+        Ok(capabilities)
     } else if line.starts_with(b"-ERR") {
-        Ok(())
+        Ok(Pop3Capabilities::default())
     } else {
         Err(CurlError::WeirdServerReply)
     }
+}
+
+fn pop3_capa_supports_auth_plain(line: &[u8]) -> bool {
+    let mut words = line
+        .split(|byte| byte.is_ascii_whitespace())
+        .filter(|word| !word.is_empty());
+    let Some(first) = words.next() else {
+        return false;
+    };
+    first.eq_ignore_ascii_case(b"SASL") && words.any(|word| word.eq_ignore_ascii_case(b"PLAIN"))
 }
 
 async fn pop3_read_multiline_body(stream: &mut TcpStream) -> Result<Vec<u8>> {
@@ -7384,6 +7421,16 @@ fn pop3_expect_ok(line: Vec<u8>, login: bool) -> Result<()> {
     if line.starts_with(b"+OK") {
         Ok(())
     } else if line.starts_with(b"-ERR") && login {
+        Err(CurlError::LoginDenied)
+    } else {
+        Err(CurlError::WeirdServerReply)
+    }
+}
+
+fn pop3_expect_auth_continuation(line: Vec<u8>) -> Result<()> {
+    if line.starts_with(b"+") && !line.starts_with(b"+OK") {
+        Ok(())
+    } else if line.starts_with(b"-ERR") {
         Err(CurlError::LoginDenied)
     } else {
         Err(CurlError::WeirdServerReply)
