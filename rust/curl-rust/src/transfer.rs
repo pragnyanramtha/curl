@@ -5015,11 +5015,7 @@ async fn run_rtsp_transfer(
     metrics.method = "OPTIONS".to_string();
     metrics.response_code = Some(response.status);
     metrics.size_download = 0;
-    metrics.content_type = response
-        .headers
-        .get(CONTENT_TYPE)
-        .and_then(|value| value.to_str().ok())
-        .map(ToString::to_string);
+    metrics.content_type = content_type_header(&response.headers);
     metrics.headers = response.headers.clone();
 
     if response.cseq != Some(1) {
@@ -8976,7 +8972,7 @@ fn strip_dict_prefix<'a>(path: &'a [u8], prefixes: &[&[u8]]) -> Option<&'a [u8]>
     prefixes.iter().find_map(|prefix| {
         path.get(..prefix.len())
             .is_some_and(|start| start.eq_ignore_ascii_case(prefix))
-            .then_some(&path[prefix.len()..])
+            .then(|| &path[prefix.len()..])
     })
 }
 
@@ -9387,11 +9383,7 @@ async fn run_http_transfer(
             metrics.url_effective = final_attempt.final_url.to_string();
             metrics.response_code = final_attempt.status.map(|status| status.as_u16());
             metrics.referer = custom_referer.clone().or_else(|| current_referer.clone());
-            metrics.content_type = final_attempt
-                .headers
-                .get(CONTENT_TYPE)
-                .and_then(|value| value.to_str().ok())
-                .map(ToString::to_string);
+            metrics.content_type = content_type_header(&final_attempt.headers);
             metrics.redirect_url = redirect_location_string(&final_attempt.headers)?;
             metrics.headers = final_attempt.headers.clone();
             check_http_content_length_max_filesize(
@@ -9435,11 +9427,7 @@ async fn run_http_transfer(
         metrics.url_effective = attempt.final_url.to_string();
         metrics.response_code = attempt.status.map(|status| status.as_u16());
         metrics.referer = custom_referer.clone().or_else(|| current_referer.clone());
-        metrics.content_type = attempt
-            .headers
-            .get(CONTENT_TYPE)
-            .and_then(|value| value.to_str().ok())
-            .map(ToString::to_string);
+        metrics.content_type = content_type_header(&attempt.headers);
         metrics.redirect_url = redirect_location_string(&attempt.headers)?;
         metrics.headers = attempt.headers.clone();
         check_http_content_length_max_filesize(transfer, &attempt.headers, method == Method::HEAD)?;
@@ -9571,11 +9559,7 @@ async fn run_http_transfer(
             metrics.url_effective = final_attempt.final_url.to_string();
             metrics.response_code = final_attempt.status.map(|status| status.as_u16());
             metrics.referer = custom_referer.clone().or_else(|| current_referer.clone());
-            metrics.content_type = final_attempt
-                .headers
-                .get(CONTENT_TYPE)
-                .and_then(|value| value.to_str().ok())
-                .map(ToString::to_string);
+            metrics.content_type = content_type_header(&final_attempt.headers);
             metrics.redirect_url = redirect_location_string(&final_attempt.headers)?;
             metrics.headers = final_attempt.headers.clone();
             check_http_content_length_max_filesize(
@@ -9727,11 +9711,7 @@ async fn run_http_transfer(
             metrics.http_connect = final_attempt.http_connect_code;
             metrics.proxy_used = final_attempt.proxy_used;
             metrics.referer = custom_referer.clone().or_else(|| current_referer.clone());
-            metrics.content_type = final_attempt
-                .headers
-                .get(CONTENT_TYPE)
-                .and_then(|value| value.to_str().ok())
-                .map(ToString::to_string);
+            metrics.content_type = content_type_header(&final_attempt.headers);
             metrics.redirect_url = redirect_location_string(&final_attempt.headers)?;
             metrics.headers = final_attempt.headers.clone();
             check_http_content_length_max_filesize(
@@ -9779,11 +9759,7 @@ async fn run_http_transfer(
         metrics.http_connect = attempt.http_connect_code;
         metrics.proxy_used = attempt.proxy_used;
         metrics.referer = custom_referer.clone().or_else(|| current_referer.clone());
-        metrics.content_type = attempt
-            .headers
-            .get(CONTENT_TYPE)
-            .and_then(|value| value.to_str().ok())
-            .map(ToString::to_string);
+        metrics.content_type = content_type_header(&attempt.headers);
         metrics.redirect_url = redirect_location_string(&attempt.headers)?;
         metrics.headers = attempt.headers.clone();
         check_http_content_length_max_filesize(transfer, &attempt.headers, method == Method::HEAD)?;
@@ -9813,11 +9789,7 @@ async fn run_http_transfer(
         metrics.url_effective = attempt.final_url.to_string();
         metrics.response_code = attempt.status.map(|status| status.as_u16());
         metrics.referer = custom_referer.clone().or_else(|| current_referer.clone());
-        metrics.content_type = attempt
-            .headers
-            .get(CONTENT_TYPE)
-            .and_then(|value| value.to_str().ok())
-            .map(ToString::to_string);
+        metrics.content_type = content_type_header(&attempt.headers);
         metrics.redirect_url = redirect_location_string(&attempt.headers)?;
         metrics.headers = attempt.headers.clone();
         check_http_content_length_max_filesize(transfer, &attempt.headers, method == Method::HEAD)?;
@@ -9867,11 +9839,7 @@ async fn run_http_transfer(
         metrics.url_effective = attempt.final_url.to_string();
         metrics.response_code = attempt.status.map(|status| status.as_u16());
         metrics.referer = custom_referer.clone().or_else(|| current_referer.clone());
-        metrics.content_type = attempt
-            .headers
-            .get(CONTENT_TYPE)
-            .and_then(|value| value.to_str().ok())
-            .map(ToString::to_string);
+        metrics.content_type = content_type_header(&attempt.headers);
         metrics.redirect_url = redirect_location_string(&attempt.headers)?;
         metrics.headers = attempt.headers.clone();
         check_http_content_length_max_filesize(transfer, &attempt.headers, method == Method::HEAD)?;
@@ -10094,10 +10062,7 @@ async fn run_http_transfer(
         let attempt_status = (version != Version::HTTP_09).then_some(status);
         metrics.response_code = attempt_status.map(|status| status.as_u16());
         metrics.referer = custom_referer.clone().or_else(|| current_referer.clone());
-        metrics.content_type = headers
-            .get(CONTENT_TYPE)
-            .and_then(|value| value.to_str().ok())
-            .map(ToString::to_string);
+        metrics.content_type = content_type_header(&headers);
         metrics.redirect_url = redirect_location_string(&headers)?;
         metrics.headers = headers.clone();
 
@@ -12938,6 +12903,13 @@ fn redirect_location_string(headers: &reqwest::header::HeaderMap) -> Result<Opti
         .map_err(|error| CurlError::Transfer(format!("redirect Location is not UTF-8: {error}")))
 }
 
+fn content_type_header(headers: &HeaderMap) -> Option<String> {
+    headers
+        .get(CONTENT_TYPE)
+        .and_then(|value| std::str::from_utf8(trim_http_header_value(value.as_bytes())).ok())
+        .map(ToString::to_string)
+}
+
 fn redirect_location_value(headers: &reqwest::header::HeaderMap) -> Result<Option<Vec<u8>>> {
     let mut selected = None;
     for location in headers.get_all(LOCATION) {
@@ -13548,5 +13520,14 @@ mod tests {
         let defaults =
             origin_ca_env_defaults_from(&transfer, |_| Some(PathBuf::from("bundle.pem")));
         assert!(defaults.cacert.is_none());
+    }
+
+    #[test]
+    fn dict_prefix_matching_does_not_slice_short_paths() {
+        assert!(strip_dict_prefix(b"/", &[b"/DEFINE:", b"/MATCH:"]).is_none());
+        assert_eq!(
+            strip_dict_prefix(b"/D:word", &[b"/DEFINE:", b"/D:"]),
+            Some(&b"word"[..])
+        );
     }
 }

@@ -218,6 +218,8 @@ fn variable(name: &str, metrics: &Metrics) -> String {
         "redirect_url" => metrics.redirect_url.clone().unwrap_or_default(),
         "referer" => metrics.referer.clone().unwrap_or_default(),
         "num_retries" => metrics.num_retries.to_string(),
+        "scheme" => url_part(&metrics.url_effective, UrlPart::Scheme).unwrap_or_default(),
+        "num_headers" => metrics.headers.len().to_string(),
         "json" => json(metrics),
         "header_json" => header_json(&metrics.headers),
         _ => String::new(),
@@ -455,6 +457,13 @@ mod tests {
         metrics.size_delivered = 5;
         metrics.num_retries = 2;
         metrics.referer = Some("https://refer.example/source".to_string());
+        metrics.headers.insert(
+            reqwest::header::DATE,
+            "Tue, 09 Nov 2010 14:49:00 GMT".parse().unwrap(),
+        );
+        metrics
+            .headers
+            .insert(reqwest::header::CONTENT_TYPE, "text/plain".parse().unwrap());
 
         assert_eq!(
             render(
@@ -464,6 +473,7 @@ mod tests {
             "https://example.com/ 200 5 https://refer.example/source 2\n"
         );
         assert_eq!(render("%{size_delivered}", &metrics), "5");
+        assert_eq!(render("%{scheme} %{num_headers}", &metrics), "https 2");
         metrics.http_version = Some("1.1".to_string());
         metrics.remote_ip = Some("127.0.0.1".to_string());
         metrics.remote_port = Some(8080);
