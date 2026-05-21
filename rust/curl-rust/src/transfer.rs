@@ -99,6 +99,7 @@ struct ExplicitHttpProxy {
 struct RawHttpProxyContext<'a> {
     transfer: &'a TransferConfig,
     url: &'a Url,
+    path_as_is_url: Option<&'a str>,
     method: &'a Method,
     prepared_body: Option<&'a PreparedBody>,
     upload_body: Option<&'a [u8]>,
@@ -112,6 +113,7 @@ struct RawHttpProxyContext<'a> {
 struct RawHttpDirectContext<'a> {
     transfer: &'a TransferConfig,
     url: &'a Url,
+    path_as_is_url: Option<&'a str>,
     connect_host: &'a str,
     connect_port: u16,
     method: &'a Method,
@@ -462,6 +464,13 @@ fn build_client(transfer: &TransferConfig, cookie_jar: Option<Arc<CookieJar>>) -
         builder = builder.max_tls_version(version);
     }
 
+    if let Some(path) = &transfer.cacert {
+        builder = builder.tls_built_in_root_certs(false);
+        for certificate in load_ca_certificates(path)? {
+            builder = builder.add_root_certificate(certificate);
+        }
+    }
+
     if transfer.ip_version != IpVersionPreference::Any {
         builder = builder.dns_resolver(Arc::new(IpFamilyResolver {
             ip_version: transfer.ip_version,
@@ -513,6 +522,20 @@ fn build_client(transfer: &TransferConfig, cookie_jar: Option<Arc<CookieJar>>) -
     }
 
     builder.build().transfer_err()
+}
+
+fn load_ca_certificates(path: &Path) -> Result<Vec<reqwest::Certificate>> {
+    let bytes = std::fs::read(path)
+        .map_err(|error| CurlError::CaCert(format!("{}: {error}", path.display())))?;
+    let certificates = reqwest::Certificate::from_pem_bundle(&bytes)
+        .map_err(|error| CurlError::CaCert(format!("{}: {error}", path.display())))?;
+    if certificates.is_empty() {
+        return Err(CurlError::CaCert(format!(
+            "{}: no certificates found",
+            path.display()
+        )));
+    }
+    Ok(certificates)
 }
 
 fn reqwest_tls_version(version: SslVersionPreference) -> reqwest::tls::Version {
@@ -8545,7 +8568,10 @@ async fn run_http_transfer(
         ));
     }
     let mut url = Url::parse(&expanded.url).map_err(|error| CurlError::Url(error.to_string()))?;
+    let path_as_is_url = transfer.path_as_is.then(|| expanded.url.clone());
+    let before_upload_append_path = url.path().to_string();
     data::append_upload_filename_to_url(&mut url, transfer.upload_file.as_deref());
+    let path_as_is_upload_append = transfer.path_as_is && before_upload_append_path != url.path();
     reject_unsupported_http_auth(transfer)?;
     output::validate_output_target(transfer, &url)?;
     if let Some(path) = &transfer.dump_header {
@@ -8584,6 +8610,13 @@ async fn run_http_transfer(
     let initial_connect_to = connect_to_target(transfer, &url)?;
     let raw_custom_header_wire_semantics = needs_raw_custom_header_wire_semantics(transfer)?;
     let custom_host_header = has_custom_header(transfer, "host")?;
+    let path_as_is_requires_raw = path_as_is_preservation_required(path_as_is_url.as_deref(), &url);
+    if path_as_is_upload_append && path_as_is_requires_raw {
+        return Err(CurlError::Unsupported(
+            "--path-as-is with upload-file directory URL is not implemented in the Rust sidecar"
+                .to_string(),
+        ));
+    }
     let mut raw_redirect_handoff = None;
     if initial_connect_to.is_some() {
         if url.scheme() != "http" {
@@ -8603,6 +8636,7 @@ async fn run_http_transfer(
         && transfer.follow_location
         && raw_http_direct_redirect_supported(transfer, &url, has_multipart)
         && (transfer.request_target.is_some()
+            || path_as_is_requires_raw
             || transfer.raw
             || transfer.tr_encoding
             || transfer.ignore_content_length
@@ -8617,6 +8651,7 @@ async fn run_http_transfer(
             !transfer.get && (!transfer.data.is_empty() || !transfer.forms.is_empty());
         let mut current_method = method.clone();
         let mut send_request_body = true;
+        let mut current_path_as_is_url = path_as_is_url.clone();
         let mut redirect_attempts = Vec::new();
 
         loop {
@@ -8637,6 +8672,7 @@ async fn run_http_transfer(
                 RawHttpDirectContext {
                     transfer,
                     url: &url,
+                    path_as_is_url: current_path_as_is_url.as_deref(),
                     connect_host: &connect_host,
                     connect_port,
                     method: &current_method,
@@ -8652,8 +8688,11 @@ async fn run_http_transfer(
             .await?;
 
             if attempt.status.is_some_and(is_followed_redirect)
-                && let Some(next_url) = redirect_location(&attempt.final_url, &attempt.headers)?
+                && let Some(next) =
+                    redirect_location(&attempt.final_url, &attempt.headers, transfer.path_as_is)?
             {
+                let next_url = next.url;
+                let next_path_as_is_url = next.path_as_is_url;
                 let status = attempt.status.expect("checked redirect status");
                 if let Some(path) = &transfer.dump_header {
                     let header_bytes =
@@ -8684,10 +8723,13 @@ async fn run_http_transfer(
                 }
 
                 if next_url.scheme() != "http" {
+                    let next_requires_path_as_is =
+                        path_as_is_preservation_required(next_path_as_is_url.as_deref(), &next_url);
                     if next_url.scheme() == "https"
                         && !transfer.raw
                         && transfer.request_target.is_none()
                         && initial_connect_to.is_none()
+                        && !next_requires_path_as_is
                     {
                         if transfer.auto_referer && custom_referer.is_none() {
                             current_referer = Some(auto_referer_value(&attempt.final_url));
@@ -8740,6 +8782,7 @@ async fn run_http_transfer(
                     send_request_body = false;
                 }
                 url = next_url;
+                current_path_as_is_url = next_path_as_is_url;
                 redirects += 1;
                 redirect_attempts.push(attempt);
                 continue;
@@ -8778,6 +8821,7 @@ async fn run_http_transfer(
             RawHttpDirectContext {
                 transfer,
                 url: &url,
+                path_as_is_url: path_as_is_url.as_deref(),
                 connect_host: &connect_to.host,
                 connect_port: connect_to.port,
                 method: &method,
@@ -8810,6 +8854,7 @@ async fn run_http_transfer(
         && transfer.follow_location
         && raw_http_proxy_redirect_supported(transfer, &url, has_multipart)
         && (transfer.request_target.is_some()
+            || path_as_is_requires_raw
             || transfer.raw
             || transfer.tr_encoding
             || transfer.ignore_content_length)
@@ -8819,6 +8864,7 @@ async fn run_http_transfer(
             !transfer.get && (!transfer.data.is_empty() || !transfer.forms.is_empty());
         let mut current_method = method.clone();
         let mut send_request_body = true;
+        let mut current_path_as_is_url = path_as_is_url.clone();
         let mut redirect_attempts = Vec::new();
 
         loop {
@@ -8837,6 +8883,7 @@ async fn run_http_transfer(
             let attempt = run_raw_http_proxy_transfer(RawHttpProxyContext {
                 transfer,
                 url: &url,
+                path_as_is_url: current_path_as_is_url.as_deref(),
                 method: &current_method,
                 prepared_body: request_body,
                 upload_body: upload,
@@ -8849,8 +8896,11 @@ async fn run_http_transfer(
             .await?;
 
             if attempt.status.is_some_and(is_followed_redirect)
-                && let Some(next_url) = redirect_location(&attempt.final_url, &attempt.headers)?
+                && let Some(next) =
+                    redirect_location(&attempt.final_url, &attempt.headers, transfer.path_as_is)?
             {
+                let next_url = next.url;
+                let next_path_as_is_url = next.path_as_is_url;
                 let status = attempt.status.expect("checked redirect status");
                 if let Some(path) = &transfer.dump_header {
                     let header_bytes =
@@ -8910,6 +8960,7 @@ async fn run_http_transfer(
                     send_request_body = false;
                 }
                 url = next_url;
+                current_path_as_is_url = next_path_as_is_url;
                 redirects += 1;
                 redirect_attempts.push(attempt);
                 continue;
@@ -8943,6 +8994,7 @@ async fn run_http_transfer(
         let attempt = run_raw_http_proxy_transfer(RawHttpProxyContext {
             transfer,
             url: &url,
+            path_as_is_url: path_as_is_url.as_deref(),
             method: &method,
             prepared_body: prepared_body.as_ref(),
             upload_body: upload_body.as_deref(),
@@ -8971,6 +9023,7 @@ async fn run_http_transfer(
     if explicit_proxy.is_none()
         && raw_http_direct_supported(transfer, &url, has_multipart)
         && (transfer.request_target.is_some()
+            || path_as_is_requires_raw
             || transfer.raw
             || transfer.ignore_content_length
             || transfer.compressed
@@ -8987,6 +9040,7 @@ async fn run_http_transfer(
             RawHttpDirectContext {
                 transfer,
                 url: &url,
+                path_as_is_url: path_as_is_url.as_deref(),
                 connect_host: url
                     .host_str()
                     .ok_or_else(|| CurlError::Url("URL is missing a host".to_string()))?,
@@ -9020,6 +9074,12 @@ async fn run_http_transfer(
     if transfer.request_target.is_some() {
         return Err(CurlError::Unsupported(
             "--request-target is only implemented for plain HTTP raw requests in the Rust sidecar"
+                .to_string(),
+        ));
+    }
+    if path_as_is_requires_raw {
+        return Err(CurlError::Unsupported(
+            "--path-as-is is only implemented for plain HTTP requests that can use the Rust sidecar raw reader"
                 .to_string(),
         ));
     }
@@ -9117,8 +9177,10 @@ async fn run_http_transfer(
         if manual_redirects
             && transfer.follow_location
             && is_followed_redirect(status)
-            && let Some(next_url) = redirect_location(&final_url, &headers)?
+            && let Some(next) = redirect_location(&final_url, &headers, transfer.path_as_is)?
         {
+            let next_url = next.url;
+            let next_path_as_is_url = next.path_as_is_url;
             if let Some(path) = &transfer.dump_header {
                 let header_bytes = output::render_headers(version, status, &headers);
                 output::append_dump_headers(path, &header_bytes, transfer.create_dirs)?;
@@ -9154,6 +9216,18 @@ async fn run_http_transfer(
                 metrics.headers = headers;
                 return Err(CurlError::UnsupportedProtocol(
                     next_url.scheme().to_string(),
+                ));
+            }
+
+            if path_as_is_preservation_required(next_path_as_is_url.as_deref(), &next_url) {
+                metrics.url_effective = final_url.to_string();
+                metrics.response_code = Some(status.as_u16());
+                metrics.referer = custom_referer.clone().or_else(|| current_referer.clone());
+                metrics.redirect_url = Some(next_url.to_string());
+                metrics.headers = headers;
+                return Err(CurlError::Unsupported(
+                    "--path-as-is redirects that require raw request-target preservation are only implemented for plain HTTP"
+                        .to_string(),
                 ));
             }
 
@@ -9616,11 +9690,15 @@ fn raw_http_direct_request(context: &RawHttpDirectContext<'_>) -> Result<Vec<u8>
     };
     let add_transfer_encoding = context.transfer.tr_encoding && !has_header("te");
     let body = raw_http_body(context.transfer, context.prepared_body, context.upload_body);
-    let target = context
-        .transfer
-        .request_target
-        .clone()
-        .unwrap_or_else(|| http_request_target(context.url));
+    let target =
+        context
+            .transfer
+            .request_target
+            .clone()
+            .unwrap_or_else(|| match context.path_as_is_url {
+                Some(raw_url) => http_request_target_path_as_is(raw_url, context.url),
+                None => http_request_target(context.url),
+            });
     let version = raw_http_request_version(context.transfer);
     let mut request = Vec::new();
     request.extend_from_slice(
@@ -9757,11 +9835,15 @@ fn raw_http_proxy_request(context: &RawHttpProxyContext<'_>) -> Result<Vec<u8>> 
     };
     let add_transfer_encoding = context.transfer.tr_encoding && !has_header("te");
     let body = raw_http_body(context.transfer, context.prepared_body, context.upload_body);
-    let target = context
-        .transfer
-        .request_target
-        .clone()
-        .unwrap_or_else(|| context.url.to_string());
+    let target =
+        context
+            .transfer
+            .request_target
+            .clone()
+            .unwrap_or_else(|| match context.path_as_is_url {
+                Some(raw_url) => http_proxy_request_target_path_as_is(raw_url, context.url),
+                None => context.url.to_string(),
+            });
     let version = raw_http_request_version(context.transfer);
     let mut request = Vec::new();
     request.extend_from_slice(
@@ -10458,9 +10540,32 @@ fn http_send_error(error: reqwest::Error, transfer: &TransferConfig) -> CurlErro
         CurlError::Timeout
     } else if !transfer.http09_allowed && reqwest_error_is_http09_denial(&error) {
         CurlError::UnsupportedProtocol("HTTP/0.9".to_string())
+    } else if reqwest_error_is_peer_verification(&error) {
+        CurlError::PeerVerificationFailed
     } else {
         CurlError::Transfer(error.to_string())
     }
+}
+
+fn reqwest_error_is_peer_verification(error: &reqwest::Error) -> bool {
+    let mut source = error.source();
+    while let Some(error) = source {
+        let message = error.to_string();
+        if message.contains("invalid peer certificate")
+            || message.contains("certificate verify failed")
+            || message.contains("UnknownIssuer")
+            || message.contains("NotValidForName")
+            || message.contains("InvalidCertificate")
+        {
+            return true;
+        }
+        source = error.source();
+    }
+
+    let debug = format!("{error:?}");
+    debug.contains("InvalidCertificate")
+        || debug.contains("UnknownIssuer")
+        || debug.contains("NotValidForName")
 }
 
 fn reqwest_error_is_http09_denial(error: &reqwest::Error) -> bool {
@@ -10509,6 +10614,61 @@ fn http_request_target(url: &Url) -> String {
     } else {
         path.to_string()
     }
+}
+
+fn path_as_is_preservation_required(raw_url: Option<&str>, url: &Url) -> bool {
+    raw_url.is_some_and(|raw_url| {
+        http_request_target_path_as_is(raw_url, url) != http_request_target(url)
+    })
+}
+
+fn http_request_target_path_as_is(raw_url: &str, url: &Url) -> String {
+    let raw_path = raw_path_from_absolute_url(raw_url).unwrap_or("/");
+    if let Some(query) = url.query() {
+        format!("{raw_path}?{query}")
+    } else {
+        raw_path.to_string()
+    }
+}
+
+fn http_proxy_request_target_path_as_is(raw_url: &str, url: &Url) -> String {
+    let Some(authority_end) = raw_absolute_authority_end(raw_url) else {
+        return url.to_string();
+    };
+    let raw_no_fragment = raw_url_without_fragment(raw_url);
+    let prefix = &raw_no_fragment[..authority_end.min(raw_no_fragment.len())];
+    format!("{prefix}{}", http_request_target_path_as_is(raw_url, url))
+}
+
+fn raw_path_from_absolute_url(raw_url: &str) -> Option<&str> {
+    let raw_no_fragment = raw_url_without_fragment(raw_url);
+    let authority_end = raw_absolute_authority_end(raw_no_fragment)?;
+    let after_authority = &raw_no_fragment[authority_end..];
+    if after_authority.starts_with('/') {
+        Some(
+            after_authority
+                .split_once('?')
+                .map_or(after_authority, |(path, _)| path),
+        )
+    } else {
+        Some("/")
+    }
+}
+
+fn raw_absolute_authority_end(raw_url: &str) -> Option<usize> {
+    let (_, after_scheme) = raw_url.split_once(':')?;
+    if !after_scheme.starts_with("//") {
+        return None;
+    }
+    let authority_start = raw_url.find("://")? + 3;
+    let authority_len = raw_url[authority_start..]
+        .find(['/', '?', '#'])
+        .unwrap_or(raw_url.len() - authority_start);
+    Some(authority_start + authority_len)
+}
+
+fn raw_url_without_fragment(raw_url: &str) -> &str {
+    raw_url.split_once('#').map_or(raw_url, |(url, _)| url)
 }
 
 pub(crate) fn default_user_agent() -> String {
@@ -11266,19 +11426,33 @@ impl RedirectFollowup {
     }
 }
 
+struct RedirectTarget {
+    url: Url,
+    path_as_is_url: Option<String>,
+}
+
 fn redirect_location(
     current_url: &Url,
     headers: &reqwest::header::HeaderMap,
-) -> Result<Option<Url>> {
+    path_as_is: bool,
+) -> Result<Option<RedirectTarget>> {
     let Some(location) = redirect_location_value(headers)? else {
         return Ok(None);
     };
     let location = std::str::from_utf8(&location)
         .map_err(|error| CurlError::Transfer(format!("redirect Location is not UTF-8: {error}")))?;
-    current_url
+    let url = current_url
         .join(location)
-        .map(Some)
-        .map_err(|error| CurlError::Url(error.to_string()))
+        .map_err(|error| CurlError::Url(error.to_string()))?;
+    let path_as_is_url = if path_as_is && Url::parse(location).is_ok() {
+        Some(raw_url_without_fragment(location).to_string())
+    } else {
+        None
+    };
+    Ok(Some(RedirectTarget {
+        url,
+        path_as_is_url,
+    }))
 }
 
 fn validate_redirect_location_headers(headers: &reqwest::header::HeaderMap) -> Result<()> {

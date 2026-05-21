@@ -267,6 +267,9 @@ fn write_request(out: &mut String, render: &RenderTransfer<'_>, url: &str) -> Re
     if let Some(target) = &transfer.request_target {
         emit_string_setopt(out, "CURLOPT_REQUEST_TARGET", target);
     }
+    if transfer.path_as_is {
+        emit_long_setopt(out, "CURLOPT_PATH_AS_IS", 1);
+    }
     if transfer.disallow_username_in_url {
         emit_long_setopt(out, "CURLOPT_DISALLOW_USERNAME_IN_URL", 1);
     }
@@ -445,6 +448,9 @@ fn write_request(out: &mut String, render: &RenderTransfer<'_>, url: &str) -> Re
     if transfer.insecure {
         emit_long_setopt(out, "CURLOPT_SSL_VERIFYPEER", 0);
         emit_long_setopt(out, "CURLOPT_SSL_VERIFYHOST", 0);
+    }
+    if let Some(path) = &transfer.cacert {
+        emit_string_setopt(out, "CURLOPT_CAINFO", &path.to_string_lossy());
     }
     if let Some(timeout) = transfer
         .connect_timeout
@@ -864,6 +870,7 @@ fn c_escape(bytes: &[u8]) -> String {
 mod tests {
     use super::*;
     use crate::cli::parse_args;
+    use tempfile::tempdir;
 
     #[test]
     fn renders_minimal_get_source() {
@@ -1071,6 +1078,30 @@ mod tests {
 
         assert!(source.contains("CURLOPT_HTTP_CONTENT_DECODING, 0L"));
         assert!(source.contains("CURLOPT_HTTP_TRANSFER_DECODING, 0L"));
+    }
+
+    #[test]
+    fn renders_path_as_is_and_cainfo_options() {
+        let temp = tempdir().unwrap();
+        let ca = temp.path().join("ca.pem");
+        std::fs::write(&ca, "test ca").unwrap();
+
+        let config = parse_args([
+            "-q",
+            "--libcurl",
+            "client.c",
+            "--path-as-is",
+            "--cacert",
+            ca.to_str().unwrap(),
+            "https://example.com/a/../b",
+        ])
+        .unwrap();
+
+        let source = render_source(&config).unwrap();
+
+        assert!(source.contains("CURLOPT_PATH_AS_IS, 1L"));
+        assert!(source.contains("CURLOPT_CAINFO"));
+        assert!(source.contains(ca.to_str().unwrap()));
     }
 
     #[test]

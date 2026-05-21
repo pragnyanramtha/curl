@@ -2314,6 +2314,54 @@ fn downloads_http_and_renders_writeout() {
 }
 
 #[test]
+fn path_as_is_preserves_direct_http_dot_segments() {
+    let (url, rx) = spawn_server(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok");
+    let target = url.replace("/resource", "/a/../b/./c?x=1");
+
+    let mut command = Command::cargo_bin("curl").unwrap();
+    command.args(["-q", "-sS", "--path-as-is", &target]);
+    command.assert().success().stdout("ok");
+
+    let request = rx.recv().unwrap();
+    assert_eq!(request.start_line, "GET /a/../b/./c?x=1 HTTP/1.1");
+}
+
+#[test]
+fn http_default_normalizes_dot_segments() {
+    let (url, rx) = spawn_server(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok");
+    let target = url.replace("/resource", "/a/../b/./c?x=1");
+
+    let mut command = Command::cargo_bin("curl").unwrap();
+    command.args(["-q", "-sS", &target]);
+    command.assert().success().stdout("ok");
+
+    let request = rx.recv().unwrap();
+    assert_eq!(request.start_line, "GET /b/c?x=1 HTTP/1.1");
+}
+
+#[test]
+fn path_as_is_preserves_http_proxy_absolute_form_dot_segments() {
+    let (proxy_url, rx) = spawn_server(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok");
+
+    let mut command = Command::cargo_bin("curl").unwrap();
+    command.args([
+        "-q",
+        "-sS",
+        "--path-as-is",
+        "-x",
+        &proxy_url,
+        "http://example.test/a/../b/./c?x=1",
+    ]);
+    command.assert().success().stdout("ok");
+
+    let request = rx.recv().unwrap();
+    assert_eq!(
+        request.start_line,
+        "GET http://example.test/a/../b/./c?x=1 HTTP/1.1"
+    );
+}
+
+#[test]
 fn max_time_zero_and_submillisecond_are_disabled() {
     for value in ["0", "0.0001"] {
         let (url, rx) =

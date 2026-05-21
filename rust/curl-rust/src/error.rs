@@ -86,6 +86,8 @@ pub enum CurlError {
     InterfaceFailed(String),
     #[error("SSL peer certificate or SSH remote key was not OK")]
     PeerVerificationFailed,
+    #[error("Problem with the SSL CA cert (path? access rights?): {0}")]
+    CaCert(String),
     #[error("LDAP cannot bind")]
     LdapCannotBind,
     #[error("LDAP search failed")]
@@ -151,6 +153,7 @@ impl CurlError {
             Self::LoginDenied | Self::UrlCredentialsProhibited => 67,
             Self::InterfaceFailed(_) => 45,
             Self::PeerVerificationFailed => 60,
+            Self::CaCert(_) => 77,
             Self::LdapCannotBind => 38,
             Self::LdapSearchFailed => 39,
             Self::RemoteFileNotFound => 78,

@@ -36,6 +36,7 @@ pub struct TransferConfig {
     pub url_globoffs: Vec<bool>,
     pub method: Option<String>,
     pub request_target: Option<String>,
+    pub path_as_is: bool,
     pub head: bool,
     pub get: bool,
     pub list_only: bool,
@@ -111,6 +112,7 @@ pub struct TransferConfig {
     pub proxy_auth: ProxyAuthMethods,
     pub noproxy: Option<String>,
     pub insecure: bool,
+    pub cacert: Option<PathBuf>,
     pub interface: Option<String>,
     pub local_port: Option<LocalPortRange>,
     pub connect_timeout: Option<Duration>,
@@ -509,6 +511,7 @@ impl Default for TransferConfig {
             url_globoffs: Vec::new(),
             method: None,
             request_target: None,
+            path_as_is: false,
             head: false,
             get: false,
             list_only: false,
@@ -584,6 +587,7 @@ impl Default for TransferConfig {
             proxy_auth: ProxyAuthMethods::default(),
             noproxy: None,
             insecure: false,
+            cacert: None,
             interface: None,
             local_port: None,
             connect_timeout: None,
@@ -782,6 +786,7 @@ impl Parser {
                 let value = self.value_for(name, inline_value)?;
                 self.current().request_target = Some(parse_nonempty_string(name, value)?);
             }
+            "path-as-is" => self.current().path_as_is = true,
             "head" => self.current().head = true,
             "get" => self.current().get = true,
             "list-only" => self.current().list_only = true,
@@ -1073,6 +1078,10 @@ impl Parser {
                 self.current().noproxy = Some(value);
             }
             "insecure" => self.current().insecure = true,
+            "cacert" => {
+                let value = self.value_for(name, inline_value)?;
+                self.current().cacert = Some(parse_existing_path(name, &value)?);
+            }
             "connect-timeout" => {
                 let value = self.value_for(name, inline_value)?;
                 self.current().connect_timeout = Some(parse_duration(name, &value)?);
@@ -1122,6 +1131,16 @@ impl Parser {
                     ));
                 }
             }
+            "trace-ids" => {
+                if inline_value.is_some() {
+                    return Err(CurlError::Usage(
+                        "option --trace-ids does not take a value".to_string(),
+                    ));
+                }
+            }
+            "trace-config" => {
+                let _ = self.value_for(name, inline_value)?;
+            }
             "silent" | "no-progress-meter" => self.current().silent = true,
             "show-error" => self.current().show_error = true,
             "globoff" => self.current().globoff = true,
@@ -1160,6 +1179,7 @@ impl Parser {
         match name {
             "head" => self.current().head = false,
             "get" => self.current().get = false,
+            "path-as-is" => self.current().path_as_is = false,
             "list-only" => self.current().list_only = false,
             "use-ascii" => self.current().use_ascii = false,
             "append" => self.current().ftp_append = false,
@@ -1227,6 +1247,7 @@ impl Parser {
             "raw" => self.current().raw = false,
             "ignore-content-length" => self.current().ignore_content_length = false,
             "verbose" => self.current().verbose = false,
+            "trace-ids" => {}
             "progress-meter" => self.current().silent = true,
             "silent" => self.current().silent = false,
             "show-error" => self.current().show_error = false,
@@ -1841,6 +1862,7 @@ impl TransferConfig {
         !self.urls.is_empty()
             || self.method.is_some()
             || self.request_target.is_some()
+            || self.path_as_is
             || self.head
             || self.get
             || self.list_only
@@ -1915,6 +1937,7 @@ impl TransferConfig {
             || !self.proxy_auth.is_empty()
             || self.noproxy.is_some()
             || self.insecure
+            || self.cacert.is_some()
             || self.interface.is_some()
             || self.local_port.is_some()
             || self.connect_timeout.is_some()
@@ -2028,6 +2051,7 @@ fn option_takes_value(name: &str) -> bool {
             | "interface"
             | "local-port"
             | "noproxy"
+            | "cacert"
             | "connect-timeout"
             | "max-time"
             | "speed-limit"
@@ -2038,6 +2062,7 @@ fn option_takes_value(name: &str) -> bool {
             | "cookie-jar"
             | "trace"
             | "trace-ascii"
+            | "trace-config"
             | "tls-max"
     )
 }
@@ -2494,6 +2519,17 @@ fn parse_nonempty_path(name: &str, value: &str) -> Result<PathBuf> {
     } else {
         Ok(PathBuf::from(value))
     }
+}
+
+fn parse_existing_path(name: &str, value: &str) -> Result<PathBuf> {
+    let path = parse_nonempty_path(name, value)?;
+    if std::fs::metadata(&path).is_err() {
+        return Err(bad_option_usage(
+            format!("The file '{value}' provided to --{name} does not exist"),
+            format!("--{name}"),
+        ));
+    }
+    Ok(path)
 }
 
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
@@ -3034,6 +3070,7 @@ fn print_common_help() {
                --interface <name>      Use network interface\n\
                --local-port <range>    Use a local port number within range\n\
            -k, --insecure              Allow insecure TLS/SSH\n\
+               --cacert <file>         CA certificate bundle\n\
            -Y, --speed-limit <speed>   Stop transfers slower than this\n\
            -y, --speed-time <seconds>  Trigger speed-limit after this time\n\
            -s, --silent                Silent mode\n\
@@ -3752,6 +3789,9 @@ mod tests {
             "--trace-ascii",
             "log/trace1",
             "--trace-time",
+            "--trace-ids",
+            "--trace-config",
+            "http/2,http/3",
             "file:///tmp/input",
         ])
         .unwrap();
@@ -3759,6 +3799,51 @@ mod tests {
         let transfer = &config.transfers[0];
         assert_eq!(transfer.urls, ["file:///tmp/input"]);
         assert!(transfer.trace_output);
+    }
+
+    #[test]
+    fn parses_path_as_is_and_cacert_options() {
+        let temp = tempdir().unwrap();
+        let ca = temp.path().join("ca.pem");
+        std::fs::write(&ca, "not a real cert").unwrap();
+
+        let config = parse_args([
+            "-q",
+            "--path-as-is",
+            "--cacert",
+            ca.to_str().unwrap(),
+            "https://example.com/a/../b",
+        ])
+        .unwrap();
+
+        let transfer = &config.transfers[0];
+        assert!(transfer.path_as_is);
+        assert_eq!(transfer.cacert.as_deref(), Some(ca.as_path()));
+
+        let config = parse_args([
+            "-q",
+            "--path-as-is",
+            "--no-path-as-is",
+            "--cacert",
+            ca.to_str().unwrap(),
+            "https://example.com/",
+        ])
+        .unwrap();
+        assert!(!config.transfers[0].path_as_is);
+        assert_eq!(config.transfers[0].cacert.as_deref(), Some(ca.as_path()));
+    }
+
+    #[test]
+    fn cacert_requires_existing_path() {
+        let error = parse_args([
+            "-q",
+            "--cacert",
+            "/tmp/curl-rust-missing-ca.pem",
+            "https://example.com/",
+        ])
+        .unwrap_err();
+
+        assert!(matches!(error, CurlError::BadOptionUsage { .. }));
     }
 
     #[test]
