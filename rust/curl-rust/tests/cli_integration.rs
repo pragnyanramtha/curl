@@ -2314,6 +2314,35 @@ fn downloads_http_and_renders_writeout() {
 }
 
 #[test]
+fn writeout_json_reports_http_stats_shape() {
+    let (url, rx) = spawn_server(
+        b"HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: 5\r\n\r\nhello",
+    );
+    let port = Url::parse(&url).unwrap().port().unwrap();
+
+    let mut command = Command::cargo_bin("curl").unwrap();
+    let assert = command
+        .args(["-q", "-sS", "--out-null", "-w", "%{json}", &url])
+        .assert()
+        .success();
+    let stdout = String::from_utf8(assert.get_output().stdout.clone()).unwrap();
+
+    assert!(stdout.contains("\"http_code\":200"));
+    assert!(stdout.contains("\"http_version\":\"1.1\""));
+    assert!(stdout.contains("\"remote_ip\":\"127.0.0.1\""));
+    assert!(stdout.contains(&format!("\"remote_port\":{port}")));
+    assert!(stdout.contains("\"local_port\":"));
+    assert!(stdout.contains("\"num_connects\":"));
+    assert!(stdout.contains("\"size_header\":"));
+    assert!(stdout.contains("\"size_request\":"));
+    assert!(stdout.contains("\"time_queue\":"));
+    assert!(stdout.contains("\"time_starttransfer\":"));
+
+    let request = rx.recv().unwrap();
+    assert!(request.start_line.starts_with("GET /resource HTTP/1.1"));
+}
+
+#[test]
 fn path_as_is_preserves_direct_http_dot_segments() {
     let (url, rx) = spawn_server(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok");
     let target = url.replace("/resource", "/a/../b/./c?x=1");

@@ -4,11 +4,24 @@ use reqwest::header::HeaderMap;
 
 #[derive(Debug, Clone)]
 pub struct Metrics {
+    pub url: String,
     pub url_effective: String,
     pub response_code: Option<u16>,
+    pub http_version: Option<String>,
     pub size_download: u64,
     pub size_delivered: u64,
+    pub size_header: u64,
+    pub size_request: u64,
+    pub size_upload: u64,
     pub time_total: Duration,
+    pub time_queue: Duration,
+    pub time_namelookup: Duration,
+    pub time_connect: Duration,
+    pub time_appconnect: Duration,
+    pub time_pretransfer: Duration,
+    pub time_posttransfer: Duration,
+    pub time_starttransfer: Duration,
+    pub time_redirect: Duration,
     pub content_type: Option<String>,
     pub filename_effective: Option<String>,
     pub method: String,
@@ -16,6 +29,12 @@ pub struct Metrics {
     pub errormsg: String,
     pub redirect_url: Option<String>,
     pub referer: Option<String>,
+    pub remote_ip: Option<String>,
+    pub remote_port: Option<u16>,
+    pub local_ip: Option<String>,
+    pub local_port: Option<u16>,
+    pub num_connects: u64,
+    pub num_redirects: usize,
     pub num_retries: usize,
     pub headers: HeaderMap,
 }
@@ -29,11 +48,24 @@ pub enum OutputStream {
 impl Metrics {
     pub fn empty(url: &str, method: &str) -> Self {
         Self {
+            url: url.to_string(),
             url_effective: url.to_string(),
             response_code: None,
+            http_version: None,
             size_download: 0,
             size_delivered: 0,
+            size_header: 0,
+            size_request: 0,
+            size_upload: 0,
             time_total: Duration::ZERO,
+            time_queue: Duration::ZERO,
+            time_namelookup: Duration::ZERO,
+            time_connect: Duration::ZERO,
+            time_appconnect: Duration::ZERO,
+            time_pretransfer: Duration::ZERO,
+            time_posttransfer: Duration::ZERO,
+            time_starttransfer: Duration::ZERO,
+            time_redirect: Duration::ZERO,
             content_type: None,
             filename_effective: None,
             method: method.to_string(),
@@ -41,6 +73,12 @@ impl Metrics {
             errormsg: String::new(),
             redirect_url: None,
             referer: None,
+            remote_ip: None,
+            remote_port: None,
+            local_ip: None,
+            local_port: None,
+            num_connects: 0,
+            num_redirects: 0,
             num_retries: 0,
             headers: HeaderMap::new(),
         }
@@ -138,10 +176,34 @@ fn variable(name: &str, metrics: &Metrics) -> String {
             .unwrap_or_else(|| "000".to_string()),
         "size_download" => metrics.size_download.to_string(),
         "size_delivered" => metrics.size_delivered.to_string(),
-        "time_total" => format!("{:.6}", metrics.time_total.as_secs_f64()),
+        "size_header" => metrics.size_header.to_string(),
+        "size_request" => metrics.size_request.to_string(),
+        "size_upload" => metrics.size_upload.to_string(),
+        "time_total" => format_duration(time_value(metrics, TimeMetric::Total)),
+        "time_queue" => format_duration(time_value(metrics, TimeMetric::Queue)),
+        "time_namelookup" => format_duration(time_value(metrics, TimeMetric::NameLookup)),
+        "time_connect" => format_duration(time_value(metrics, TimeMetric::Connect)),
+        "time_appconnect" => format_duration(time_value(metrics, TimeMetric::AppConnect)),
+        "time_pretransfer" => format_duration(time_value(metrics, TimeMetric::PreTransfer)),
+        "time_posttransfer" => format_duration(time_value(metrics, TimeMetric::PostTransfer)),
+        "time_starttransfer" => format_duration(time_value(metrics, TimeMetric::StartTransfer)),
+        "time_redirect" => format_duration(time_value(metrics, TimeMetric::Redirect)),
         "content_type" => metrics.content_type.clone().unwrap_or_default(),
         "filename_effective" => metrics.filename_effective.clone().unwrap_or_default(),
         "method" => metrics.method.clone(),
+        "http_version" => metrics.http_version.clone().unwrap_or_default(),
+        "remote_ip" => metrics.remote_ip.clone().unwrap_or_default(),
+        "remote_port" => metrics
+            .remote_port
+            .map(|port| port.to_string())
+            .unwrap_or_else(|| "0".to_string()),
+        "local_ip" => metrics.local_ip.clone().unwrap_or_default(),
+        "local_port" => metrics
+            .local_port
+            .map(|port| port.to_string())
+            .unwrap_or_else(|| "0".to_string()),
+        "num_connects" => metrics.num_connects.to_string(),
+        "num_redirects" => metrics.num_redirects.to_string(),
         "exitcode" => metrics.exit_code.to_string(),
         "errormsg" => metrics.errormsg.clone(),
         "redirect_url" => metrics.redirect_url.clone().unwrap_or_default(),
@@ -154,26 +216,193 @@ fn variable(name: &str, metrics: &Metrics) -> String {
 }
 
 fn json(metrics: &Metrics) -> String {
-    format!(
-        "{{\"url_effective\":\"{}\",\"http_code\":{},\"response_code\":{},\"size_download\":{},\"size_delivered\":{},\"time_total\":{:.6},\"method\":\"{}\",\"exitcode\":{},\"errormsg\":\"{}\",\"referer\":{},\"num_retries\":{}}}",
-        escape_json(&metrics.url_effective),
-        metrics.response_code.unwrap_or(0),
-        metrics.response_code.unwrap_or(0),
-        metrics.size_download,
-        metrics.size_delivered,
-        metrics.time_total.as_secs_f64(),
-        escape_json(&metrics.method),
-        metrics.exit_code,
-        escape_json(&metrics.errormsg),
-        json_optional_string(metrics.referer.as_deref()),
-        metrics.num_retries
-    )
+    let scheme = url_part(&metrics.url_effective, UrlPart::Scheme);
+    let speed_download = speed(metrics.size_download, metrics.time_total);
+    let speed_upload = speed(metrics.size_upload, metrics.time_total);
+    let fields = [
+        json_string("certs", Some("")),
+        json_number("conn_id", 0),
+        json_optional("content_type", metrics.content_type.as_deref()),
+        json_optional_nonempty("errormsg", &metrics.errormsg),
+        json_number("exitcode", metrics.exit_code),
+        json_optional("filename_effective", metrics.filename_effective.as_deref()),
+        json_null("ftp_entry_path"),
+        json_number("http_code", metrics.response_code.unwrap_or(0)),
+        json_number("http_connect", 0),
+        json_string("http_version", metrics.http_version.as_deref()),
+        json_string("local_ip", metrics.local_ip.as_deref()),
+        json_number("local_port", metrics.local_port.unwrap_or(0)),
+        json_string("method", Some(&metrics.method)),
+        json_number("num_certs", 0),
+        json_number("num_connects", metrics.num_connects),
+        json_number("num_headers", metrics.headers.len()),
+        json_number("num_redirects", metrics.num_redirects),
+        json_number("num_retries", metrics.num_retries),
+        json_number("proxy_ssl_verify_result", 0),
+        json_number("proxy_used", 0),
+        json_optional("redirect_url", metrics.redirect_url.as_deref()),
+        json_optional("referer", metrics.referer.as_deref()),
+        json_string("remote_ip", metrics.remote_ip.as_deref()),
+        json_number("remote_port", metrics.remote_port.unwrap_or(0)),
+        json_number("response_code", metrics.response_code.unwrap_or(0)),
+        json_string("scheme", scheme.as_deref()),
+        json_number("size_delivered", metrics.size_delivered),
+        json_number("size_download", metrics.size_download),
+        json_number("size_header", metrics.size_header),
+        json_number("size_request", metrics.size_request),
+        json_number("size_upload", metrics.size_upload),
+        json_number("speed_download", speed_download),
+        json_number("speed_upload", speed_upload),
+        json_number("ssl_verify_result", 0),
+        json_duration_field(
+            "time_appconnect",
+            time_value(metrics, TimeMetric::AppConnect),
+        ),
+        json_duration_field("time_connect", time_value(metrics, TimeMetric::Connect)),
+        json_duration_field(
+            "time_namelookup",
+            time_value(metrics, TimeMetric::NameLookup),
+        ),
+        json_duration_field(
+            "time_posttransfer",
+            time_value(metrics, TimeMetric::PostTransfer),
+        ),
+        json_duration_field(
+            "time_pretransfer",
+            time_value(metrics, TimeMetric::PreTransfer),
+        ),
+        json_duration_field("time_queue", time_value(metrics, TimeMetric::Queue)),
+        json_duration_field("time_redirect", time_value(metrics, TimeMetric::Redirect)),
+        json_duration_field(
+            "time_starttransfer",
+            time_value(metrics, TimeMetric::StartTransfer),
+        ),
+        json_duration_field("time_total", time_value(metrics, TimeMetric::Total)),
+        json_number("tls_earlydata", 0),
+        json_string("url", Some(&metrics.url)),
+        json_string("url_effective", Some(&metrics.url_effective)),
+        json_number("urlnum", 0),
+        json_number("xfer_id", 0),
+        json_string("curl_version", Some(env!("CARGO_PKG_VERSION"))),
+    ];
+    format!("{{{}}}", fields.join(","))
 }
 
-fn json_optional_string(value: Option<&str>) -> String {
-    value
-        .map(|value| format!("\"{}\"", escape_json(value)))
-        .unwrap_or_else(|| "null".to_string())
+fn json_string(name: &str, value: Option<&str>) -> String {
+    match value {
+        Some(value) => format!("\"{name}\":\"{}\"", escape_json(value)),
+        None => format!("\"{name}\":null"),
+    }
+}
+
+fn json_optional(name: &str, value: Option<&str>) -> String {
+    json_string(name, value)
+}
+
+fn json_optional_nonempty(name: &str, value: &str) -> String {
+    if value.is_empty() {
+        format!("\"{name}\":null")
+    } else {
+        json_string(name, Some(value))
+    }
+}
+
+fn json_null(name: &str) -> String {
+    format!("\"{name}\":null")
+}
+
+fn json_number<T: std::fmt::Display>(name: &str, value: T) -> String {
+    format!("\"{name}\":{value}")
+}
+
+fn json_duration_field(name: &str, value: Duration) -> String {
+    format!("\"{name}\":{}", format_duration(value))
+}
+
+fn format_duration(value: Duration) -> String {
+    format!("{:.6}", value.as_secs_f64())
+}
+
+#[derive(Clone, Copy)]
+enum TimeMetric {
+    Queue,
+    NameLookup,
+    Connect,
+    AppConnect,
+    PreTransfer,
+    PostTransfer,
+    StartTransfer,
+    Redirect,
+    Total,
+}
+
+fn time_value(metrics: &Metrics, metric: TimeMetric) -> Duration {
+    let total = positive_duration(metrics.time_total);
+    let stored = match metric {
+        TimeMetric::Queue => metrics.time_queue,
+        TimeMetric::NameLookup => metrics.time_namelookup,
+        TimeMetric::Connect => metrics.time_connect,
+        TimeMetric::AppConnect => metrics.time_appconnect,
+        TimeMetric::PreTransfer => metrics.time_pretransfer,
+        TimeMetric::PostTransfer => metrics.time_posttransfer,
+        TimeMetric::StartTransfer => metrics.time_starttransfer,
+        TimeMetric::Redirect => metrics.time_redirect,
+        TimeMetric::Total => metrics.time_total,
+    };
+    if !stored.is_zero() || matches!(metric, TimeMetric::Total) {
+        return if matches!(metric, TimeMetric::Total) {
+            total
+        } else {
+            stored
+        };
+    }
+
+    match metric {
+        TimeMetric::Queue => total,
+        TimeMetric::NameLookup | TimeMetric::Connect if metrics.num_connects > 0 => total,
+        TimeMetric::AppConnect
+            if metrics.num_connects > 0 && metrics.url_effective.starts_with("https:") =>
+        {
+            total
+        }
+        TimeMetric::PreTransfer
+            if metrics.size_download > 0
+                || metrics.size_upload > 0
+                || metrics.response_code.is_some() =>
+        {
+            total
+        }
+        TimeMetric::PostTransfer if metrics.size_request > 0 || metrics.size_upload > 0 => total,
+        TimeMetric::StartTransfer if metrics.size_download > 0 => total,
+        _ => Duration::ZERO,
+    }
+}
+
+fn positive_duration(value: Duration) -> Duration {
+    if value.is_zero() {
+        Duration::from_micros(1)
+    } else {
+        value
+    }
+}
+
+fn speed(size: u64, duration: Duration) -> u64 {
+    let seconds = duration.as_secs_f64();
+    if seconds <= 0.0 {
+        0
+    } else {
+        (size as f64 / seconds) as u64
+    }
+}
+
+enum UrlPart {
+    Scheme,
+}
+
+fn url_part(url: &str, part: UrlPart) -> Option<String> {
+    match part {
+        UrlPart::Scheme => url.split_once(':').map(|(scheme, _)| scheme.to_string()),
+    }
 }
 
 fn header_json(headers: &HeaderMap) -> String {
@@ -226,9 +455,23 @@ mod tests {
             "https://example.com/ 200 5 https://refer.example/source 2\n"
         );
         assert_eq!(render("%{size_delivered}", &metrics), "5");
+        metrics.http_version = Some("1.1".to_string());
+        metrics.remote_ip = Some("127.0.0.1".to_string());
+        metrics.remote_port = Some(8080);
+        metrics.local_port = Some(49152);
+        metrics.size_header = 42;
+        metrics.size_request = 84;
         assert!(
             render("%{json}", &metrics).contains("\"referer\":\"https://refer.example/source\"")
         );
+        let json = render("%{json}", &metrics);
+        assert!(json.contains("\"http_version\":\"1.1\""));
+        assert!(json.contains("\"remote_ip\":\"127.0.0.1\""));
+        assert!(json.contains("\"remote_port\":8080"));
+        assert!(json.contains("\"local_port\":49152"));
+        assert!(json.contains("\"size_header\":42"));
+        assert!(json.contains("\"size_request\":84"));
+        assert!(json.contains("\"time_queue\":"));
     }
 
     #[test]

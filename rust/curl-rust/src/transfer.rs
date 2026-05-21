@@ -165,6 +165,12 @@ struct HttpAttempt {
     retry_after: Option<Duration>,
     resume_from: u64,
     deferred_error: Option<CurlError>,
+    size_request: u64,
+    remote_ip: Option<String>,
+    remote_port: Option<u16>,
+    local_ip: Option<String>,
+    local_port: Option<u16>,
+    num_connects: u64,
 }
 
 #[derive(Default)]
@@ -8699,6 +8705,8 @@ async fn run_http_transfer(
             "--get cannot be combined with --upload-file".to_string(),
         ));
     }
+    metrics.size_upload =
+        http_upload_size(transfer, prepared_body.as_ref(), upload_body.as_deref());
     let mut url = Url::parse(&expanded.url).map_err(|error| CurlError::Url(error.to_string()))?;
     let path_as_is_url = transfer.path_as_is.then(|| expanded.url.clone());
     let before_upload_append_path = url.path().to_string();
@@ -8740,6 +8748,13 @@ async fn run_http_transfer(
 
     let explicit_proxy = explicit_http_proxy(transfer)?;
     let initial_connect_to = connect_to_target(transfer, &url)?;
+    record_http_endpoint_hint(
+        metrics,
+        transfer,
+        &url,
+        explicit_proxy.as_ref(),
+        initial_connect_to.as_ref(),
+    );
     let raw_custom_header_wire_semantics = needs_raw_custom_header_wire_semantics(transfer)?;
     let custom_host_header = has_custom_header(transfer, "host")?;
     let path_as_is_requires_raw = path_as_is_preservation_required(path_as_is_url.as_deref(), &url);
@@ -9413,6 +9428,11 @@ async fn run_http_transfer(
         let body = decode_http_body_if_compressed(transfer, &headers, body)?;
         metrics.size_download = body.len() as u64;
         let retry_after = retry_after_delay(&headers);
+        let size_request = estimate_http_request_size(
+            current_method.as_str(),
+            final_url.as_str(),
+            metrics.size_upload,
+        );
 
         return Ok(HttpAttempt {
             method: current_method,
@@ -9426,6 +9446,12 @@ async fn run_http_transfer(
             retry_after,
             resume_from,
             deferred_error: None,
+            size_request,
+            remote_ip: metrics.remote_ip.clone(),
+            remote_port: metrics.remote_port,
+            local_ip: metrics.local_ip.clone(),
+            local_port: metrics.local_port,
+            num_connects: metrics.num_connects,
         });
     }
 }
@@ -9667,6 +9693,7 @@ async fn run_raw_http_proxy_transfer(context: RawHttpProxyContext<'_>) -> Result
         },
     )
     .await?;
+    record_raw_http_attempt_metrics(&mut attempt, &stream, true, request.len());
     decode_http_attempt_body(context.transfer, &mut attempt)?;
     Ok(attempt)
 }
@@ -9732,6 +9759,7 @@ async fn run_raw_http_direct_transfer(
                 )
                 .await?;
             let mut attempt = raw_http_send_direct_request(&mut fresh, &request, &context).await?;
+            record_raw_http_attempt_metrics(&mut attempt, &fresh, true, request.len());
             decode_http_attempt_body(context.transfer, &mut attempt)?;
             if raw_http_direct_response_allows_reuse(reuse_allowed, &attempt) {
                 session
@@ -9742,6 +9770,7 @@ async fn run_raw_http_direct_transfer(
         }
         Err(error) => return Err(error),
     };
+    record_raw_http_attempt_metrics(&mut attempt, &stream, !reused, request.len());
     decode_http_attempt_body(context.transfer, &mut attempt)?;
     if raw_http_direct_response_allows_reuse(reuse_allowed, &attempt) {
         session
@@ -9749,6 +9778,24 @@ async fn run_raw_http_direct_transfer(
             .store_direct(context.connect_host, context.connect_port, stream);
     }
     Ok(attempt)
+}
+
+fn record_raw_http_attempt_metrics(
+    attempt: &mut HttpAttempt,
+    stream: &TcpStream,
+    opened_connection: bool,
+    request_size: usize,
+) {
+    attempt.size_request = request_size as u64;
+    attempt.num_connects = u64::from(opened_connection);
+    if let Ok(peer) = stream.peer_addr() {
+        attempt.remote_ip = Some(peer.ip().to_string());
+        attempt.remote_port = Some(peer.port());
+    }
+    if let Ok(local) = stream.local_addr() {
+        attempt.local_ip = Some(local.ip().to_string());
+        attempt.local_port = Some(local.port());
+    }
 }
 
 async fn raw_http_send_direct_request(
@@ -10295,6 +10342,12 @@ async fn raw_http_read_response(
         retry_after,
         resume_from,
         deferred_error,
+        size_request: 0,
+        remote_ip: None,
+        remote_port: None,
+        local_ip: None,
+        local_port: None,
+        num_connects: 0,
     })
 }
 
@@ -10424,6 +10477,12 @@ fn raw_http09_attempt(
         retry_after: None,
         resume_from,
         deferred_error: None,
+        size_request: 0,
+        remote_ip: None,
+        remote_port: None,
+        local_ip: None,
+        local_port: None,
+        num_connects: 0,
     })
 }
 
@@ -10748,6 +10807,98 @@ fn http_request_target(url: &Url) -> String {
     }
 }
 
+fn http_upload_size(
+    transfer: &TransferConfig,
+    prepared_body: Option<&PreparedBody>,
+    upload_body: Option<&[u8]>,
+) -> u64 {
+    if transfer.get {
+        0
+    } else if let Some(body) = upload_body {
+        body.len() as u64
+    } else if let Some(body) = prepared_body {
+        body.bytes.len() as u64
+    } else {
+        0
+    }
+}
+
+fn record_http_endpoint_hint(
+    metrics: &mut writeout::Metrics,
+    transfer: &TransferConfig,
+    url: &Url,
+    proxy: Option<&ExplicitHttpProxy>,
+    connect_to: Option<&ConnectToTarget>,
+) {
+    let endpoint = if let Some(proxy) = proxy {
+        Some((proxy.host.as_str(), proxy.port))
+    } else if let Some(connect_to) = connect_to {
+        Some((connect_to.host.as_str(), connect_to.port))
+    } else {
+        url.host_str().zip(url.port_or_known_default())
+    };
+    let Some((host, port)) = endpoint else {
+        return;
+    };
+    metrics.remote_port = Some(port);
+    metrics.remote_ip = infer_remote_ip(transfer, host, port);
+}
+
+fn infer_remote_ip(transfer: &TransferConfig, host: &str, port: u16) -> Option<String> {
+    if let Some(ip) = parse_ip_literal(host) {
+        return Some(ip.to_string());
+    }
+
+    for entry in &transfer.resolve {
+        let Ok(Some((entry_host, addresses))) = parse_resolve_entry(entry) else {
+            continue;
+        };
+        if !entry_host.eq_ignore_ascii_case(trim_ip_brackets(host)) {
+            continue;
+        }
+        if let Some(address) = addresses.into_iter().find(|address| {
+            address.port() == port && socket_addr_matches_ip_version(address, transfer.ip_version)
+        }) {
+            return Some(address.ip().to_string());
+        }
+    }
+    None
+}
+
+fn estimate_http_request_size(method: &str, url: &str, size_upload: u64) -> u64 {
+    let Ok(url) = Url::parse(url) else {
+        return size_upload.max(1);
+    };
+    let host = http_host_header(&url);
+    let mut size = method.len()
+        + 1
+        + http_request_target(&url).len()
+        + " HTTP/1.1\r\n".len()
+        + "Host: ".len()
+        + host.len()
+        + "\r\n".len()
+        + "User-Agent: ".len()
+        + default_user_agent().len()
+        + "\r\n".len()
+        + "Accept: */*\r\n".len()
+        + "\r\n".len();
+    if size_upload > 0 {
+        size += "Content-Length: ".len() + size_upload.to_string().len() + "\r\n".len();
+    }
+    (size as u64).max(size_upload)
+}
+
+fn http_version_writeout(version: Version) -> &'static str {
+    match version {
+        Version::HTTP_09 => "0.9",
+        Version::HTTP_10 => "1.0",
+        Version::HTTP_11 => "1.1",
+        Version::HTTP_2 => "2",
+        Version::HTTP_3 => "3",
+        _ => "",
+    }
+}
+
 fn path_as_is_preservation_required(raw_url: Option<&str>, url: &Url) -> bool {
     raw_url.is_some_and(|raw_url| {
         http_request_target_path_as_is(raw_url, url) != http_request_target(url)
@@ -10893,12 +11044,22 @@ async fn run_http_with_retries(
 fn reset_attempt_metrics(metrics: &mut writeout::Metrics) {
     metrics.response_code = None;
     metrics.size_download = 0;
+    metrics.size_delivered = 0;
+    metrics.size_header = 0;
+    metrics.size_request = 0;
     metrics.content_type = None;
     metrics.filename_effective = None;
     metrics.exit_code = 0;
     metrics.errormsg.clear();
     metrics.redirect_url = None;
     metrics.referer = None;
+    metrics.http_version = None;
+    metrics.remote_ip = None;
+    metrics.remote_port = None;
+    metrics.local_ip = None;
+    metrics.local_port = None;
+    metrics.num_connects = 0;
+    metrics.num_redirects = 0;
     metrics.headers = reqwest::header::HeaderMap::new();
 }
 
@@ -11060,6 +11221,7 @@ fn write_http_attempt_output(
     append_output: bool,
 ) -> Result<HttpAttemptWrite> {
     let header_bytes = http_attempt_header_bytes(attempt);
+    record_http_attempt_metrics(metrics, method, attempt, header_bytes.len() as u64);
     if persist_headers && let Some(path) = &transfer.dump_header {
         output::append_dump_headers(path, &header_bytes, transfer.create_dirs)?;
     }
@@ -11121,6 +11283,39 @@ fn write_http_attempt_output(
         output_bytes,
         output_path,
     })
+}
+
+fn record_http_attempt_metrics(
+    metrics: &mut writeout::Metrics,
+    method: &Method,
+    attempt: &HttpAttempt,
+    header_size: u64,
+) {
+    metrics.http_version = Some(http_version_writeout(attempt.version).to_string());
+    metrics.size_header = header_size;
+    metrics.size_request = if attempt.size_request > 0 {
+        attempt.size_request
+    } else {
+        estimate_http_request_size(
+            method.as_str(),
+            attempt.final_url.as_str(),
+            metrics.size_upload,
+        )
+    };
+    metrics.num_redirects = attempt.redirects.len();
+    metrics.num_connects = attempt.num_connects;
+    if attempt.remote_ip.is_some() {
+        metrics.remote_ip = attempt.remote_ip.clone();
+    }
+    if attempt.remote_port.is_some() {
+        metrics.remote_port = attempt.remote_port;
+    }
+    if attempt.local_ip.is_some() {
+        metrics.local_ip = attempt.local_ip.clone();
+    }
+    if attempt.local_port.is_some() {
+        metrics.local_port = attempt.local_port;
+    }
 }
 
 fn http_attempt_header_bytes(attempt: &HttpAttempt) -> Vec<u8> {
