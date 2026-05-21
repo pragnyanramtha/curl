@@ -1917,6 +1917,35 @@ fn spawn_mqtt_subscribe_server(topic: Vec<u8>, payload: Vec<u8>) -> (String, Rec
     (format!("mqtt://{addr}/sensor"), rx)
 }
 
+fn spawn_mqtt_short_publish_server() -> (String, Receiver<MqttRecord>) {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = listener.local_addr().unwrap();
+    let (tx, rx) = mpsc::channel();
+
+    thread::spawn(move || {
+        let (mut stream, _) = listener.accept().unwrap();
+        let (connect_type, connect) = read_mqtt_frame(&mut stream);
+        assert_eq!(connect_type, 0x10);
+        stream.write_all(&mqtt_connack(0)).unwrap();
+
+        let (subscribe_type, subscribe) = read_mqtt_frame(&mut stream);
+        assert_eq!(subscribe_type, 0x82);
+        let mut publish = mqtt_publish(b"sensor", b"hello\n");
+        publish.pop();
+        stream.write_all(&publish).unwrap();
+
+        tx.send(MqttRecord {
+            connect,
+            subscribe: Some(subscribe),
+            publish: None,
+            disconnect: None,
+        })
+        .unwrap();
+    });
+
+    (format!("mqtt://{addr}/sensor"), rx)
+}
+
 fn spawn_mqtt_publish_server() -> (String, Receiver<MqttRecord>) {
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let addr = listener.local_addr().unwrap();
@@ -1955,6 +1984,29 @@ fn spawn_mqtt_connack_server(code: u8) -> (String, Receiver<MqttRecord>) {
         let (connect_type, connect) = read_mqtt_frame(&mut stream);
         assert_eq!(connect_type, 0x10);
         stream.write_all(&mqtt_connack(code)).unwrap();
+
+        tx.send(MqttRecord {
+            connect,
+            subscribe: None,
+            publish: None,
+            disconnect: None,
+        })
+        .unwrap();
+    });
+
+    (format!("mqtt://{addr}/sensor"), rx)
+}
+
+fn spawn_mqtt_connect_response_server(response: Vec<u8>) -> (String, Receiver<MqttRecord>) {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = listener.local_addr().unwrap();
+    let (tx, rx) = mpsc::channel();
+
+    thread::spawn(move || {
+        let (mut stream, _) = listener.accept().unwrap();
+        let (connect_type, connect) = read_mqtt_frame(&mut stream);
+        assert_eq!(connect_type, 0x10);
+        stream.write_all(&response).unwrap();
 
         tx.send(MqttRecord {
             connect,
@@ -8457,6 +8509,25 @@ fn mqtt_subscribe_outputs_publish_packet_and_sends_subscribe() {
 }
 
 #[test]
+fn mqtt_short_publish_returns_partial_file() {
+    let (url, rx) = spawn_mqtt_short_publish_server();
+
+    let mut command = Command::cargo_bin("curl").unwrap();
+    command.args(["-q", "-sS", &url]);
+    command
+        .assert()
+        .failure()
+        .code(18)
+        .stdout(b"\0\x06sensorhello" as &[u8])
+        .stderr("curl: (18) transferred a partial file\n");
+
+    assert_eq!(
+        rx.recv().unwrap().subscribe,
+        Some(b"\0\x01\0\x06sensor\0".to_vec())
+    );
+}
+
+#[test]
 fn mqtt_publish_sends_data_payload_and_disconnects() {
     let (url, rx) = spawn_mqtt_publish_server();
 
@@ -8527,6 +8598,34 @@ fn mqtt_connack_error_returns_weird_server_reply() {
     let mut command = Command::cargo_bin("curl").unwrap();
     command.args(["-q", "-sS", &url]);
     command.assert().failure().code(8).stdout("");
+
+    assert_eq!(
+        rx.recv().unwrap().connect,
+        b"\0\x04MQTT\x04\x02\0\x3c\0\x0ccurlrust0000"
+    );
+}
+
+#[test]
+fn mqtt_connack_bad_remaining_length_returns_weird_server_reply() {
+    let (url, rx) = spawn_mqtt_connect_response_server(vec![0x20, 0x03, 0x00, 0x00]);
+
+    let mut command = Command::cargo_bin("curl").unwrap();
+    command.args(["-q", "-sS", &url]);
+    command.assert().failure().code(8).stdout("");
+
+    assert_eq!(
+        rx.recv().unwrap().connect,
+        b"\0\x04MQTT\x04\x02\0\x3c\0\x0ccurlrust0000"
+    );
+}
+
+#[test]
+fn mqtt_connack_short_body_returns_recv_error() {
+    let (url, rx) = spawn_mqtt_connect_response_server(vec![0x20, 0x02, 0x00]);
+
+    let mut command = Command::cargo_bin("curl").unwrap();
+    command.args(["-q", "-sS", &url]);
+    command.assert().failure().code(56).stdout("");
 
     assert_eq!(
         rx.recv().unwrap().connect,

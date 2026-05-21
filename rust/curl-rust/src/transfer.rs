@@ -4913,7 +4913,7 @@ async fn run_mqtt_transfer(
         .write_all(&mqtt_subscribe_packet(&topic)?)
         .await
         .map_err(tcp_io_error)?;
-    let body = mqtt_read_subscribe_body(&mut stream, transfer).await?;
+    let (body, deferred_error) = mqtt_read_subscribe_body(&mut stream, transfer).await?;
     metrics.size_download = body.len() as u64;
     let filename = output::write_response(
         transfer,
@@ -4924,12 +4924,19 @@ async fn run_mqtt_transfer(
         false,
     )?;
     metrics.filename_effective = filename.map(|path| path.display().to_string());
+    if let Some(error) = deferred_error {
+        return Err(error);
+    }
     Ok(())
 }
 
 async fn mqtt_expect_connack(stream: &mut TcpStream) -> Result<()> {
-    let packet = mqtt_read_packet(stream).await?;
-    if packet.packet_type != MQTT_CONNACK || packet.remaining_len != 2 || packet.body != [0, 0] {
+    let header = mqtt_read_packet_header(stream).await?;
+    if header.packet_type != MQTT_CONNACK || header.remaining_len != 2 {
+        return Err(CurlError::WeirdServerReply);
+    }
+    let body = mqtt_read_packet_body(stream, header.remaining_len).await?;
+    if body != [0, 0] {
         return Err(CurlError::WeirdServerReply);
     }
     Ok(())
@@ -4938,7 +4945,7 @@ async fn mqtt_expect_connack(stream: &mut TcpStream) -> Result<()> {
 async fn mqtt_read_subscribe_body(
     stream: &mut TcpStream,
     transfer: &TransferConfig,
-) -> Result<Vec<u8>> {
+) -> Result<(Vec<u8>, Option<CurlError>)> {
     let mut body = Vec::new();
     let mut saw_suback = false;
 
@@ -4958,8 +4965,12 @@ async fn mqtt_read_subscribe_body(
                 {
                     return Err(CurlError::FileSizeExceeded);
                 }
-                let packet_body = mqtt_read_packet_body(stream, header.remaining_len).await?;
+                let (packet_body, partial) =
+                    mqtt_read_publish_body(stream, header.remaining_len).await?;
                 body.extend_from_slice(&packet_body);
+                if partial {
+                    return Ok((body, Some(CurlError::PartialFile)));
+                }
             }
             MQTT_DISCONNECT => {
                 if header.remaining_len != 0 || (header.packet_type & 0x0f) != 0 {
@@ -4979,7 +4990,7 @@ async fn mqtt_read_subscribe_body(
     if !saw_suback {
         return Err(CurlError::WeirdServerReply);
     }
-    Ok(body)
+    Ok((body, None))
 }
 
 async fn run_rtsp_transfer(
@@ -8367,12 +8378,6 @@ fn validate_tftp_initial_request_size(packet: &[u8]) -> Result<()> {
     Ok(())
 }
 
-struct MqttPacket {
-    packet_type: u8,
-    remaining_len: usize,
-    body: Vec<u8>,
-}
-
 struct MqttPacketHeader {
     packet_type: u8,
     remaining_len: usize,
@@ -8456,25 +8461,21 @@ fn mqtt_encode_remaining_len(mut len: usize, output: &mut Vec<u8>) -> Result<()>
     }
 }
 
-async fn mqtt_read_packet(stream: &mut TcpStream) -> Result<MqttPacket> {
-    let header = mqtt_read_packet_header(stream).await?;
-    let body = mqtt_read_packet_body(stream, header.remaining_len).await?;
-    Ok(MqttPacket {
-        packet_type: header.packet_type,
-        remaining_len: header.remaining_len,
-        body,
-    })
-}
-
 async fn mqtt_read_packet_header(stream: &mut TcpStream) -> Result<MqttPacketHeader> {
     let mut first = [0; 1];
-    stream.read_exact(&mut first).await.map_err(tcp_io_error)?;
+    stream
+        .read_exact(&mut first)
+        .await
+        .map_err(mqtt_recv_error)?;
 
     let mut multiplier = 1_usize;
     let mut remaining_len = 0_usize;
     for _ in 0..4 {
         let mut byte = [0; 1];
-        stream.read_exact(&mut byte).await.map_err(tcp_io_error)?;
+        stream
+            .read_exact(&mut byte)
+            .await
+            .map_err(mqtt_recv_error)?;
         remaining_len += usize::from(byte[0] & 127) * multiplier;
         if byte[0] & 128 == 0 {
             return Ok(MqttPacketHeader {
@@ -8491,9 +8492,40 @@ async fn mqtt_read_packet_header(stream: &mut TcpStream) -> Result<MqttPacketHea
 async fn mqtt_read_packet_body(stream: &mut TcpStream, remaining_len: usize) -> Result<Vec<u8>> {
     let mut body = vec![0; remaining_len];
     if remaining_len > 0 {
-        stream.read_exact(&mut body).await.map_err(tcp_io_error)?;
+        stream
+            .read_exact(&mut body)
+            .await
+            .map_err(mqtt_recv_error)?;
     }
     Ok(body)
+}
+
+fn mqtt_recv_error(error: io::Error) -> CurlError {
+    if error.kind() == io::ErrorKind::UnexpectedEof {
+        CurlError::RecvError
+    } else {
+        tcp_io_error(error)
+    }
+}
+
+async fn mqtt_read_publish_body(
+    stream: &mut TcpStream,
+    remaining_len: usize,
+) -> Result<(Vec<u8>, bool)> {
+    let mut body = Vec::with_capacity(remaining_len);
+    let mut scratch = [0; 8192];
+
+    while body.len() < remaining_len {
+        let remaining = remaining_len - body.len();
+        let read_len = remaining.min(scratch.len());
+        match stream.read(&mut scratch[..read_len]).await {
+            Ok(0) => return Ok((body, true)),
+            Ok(read) => body.extend_from_slice(&scratch[..read]),
+            Err(error) if error.kind() == io::ErrorKind::Interrupted => {}
+            Err(error) => return Err(tcp_io_error(error)),
+        }
+    }
+    Ok((body, false))
 }
 
 fn mqtt_topic_from_url(url: &Url) -> Result<Vec<u8>> {
