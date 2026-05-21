@@ -3,6 +3,7 @@ pub mod data;
 pub mod error;
 pub mod glob;
 pub mod output;
+pub mod trace;
 pub mod transfer;
 pub mod writeout;
 

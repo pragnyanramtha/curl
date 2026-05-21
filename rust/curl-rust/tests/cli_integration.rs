@@ -2858,6 +2858,63 @@ fn extra_output_slots_emit_warning() {
 }
 
 #[test]
+fn trace_ascii_file_url_writes_trace_file() {
+    let temp = tempdir().unwrap();
+    let input = temp.path().join("input.txt");
+    let trace = temp.path().join("trace");
+    std::fs::write(&input, "hello\n").unwrap();
+    let url = Url::from_file_path(&input).unwrap().to_string();
+
+    let mut command = Command::cargo_bin("curl").unwrap();
+    command.args(["-q", "--trace-ascii", trace.to_str().unwrap(), "-sS", &url]);
+    command.assert().success().stdout("hello\n").stderr("");
+
+    let trace = std::fs::read_to_string(trace).unwrap();
+    assert!(trace.contains("<= Recv header, "));
+    assert!(trace.contains("<= Recv data, 6 bytes (0x6)"));
+    assert!(trace.contains("0000: hello"));
+}
+
+#[test]
+fn trace_ascii_http_get_writes_trace_file() {
+    let temp = tempdir().unwrap();
+    let trace = temp.path().join("trace");
+    let (url, rx) =
+        spawn_server(b"HTTP/1.1 200 OK\r\nX-Test: yes\r\nContent-Length: 6\r\n\r\n-foo-\n");
+
+    let mut command = Command::cargo_bin("curl").unwrap();
+    command.args(["-q", "--trace-ascii", trace.to_str().unwrap(), "-sS", &url]);
+    command.assert().success().stdout("-foo-\n").stderr("");
+
+    let request = rx.recv().unwrap();
+    assert_eq!(request.start_line, "GET /resource HTTP/1.1");
+
+    let trace = std::fs::read_to_string(trace).unwrap();
+    assert!(trace.contains("=> Send header, "));
+    assert!(trace.contains("0000: GET /resource HTTP/1.1"));
+    assert!(trace.contains("<= Recv header, "));
+    assert!(trace.contains("0000: HTTP/1.1 200 OK"));
+    assert!(trace.contains("<= Recv data, 6 bytes (0x6)"));
+    assert!(trace.contains("0000: -foo-"));
+}
+
+#[test]
+fn trace_ascii_percent_writes_to_stderr() {
+    let temp = tempdir().unwrap();
+    let input = temp.path().join("input.txt");
+    std::fs::write(&input, "hello\n").unwrap();
+    let url = Url::from_file_path(&input).unwrap().to_string();
+
+    let mut command = Command::cargo_bin("curl").unwrap();
+    command.args(["-q", "--trace-ascii", "%", "-sS", &url]);
+    command
+        .assert()
+        .success()
+        .stdout("hello\n")
+        .stderr(predicates::str::contains("<= Recv data, 6 bytes (0x6)"));
+}
+
+#[test]
 fn skip_existing_existing_output_skips_http_transfer() {
     let temp = tempdir().unwrap();
     let output = temp.path().join("there");

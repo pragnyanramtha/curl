@@ -26,6 +26,7 @@ EXTRA_DIST =                                      \
   curl-rust/src/libcurl.rs                       \
   curl-rust/src/main.rs                          \
   curl-rust/src/output.rs                        \
+  curl-rust/src/trace.rs                         \
   curl-rust/src/transfer.rs                      \
   curl-rust/src/writeout.rs                      \
   curl-rust/tests/cli_integration.rs

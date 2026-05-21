@@ -38,7 +38,7 @@ use crate::cli::{
 use crate::cookie::CookieJar;
 use crate::data::{self, PreparedBody};
 use crate::error::{CurlError, Result, ResultExt};
-use crate::{glob, ipfs, output, writeout};
+use crate::{glob, ipfs, output, trace, writeout};
 
 const TELNET_IAC: u8 = 255;
 const TELNET_DONT: u8 = 254;
@@ -262,6 +262,7 @@ pub async fn run(config: Config) -> Result<i32> {
         return run_parallel(config).await;
     }
 
+    trace::prepare_trace_outputs(&config.transfers)?;
     let mut final_code = 0;
 
     for transfer in &config.transfers {
@@ -321,6 +322,7 @@ struct CookieSave {
 }
 
 async fn run_parallel(config: Config) -> Result<i32> {
+    trace::prepare_trace_outputs(&config.transfers)?;
     let (jobs, cookie_saves) = parallel_jobs(&config)?;
     let mut results = vec![0; jobs.len()];
     let mut pending = jobs.into_iter();
@@ -1292,6 +1294,10 @@ async fn run_file_transfer(
     let header_bytes = output::render_file_headers(&headers);
     if let Some(path) = &transfer.dump_header {
         output::dump_headers(path, &header_bytes, transfer.create_dirs)?;
+    }
+    trace::dump(transfer, trace::TraceEvent::RecvHeader, &header_bytes)?;
+    if method != "HEAD" {
+        trace::dump(transfer, trace::TraceEvent::RecvData, body_bytes)?;
     }
     metrics.url_effective = expanded.url.clone();
     metrics.response_code = Some(200);
@@ -9831,6 +9837,7 @@ async fn run_http_transfer(
             || raw_http_default_get_version_wire_semantics(transfer, &method)
             || raw_http_time_condition_wire_semantics(transfer, &method)
             || method == Method::HEAD
+            || transfer.trace.is_some()
             || (method != Method::HEAD && max_filesize_limit(transfer).is_some()))
     {
         let attempt = run_raw_http_direct_transfer(
@@ -10389,6 +10396,7 @@ async fn run_raw_http_proxy_transfer(context: RawHttpProxyContext<'_>) -> Result
         context.transfer,
     )
     .await?;
+    trace::dump_http_request(context.transfer, &request)?;
     stream.write_all(&request).await.map_err(tcp_io_error)?;
     let mut attempt = raw_http_read_response(
         &mut stream,
@@ -10604,6 +10612,7 @@ async fn raw_http_send_direct_request(
     request: &[u8],
     context: &RawHttpDirectContext<'_>,
 ) -> Result<HttpAttempt> {
+    trace::dump_http_request(context.transfer, request)?;
     stream.write_all(request).await.map_err(tcp_io_error)?;
     raw_http_read_response(
         stream,
@@ -11147,6 +11156,7 @@ async fn raw_http_read_response(
         }
     }
 
+    trace::dump(transfer, trace::TraceEvent::RecvHeader, &header_bytes)?;
     let (version, status, headers) = parse_raw_http_headers(&header_bytes)?;
     validate_redirect_location_headers(&headers)?;
     let retry_after = retry_after_delay(&headers);
@@ -11186,6 +11196,9 @@ async fn raw_http_read_response(
         rate_limited_read_to_end(stream, &mut body, rate_limiter.as_mut()).await?;
         body
     };
+    if !body.is_empty() {
+        trace::dump(transfer, trace::TraceEvent::RecvData, &body)?;
+    }
 
     Ok(HttpAttempt {
         method: method.clone(),

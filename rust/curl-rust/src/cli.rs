@@ -21,12 +21,29 @@ pub struct Config {
     pub show_manual: bool,
     pub show_version: bool,
     pub libcurl: Option<PathBuf>,
+    pub trace: Option<TraceConfig>,
+    pub trace_time: bool,
+    pub trace_ids: bool,
     pub parallel: bool,
     pub parallel_immediate: bool,
     pub parallel_max: usize,
     pub parallel_max_host: usize,
     pub fail_early: bool,
     pub transfers: Vec<TransferConfig>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TraceConfig {
+    pub mode: TraceMode,
+    pub target: String,
+    pub time: bool,
+    pub ids: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TraceMode {
+    Binary,
+    Ascii,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -141,6 +158,7 @@ pub struct TransferConfig {
     pub compressed: bool,
     pub tr_encoding: bool,
     pub raw: bool,
+    pub trace: Option<TraceConfig>,
     pub trace_output: bool,
     pub verbose: bool,
     pub silent: bool,
@@ -508,6 +526,9 @@ impl Default for Config {
             show_manual: false,
             show_version: false,
             libcurl: None,
+            trace: None,
+            trace_time: false,
+            trace_ids: false,
             parallel: false,
             parallel_immediate: false,
             parallel_max: PARALLEL_DEFAULT,
@@ -631,6 +652,7 @@ impl Default for TransferConfig {
             compressed: false,
             tr_encoding: false,
             raw: false,
+            trace: None,
             trace_output: false,
             verbose: false,
             silent: false,
@@ -701,6 +723,7 @@ impl Parser {
             }
         }
 
+        self.apply_global_trace();
         self.config.transfers.retain(TransferConfig::has_options);
 
         if self.config.transfers.is_empty()
@@ -723,6 +746,19 @@ impl Parser {
         }
 
         Ok(std::mem::take(&mut self.config))
+    }
+
+    fn apply_global_trace(&mut self) {
+        let Some(mut trace) = self.config.trace.clone() else {
+            return;
+        };
+        trace.time = self.config.trace_time;
+        trace.ids = self.config.trace_ids;
+        self.config.trace = Some(trace.clone());
+        for transfer in &mut self.config.transfers {
+            transfer.trace = Some(trace.clone());
+            transfer.trace_output = true;
+        }
     }
 
     fn parse_long(&mut self, raw: &str) -> Result<()> {
@@ -1189,7 +1225,18 @@ impl Parser {
             "raw" => self.current().raw = true,
             "verbose" => self.current().verbose = true,
             "trace" | "trace-ascii" => {
-                let _ = self.value_for(name, inline_value)?;
+                let value = self.value_for(name, inline_value)?;
+                let target = parse_nonempty_string(name, value)?;
+                self.config.trace = Some(TraceConfig {
+                    mode: if name == "trace" {
+                        TraceMode::Binary
+                    } else {
+                        TraceMode::Ascii
+                    },
+                    target,
+                    time: self.config.trace_time,
+                    ids: self.config.trace_ids,
+                });
                 self.current().trace_output = true;
             }
             "trace-time" => {
@@ -1198,6 +1245,7 @@ impl Parser {
                         "option --trace-time does not take a value".to_string(),
                     ));
                 }
+                self.config.trace_time = true;
             }
             "trace-ids" => {
                 if inline_value.is_some() {
@@ -1205,6 +1253,7 @@ impl Parser {
                         "option --trace-ids does not take a value".to_string(),
                     ));
                 }
+                self.config.trace_ids = true;
             }
             "trace-config" => {
                 let _ = self.value_for(name, inline_value)?;
@@ -1336,7 +1385,8 @@ impl Parser {
             "raw" => self.current().raw = false,
             "ignore-content-length" => self.current().ignore_content_length = false,
             "verbose" => self.current().verbose = false,
-            "trace-ids" => {}
+            "trace-ids" => self.config.trace_ids = false,
+            "trace-time" => self.config.trace_time = false,
             "progress-meter" => self.current().silent = true,
             "silent" => self.current().silent = false,
             "show-error" => self.current().show_error = false,
@@ -2064,6 +2114,7 @@ impl TransferConfig {
             || self.compressed
             || self.tr_encoding
             || self.raw
+            || self.trace.is_some()
             || self.trace_output
             || self.verbose
             || self.silent
@@ -3939,6 +3990,41 @@ mod tests {
         let transfer = &config.transfers[0];
         assert_eq!(transfer.urls, ["file:///tmp/input"]);
         assert!(transfer.trace_output);
+        assert_eq!(
+            transfer.trace,
+            Some(TraceConfig {
+                mode: TraceMode::Ascii,
+                target: "log/trace1".to_string(),
+                time: true,
+                ids: true,
+            })
+        );
+    }
+
+    #[test]
+    fn parses_no_trace_time_and_no_trace_ids() {
+        let config = parse_args([
+            "-q",
+            "--trace-time",
+            "--trace-ids",
+            "--no-trace-time",
+            "--no-trace-ids",
+            "--trace-ascii",
+            "log/trace1",
+            "file:///tmp/input",
+        ])
+        .unwrap();
+
+        let transfer = &config.transfers[0];
+        assert_eq!(
+            transfer.trace,
+            Some(TraceConfig {
+                mode: TraceMode::Ascii,
+                target: "log/trace1".to_string(),
+                time: false,
+                ids: false,
+            })
+        );
     }
 
     #[test]
