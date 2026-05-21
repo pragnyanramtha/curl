@@ -464,3 +464,32 @@ if(CURL_BUILD_TESTING AND PERL_EXECUTABLE)
     VERBATIM USES_TERMINAL
   )
 endif()
+
+if(CURL_BUILD_TESTING AND TARGET curlinfo AND TARGET libtests AND TARGET build-certs)
+  set(_curl_rust_pytest_deps
+    curl-rust
+    curlinfo
+    libtests
+    build-certs
+  )
+
+  add_custom_target(curl-rust-pytest
+    COMMAND ${CMAKE_COMMAND} -E env
+      "CURL=${_curl_rust_sidecar}"
+      pytest -n auto "${PROJECT_SOURCE_DIR}/tests/http"
+    DEPENDS ${_curl_rust_pytest_deps}
+    WORKING_DIRECTORY "${PROJECT_BINARY_DIR}/tests"
+    COMMENT "Running HTTP pytest suite with Rust sidecar"
+    VERBATIM USES_TERMINAL
+  )
+
+  add_custom_target(curl-rust-pytest-ci
+    COMMAND ${CMAKE_COMMAND} -E env
+      "CURL=${_curl_rust_sidecar}"
+      pytest -n auto -v "${PROJECT_SOURCE_DIR}/tests/http"
+    DEPENDS ${_curl_rust_pytest_deps}
+    WORKING_DIRECTORY "${PROJECT_BINARY_DIR}/tests"
+    COMMENT "Running HTTP pytest CI suite with Rust sidecar"
+    VERBATIM USES_TERMINAL
+  )
+endif()

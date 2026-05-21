@@ -58,7 +58,16 @@ rust-corpus-test: rust-curl rust-testdeps
 	    -n -a -s -p -c "$(RUST_CURL_SIDECAR)" \
 	    $(RUST_CURL_CORPUS_TESTS) $(TFLAGS))
 
+rust-pytestdeps:
+	$(MAKE) -C "$(abs_top_builddir)/src" curlinfo$(EXEEXT)
+
+rust-pytest: rust-curl rust-pytestdeps
+	CURL="$(RUST_CURL_SIDECAR)" $(MAKE) -C "$(abs_top_builddir)/tests" default-pytest
+
+rust-pytest-ci: rust-curl rust-pytestdeps
+	CURL="$(RUST_CURL_SIDECAR)" $(MAKE) -C "$(abs_top_builddir)/tests" ci-pytest
+
 clean-local:
 	rm -rf "$(RUST_CARGO_TARGET_DIR)" "$(abs_builddir)/bin"
 
-.PHONY: rust-curl rust-test rust-testdeps rust-corpus-test
+.PHONY: rust-curl rust-test rust-testdeps rust-corpus-test rust-pytestdeps rust-pytest rust-pytest-ci
