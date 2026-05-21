@@ -7,7 +7,7 @@ use url::Url;
 
 use crate::cli::{
     Config, ContinueAt, FtpFileMethod, HttpVersionPreference, IpVersionPreference, ProtocolSet,
-    SslVersionMaxPreference, SslVersionPreference, TransferConfig,
+    ProxyVersionPreference, SslVersionMaxPreference, SslVersionPreference, TransferConfig,
 };
 use crate::data::{self, PreparedBody};
 use crate::error::{CurlError, Result};
@@ -435,6 +435,9 @@ fn write_request(out: &mut String, render: &RenderTransfer<'_>, url: &str) -> Re
     }
     if let Some(proxy) = &transfer.proxy {
         emit_string_setopt(out, "CURLOPT_PROXY", proxy);
+    }
+    if transfer.proxy_version == ProxyVersionPreference::Http10 {
+        emit_raw_setopt(out, "CURLOPT_PROXYTYPE", "CURLPROXY_HTTP_1_0");
     }
     if transfer.proxytunnel {
         emit_long_setopt(out, "CURLOPT_HTTPPROXYTUNNEL", 1);
@@ -965,6 +968,24 @@ mod tests {
         assert!(source.contains("CURLOPT_SUPPRESS_CONNECT_HEADERS, 1L"));
         assert!(source.contains("CURLOPT_NOPROXY, \"localhost\""));
         assert!(source.contains("CURLOPT_USERAGENT, \"MyUA\""));
+    }
+
+    #[test]
+    fn renders_proxy10_type_option() {
+        let config = parse_args([
+            "-q",
+            "--libcurl",
+            "client.c",
+            "--proxy1.0",
+            "proxy.example:8080",
+            "https://example.com",
+        ])
+        .unwrap();
+
+        let source = render_source(&config).unwrap();
+
+        assert!(source.contains("CURLOPT_PROXY, \"proxy.example:8080\""));
+        assert!(source.contains("CURLOPT_PROXYTYPE, CURLPROXY_HTTP_1_0"));
     }
 
     #[test]

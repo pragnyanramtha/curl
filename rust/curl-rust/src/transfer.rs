@@ -26,8 +26,8 @@ use reqwest::{Client, Method, StatusCode, Url, Version};
 
 use crate::cli::{
     Config, ContinueAt, FtpFileMethod, HttpVersionPreference, IpVersionPreference, LocalPortRange,
-    OutputTarget, SslVersionMaxPreference, SslVersionPreference, TransferConfig,
-    parse_curl_time_condition_date,
+    OutputTarget, ProxyVersionPreference, SslVersionMaxPreference, SslVersionPreference,
+    TransferConfig, parse_curl_time_condition_date,
 };
 use crate::cookie::CookieJar;
 use crate::data::{self, PreparedBody};
@@ -93,6 +93,7 @@ const MQTT_DISCONNECT: u8 = 0xe0;
 struct ExplicitHttpProxy {
     host: String,
     port: u16,
+    version: ProxyVersionPreference,
     authorization: Option<String>,
 }
 
@@ -10040,6 +10041,7 @@ fn explicit_http_proxy(transfer: &TransferConfig) -> Result<Option<ExplicitHttpP
     Ok(Some(ExplicitHttpProxy {
         host,
         port,
+        version: transfer.proxy_version,
         authorization,
     }))
 }
@@ -10167,10 +10169,15 @@ fn raw_http_tunnel_endpoint<'a>(context: &'a RawHttpProxyContext<'a>) -> Result<
         return Ok((connect_to.host.as_str(), connect_to.port));
     }
 
-    let connect_host = context
-        .url
-        .host_str()
-        .ok_or_else(|| CurlError::Url("URL is missing a host".to_string()))?;
+    let connect_host = context.host_override.map_or_else(
+        || {
+            context
+                .url
+                .host_str()
+                .ok_or_else(|| CurlError::Url("URL is missing a host".to_string()))
+        },
+        Ok,
+    )?;
     let connect_port = context
         .url
         .port_or_known_default()
@@ -10371,6 +10378,24 @@ fn raw_http_direct_request(context: &RawHttpDirectContext<'_>) -> Result<Vec<u8>
         &parsed_headers,
         context.custom_host_allowed,
     );
+    if context.sensitive_headers_allowed
+        && let Some(token) = &context.transfer.oauth2_bearer
+        && !has_header("authorization")
+    {
+        request.extend_from_slice(format!("Authorization: Bearer {token}\r\n").as_bytes());
+    } else if context.sensitive_headers_allowed
+        && let Some(user) = &context.transfer.user
+        && context.transfer.oauth2_bearer.is_none()
+        && !has_header("authorization")
+    {
+        request.extend_from_slice(
+            format!(
+                "Authorization: Basic {}\r\n",
+                base64_padded(user.as_bytes())
+            )
+            .as_bytes(),
+        );
+    }
     append_raw_http_range_header(
         &mut request,
         context.transfer,
@@ -10400,24 +10425,6 @@ fn raw_http_direct_request(context: &RawHttpDirectContext<'_>) -> Result<Vec<u8>
         && !has_header("cookie")
     {
         request.extend_from_slice(format!("Cookie: {cookie}\r\n").as_bytes());
-    }
-    if context.sensitive_headers_allowed
-        && let Some(token) = &context.transfer.oauth2_bearer
-        && !has_header("authorization")
-    {
-        request.extend_from_slice(format!("Authorization: Bearer {token}\r\n").as_bytes());
-    } else if context.sensitive_headers_allowed
-        && let Some(user) = &context.transfer.user
-        && context.transfer.oauth2_bearer.is_none()
-        && !has_header("authorization")
-    {
-        request.extend_from_slice(
-            format!(
-                "Authorization: Basic {}\r\n",
-                base64_padded(user.as_bytes())
-            )
-            .as_bytes(),
-        );
     }
     if let Some(path) = &context.transfer.etag_compare
         && !has_header("if-none-match")
@@ -10491,7 +10498,7 @@ fn raw_http_proxy_connect_request(context: &RawHttpProxyContext<'_>) -> Result<V
     let has_proxy_header = |name: &str| raw_headers_contain(&parsed_proxy_headers, name);
     let (connect_host, connect_port) = raw_http_tunnel_endpoint(context)?;
     let authority = http_connect_authority_from_parts(connect_host, connect_port);
-    let version = raw_http_request_version(context.transfer);
+    let version = raw_http_proxy_connect_version(context.proxy);
     let mut request = Vec::new();
     request.extend_from_slice(format!("CONNECT {authority} {version}\r\n").as_bytes());
     if !has_proxy_header("host") {
@@ -10520,6 +10527,13 @@ fn raw_http_proxy_connect_request(context: &RawHttpProxyContext<'_>) -> Result<V
     }
     request.extend_from_slice(b"\r\n");
     Ok(request)
+}
+
+fn raw_http_proxy_connect_version(proxy: &ExplicitHttpProxy) -> &'static str {
+    match proxy.version {
+        ProxyVersionPreference::Http10 => "HTTP/1.0",
+        ProxyVersionPreference::Http11 => "HTTP/1.1",
+    }
 }
 
 fn raw_http_proxy_request(context: &RawHttpProxyContext<'_>) -> Result<Vec<u8>> {
@@ -10553,17 +10567,35 @@ fn raw_http_proxy_request(context: &RawHttpProxyContext<'_>) -> Result<Vec<u8>> 
         &parsed_headers,
         context.custom_host_allowed,
     );
+    if let Some(authorization) = &context.proxy.authorization
+        && !has_proxy_header("proxy-authorization")
+    {
+        request.extend_from_slice(format!("Proxy-Authorization: {authorization}\r\n").as_bytes());
+    }
+    if context.sensitive_headers_allowed
+        && let Some(token) = &context.transfer.oauth2_bearer
+        && !has_header("authorization")
+    {
+        request.extend_from_slice(format!("Authorization: Bearer {token}\r\n").as_bytes());
+    } else if context.sensitive_headers_allowed
+        && let Some(user) = &context.transfer.user
+        && context.transfer.oauth2_bearer.is_none()
+        && !has_header("authorization")
+    {
+        request.extend_from_slice(
+            format!(
+                "Authorization: Basic {}\r\n",
+                base64_padded(user.as_bytes())
+            )
+            .as_bytes(),
+        );
+    }
     append_raw_http_range_header(
         &mut request,
         context.transfer,
         context.resume_from,
         has_header("range"),
     );
-    if let Some(authorization) = &context.proxy.authorization
-        && !has_proxy_header("proxy-authorization")
-    {
-        request.extend_from_slice(format!("Proxy-Authorization: {authorization}\r\n").as_bytes());
-    }
     if !has_header("user-agent")
         && let Some(user_agent) = effective_user_agent(context.transfer)
     {
@@ -10587,24 +10619,6 @@ fn raw_http_proxy_request(context: &RawHttpProxyContext<'_>) -> Result<Vec<u8>> 
         && !has_header("cookie")
     {
         request.extend_from_slice(format!("Cookie: {cookie}\r\n").as_bytes());
-    }
-    if context.sensitive_headers_allowed
-        && let Some(token) = &context.transfer.oauth2_bearer
-        && !has_header("authorization")
-    {
-        request.extend_from_slice(format!("Authorization: Bearer {token}\r\n").as_bytes());
-    } else if context.sensitive_headers_allowed
-        && let Some(user) = &context.transfer.user
-        && context.transfer.oauth2_bearer.is_none()
-        && !has_header("authorization")
-    {
-        request.extend_from_slice(
-            format!(
-                "Authorization: Basic {}\r\n",
-                base64_padded(user.as_bytes())
-            )
-            .as_bytes(),
-        );
     }
     if let Some(path) = &context.transfer.etag_compare
         && !has_header("if-none-match")

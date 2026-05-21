@@ -108,6 +108,7 @@ pub struct TransferConfig {
     pub connect_to: Vec<String>,
     pub disallow_username_in_url: bool,
     pub proxy: Option<String>,
+    pub proxy_version: ProxyVersionPreference,
     pub proxy_user: Option<String>,
     pub proxy_auth: ProxyAuthMethods,
     pub proxytunnel: bool,
@@ -258,6 +259,13 @@ pub enum HttpVersionPreference {
     Http11,
     Http2,
     Http2PriorKnowledge,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum ProxyVersionPreference {
+    #[default]
+    Http11,
+    Http10,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -589,6 +597,7 @@ impl Default for TransferConfig {
             connect_to: Vec::new(),
             disallow_username_in_url: false,
             proxy: None,
+            proxy_version: ProxyVersionPreference::default(),
             proxy_user: None,
             proxy_auth: ProxyAuthMethods::default(),
             proxytunnel: false,
@@ -1062,7 +1071,15 @@ impl Parser {
             "disallow-username-in-url" => self.current().disallow_username_in_url = true,
             "proxy" => {
                 let value = self.value_for(name, inline_value)?;
-                self.current().proxy = Some(value);
+                let transfer = self.current();
+                transfer.proxy = Some(value);
+                transfer.proxy_version = ProxyVersionPreference::Http11;
+            }
+            "proxy1.0" => {
+                let value = self.value_for(name, inline_value)?;
+                let transfer = self.current();
+                transfer.proxy = Some(parse_nonempty_string(name, value)?);
+                transfer.proxy_version = ProxyVersionPreference::Http10;
             }
             "proxy-header" => {
                 let value = self.value_for(name, inline_value)?;
@@ -1422,7 +1439,9 @@ impl Parser {
                 }
                 'x' => {
                     let value = self.short_value('x', rest)?;
-                    self.current().proxy = Some(value);
+                    let transfer = self.current();
+                    transfer.proxy = Some(value);
+                    transfer.proxy_version = ProxyVersionPreference::Http11;
                     break;
                 }
                 'p' => self.current().proxytunnel = true,
@@ -1966,6 +1985,7 @@ impl TransferConfig {
             || !self.connect_to.is_empty()
             || self.disallow_username_in_url
             || self.proxy.is_some()
+            || self.proxy_version != ProxyVersionPreference::default()
             || self.proxy_user.is_some()
             || !self.proxy_auth.is_empty()
             || self.proxytunnel
@@ -2086,6 +2106,7 @@ fn option_takes_value(name: &str) -> bool {
             | "resolve"
             | "connect-to"
             | "proxy"
+            | "proxy1.0"
             | "proxy-user"
             | "interface"
             | "local-port"
@@ -3103,6 +3124,7 @@ fn print_common_help() {
            -c, --cookie-jar <file>     Save cookies to file\n\
            -j, --junk-session-cookies  Ignore session cookies from file\n\
                --oauth2-bearer <token> OAuth 2 Bearer token\n\
+               --proxy1.0 <proxy>      Use HTTP/1.0 proxy\n\
            -U, --proxy-user <user:pass> Proxy user and password\n\
            -p, --proxytunnel          HTTP proxy tunnel using CONNECT\n\
                --suppress-connect-headers Suppress proxy CONNECT headers\n\
@@ -4825,6 +4847,33 @@ mod tests {
         assert!(transfer.proxytunnel);
         assert!(transfer.suppress_connect_headers);
         assert_eq!(transfer.noproxy.as_deref(), Some("example.com"));
+    }
+
+    #[test]
+    fn proxy10_sets_proxy_and_resets_with_proxy() {
+        let config = parse_args([
+            "-q",
+            "--proxy1.0",
+            "proxy.example:8080",
+            "https://example.com",
+        ])
+        .unwrap();
+        let transfer = &config.transfers[0];
+        assert_eq!(transfer.proxy.as_deref(), Some("proxy.example:8080"));
+        assert_eq!(transfer.proxy_version, ProxyVersionPreference::Http10);
+
+        let config = parse_args([
+            "-q",
+            "--proxy1.0",
+            "old.example:8080",
+            "-x",
+            "new.example:8081",
+            "https://example.com",
+        ])
+        .unwrap();
+        let transfer = &config.transfers[0];
+        assert_eq!(transfer.proxy.as_deref(), Some("new.example:8081"));
+        assert_eq!(transfer.proxy_version, ProxyVersionPreference::Http11);
     }
 
     #[test]

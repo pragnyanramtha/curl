@@ -11444,6 +11444,46 @@ fn proxytunnel_connects_then_sends_origin_form_request() {
 }
 
 #[test]
+fn proxy10_uses_http10_for_connect_only() {
+    let (proxy_url, rx) = spawn_tunnel_proxy(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok");
+
+    let mut command = Command::cargo_bin("curl").unwrap();
+    command.args([
+        "-q",
+        "-sS",
+        "--proxytunnel",
+        "--proxy1.0",
+        &proxy_url,
+        "--user",
+        "iam:myself",
+        "--proxy-user",
+        "youare:yourself",
+        "-A",
+        "",
+        "http://test.80/resource",
+    ]);
+    command.assert().success().stdout("ok");
+
+    let connect = rx.recv().unwrap();
+    assert_eq!(connect.start_line, "CONNECT test.80:80 HTTP/1.0");
+    assert_eq!(header(&connect, "host"), Some("test.80:80"));
+    assert_eq!(
+        header(&connect, "proxy-authorization"),
+        Some("Basic eW91YXJlOnlvdXJzZWxm")
+    );
+    assert_eq!(header(&connect, "user-agent"), None);
+
+    let origin = rx.recv().unwrap();
+    assert_eq!(origin.start_line, "GET /resource HTTP/1.1");
+    assert_eq!(header(&origin, "host"), Some("test.80"));
+    assert_eq!(
+        header(&origin, "authorization"),
+        Some("Basic aWFtOm15c2VsZg==")
+    );
+    assert_eq!(header(&origin, "user-agent"), None);
+}
+
+#[test]
 fn proxytunnel_location_follows_redirect_and_strips_sensitive_headers() {
     let (proxy_url, rx) = spawn_tunnel_proxy_sequence(vec![
         b"HTTP/1.1 302 Found\r\nLocation: http://second.example/next?x=1\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
