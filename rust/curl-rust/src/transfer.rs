@@ -1497,6 +1497,7 @@ async fn run_ftp_exchange(
     }
     let (user, password) = ftp_credentials(transfer, &url)?;
     let account = ftp_account_bytes(transfer)?;
+    let alternative_to_user = ftp_alternative_to_user_bytes(transfer)?;
     let resume_from = if upload.is_none() {
         resume_offset(
             transfer,
@@ -1518,38 +1519,16 @@ async fn run_ftp_exchange(
         user_command.extend_from_slice(&user);
         let response =
             ftp_command(&mut stream, &user_command, metrics, &mut control_headers).await?;
-        match response.code {
-            230 => {}
-            332 => {
-                ftp_send_acct(
-                    &mut stream,
-                    account.as_deref(),
-                    metrics,
-                    &mut control_headers,
-                )
-                .await?;
-            }
-            331 => {
-                let mut pass_command = Vec::from(&b"PASS "[..]);
-                pass_command.extend_from_slice(&password);
-                let response =
-                    ftp_command(&mut stream, &pass_command, metrics, &mut control_headers).await?;
-                match response.code {
-                    230 => {}
-                    332 => {
-                        ftp_send_acct(
-                            &mut stream,
-                            account.as_deref(),
-                            metrics,
-                            &mut control_headers,
-                        )
-                        .await?;
-                    }
-                    _ => return Err(CurlError::LoginDenied),
-                }
-            }
-            _ => return Err(CurlError::LoginDenied),
-        }
+        ftp_finish_login(
+            &mut stream,
+            response,
+            &password,
+            account.as_deref(),
+            alternative_to_user.as_deref(),
+            metrics,
+            &mut control_headers,
+        )
+        .await?;
     }
 
     let _ = ftp_command(&mut stream, b"PWD", metrics, &mut control_headers).await?;
@@ -2652,6 +2631,65 @@ fn ftp_account_bytes(transfer: &TransferConfig) -> Result<Option<Vec<u8>>> {
         ));
     }
     Ok(Some(account))
+}
+
+fn ftp_alternative_to_user_bytes(transfer: &TransferConfig) -> Result<Option<Vec<u8>>> {
+    let Some(command) = &transfer.ftp_alternative_to_user else {
+        return Ok(None);
+    };
+    let command = command.as_bytes().to_vec();
+    if has_control_byte(&command) {
+        return Err(CurlError::Url(
+            "FTP alternative user command contains a decoded control byte".to_string(),
+        ));
+    }
+    Ok(Some(command))
+}
+
+async fn ftp_finish_login(
+    stream: &mut TcpStream,
+    mut response: FtpResponse,
+    password: &[u8],
+    account: Option<&[u8]>,
+    alternative_to_user: Option<&[u8]>,
+    metrics: &mut writeout::Metrics,
+    control_headers: &mut Vec<u8>,
+) -> Result<()> {
+    let mut tried_alternative = false;
+
+    loop {
+        match response.code {
+            code if ftp_positive_code(code) => return Ok(()),
+            332 => {
+                ftp_send_acct(stream, account, metrics, control_headers).await?;
+                return Ok(());
+            }
+            331 => {
+                let mut pass_command = Vec::from(&b"PASS "[..]);
+                pass_command.extend_from_slice(password);
+                let pass_response =
+                    ftp_command(stream, &pass_command, metrics, control_headers).await?;
+                match pass_response.code {
+                    code if ftp_positive_code(code) => return Ok(()),
+                    332 => {
+                        ftp_send_acct(stream, account, metrics, control_headers).await?;
+                        return Ok(());
+                    }
+                    _ => {}
+                }
+            }
+            _ => {}
+        }
+
+        if tried_alternative {
+            return Err(CurlError::LoginDenied);
+        }
+        let Some(alternative_to_user) = alternative_to_user else {
+            return Err(CurlError::LoginDenied);
+        };
+        tried_alternative = true;
+        response = ftp_command(stream, alternative_to_user, metrics, control_headers).await?;
+    }
 }
 
 async fn ftp_send_acct(

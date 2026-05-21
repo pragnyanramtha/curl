@@ -128,6 +128,7 @@ set(_curl_rust_corpus_tests
   269
   270
   271
+  280
   283
   284
   285

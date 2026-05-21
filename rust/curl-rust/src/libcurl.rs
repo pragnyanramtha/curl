@@ -288,6 +288,9 @@ fn write_request(out: &mut String, render: &RenderTransfer<'_>, url: &str) -> Re
     if let Some(account) = &transfer.ftp_account {
         emit_string_setopt(out, "CURLOPT_FTP_ACCOUNT", account);
     }
+    if let Some(command) = &transfer.ftp_alternative_to_user {
+        emit_string_setopt(out, "CURLOPT_FTP_ALTERNATIVE_TO_USER", command);
+    }
     if transfer.ftp_create_dirs {
         emit_raw_setopt(
             out,

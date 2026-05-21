@@ -60,6 +60,7 @@ pub struct TransferConfig {
     pub use_ascii: bool,
     pub ftp_append: bool,
     pub ftp_account: Option<String>,
+    pub ftp_alternative_to_user: Option<String>,
     pub ftp_create_dirs: bool,
     pub ftp_file_method: Option<FtpFileMethod>,
     pub ftp_disable_epsv: bool,
@@ -560,6 +561,7 @@ impl Default for TransferConfig {
             use_ascii: false,
             ftp_append: false,
             ftp_account: None,
+            ftp_alternative_to_user: None,
             ftp_create_dirs: false,
             ftp_file_method: None,
             ftp_disable_epsv: false,
@@ -866,6 +868,10 @@ impl Parser {
             "ftp-account" => {
                 let value = self.value_for(name, inline_value)?;
                 self.current().ftp_account = Some(parse_nonempty_string(name, value)?);
+            }
+            "ftp-alternative-to-user" => {
+                let value = self.value_for(name, inline_value)?;
+                self.current().ftp_alternative_to_user = Some(parse_nonempty_string(name, value)?);
             }
             "ftp-create-dirs" => self.current().ftp_create_dirs = true,
             "ftp-method" => {
@@ -2047,6 +2053,7 @@ impl TransferConfig {
             || self.use_ascii
             || self.ftp_append
             || self.ftp_account.is_some()
+            || self.ftp_alternative_to_user.is_some()
             || self.ftp_create_dirs
             || self.ftp_file_method.is_some()
             || self.ftp_disable_epsv
@@ -2211,6 +2218,7 @@ fn option_takes_value(name: &str) -> bool {
             | "mail-from"
             | "mail-rcpt"
             | "ftp-account"
+            | "ftp-alternative-to-user"
             | "ftp-method"
             | "key"
             | "pubkey"
@@ -3196,6 +3204,7 @@ fn print_common_help() {
                --knownhosts <file>     SSH known_hosts file\n\
                --compressed-ssh        Enable SSH compression\n\
                --ftp-account <data>    Account data after FTP PASS\n\
+               --ftp-alternative-to-user <command> String to replace USER [name]\n\
                --ftp-method <method>   Set FTP CWD method\n\
                --ftp-pret              Send PRET before PASV\n\
                --tftp-blksize <value>  Set TFTP BLKSIZE option\n\
@@ -4324,6 +4333,31 @@ mod tests {
         assert_eq!(transfer.ftp_quote, ["NOOP 1", "*FAIL"]);
         assert_eq!(transfer.ftp_prequote, ["NOOP 2"]);
         assert_eq!(transfer.ftp_postquote, ["*DELE after"]);
+    }
+
+    #[test]
+    fn parses_ftp_alternative_to_user_option() {
+        let config = parse_args([
+            "-q",
+            "--ftp-alternative-to-user",
+            "USER replacement",
+            "ftp://example.com/file",
+        ])
+        .unwrap();
+
+        assert_eq!(
+            config.transfers[0].ftp_alternative_to_user.as_deref(),
+            Some("USER replacement")
+        );
+
+        let error = parse_args([
+            "-q",
+            "--ftp-alternative-to-user",
+            "",
+            "ftp://example.com/file",
+        ])
+        .unwrap_err();
+        assert!(matches!(error, CurlError::Usage(_)));
     }
 
     #[test]

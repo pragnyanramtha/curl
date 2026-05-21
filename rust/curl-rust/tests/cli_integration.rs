@@ -282,6 +282,9 @@ struct FtpServerOptions {
     pasv_reply: Option<&'static [u8]>,
     pasv_host: [u8; 4],
     login_denied: bool,
+    user_denied_once: bool,
+    pass_denied_once: bool,
+    user_reply: Option<&'static [u8]>,
     pass_requires_acct: bool,
     user_requires_acct: bool,
     acct_reply: &'static [u8],
@@ -645,6 +648,9 @@ fn ftp_options(data: impl Into<Vec<u8>>) -> FtpServerOptions {
         pasv_reply: None,
         pasv_host: [127, 0, 0, 1],
         login_denied: false,
+        user_denied_once: false,
+        pass_denied_once: false,
+        user_reply: None,
         pass_requires_acct: false,
         user_requires_acct: false,
         acct_reply: b"230 Account accepted\r\n",
@@ -696,6 +702,8 @@ fn spawn_ftp_server_with_listener(
         let mut passive_listener: Option<TcpListener> = None;
         let mut restart_offset = 0_usize;
         let mut created_directories: Vec<String> = Vec::new();
+        let mut user_denied_once = false;
+        let mut pass_denied_once = false;
 
         while let Some(line) = read_pop3_client_line(&mut stream) {
             commands.extend_from_slice(&line);
@@ -707,12 +715,26 @@ fn spawn_ftp_server_with_listener(
                     stream.write_all(b"530 Login incorrect\r\n").unwrap();
                     break;
                 }
+                if options.user_denied_once && !user_denied_once {
+                    user_denied_once = true;
+                    stream.write_all(b"530 Login incorrect\r\n").unwrap();
+                    continue;
+                }
                 if options.user_requires_acct {
                     stream.write_all(b"332 Account required\r\n").unwrap();
                     continue;
                 }
+                if let Some(reply) = options.user_reply {
+                    stream.write_all(reply).unwrap();
+                    continue;
+                }
                 stream.write_all(b"331 Password required\r\n").unwrap();
             } else if command.starts_with("PASS ") {
+                if options.pass_denied_once && !pass_denied_once {
+                    pass_denied_once = true;
+                    stream.write_all(b"530 Login incorrect\r\n").unwrap();
+                    continue;
+                }
                 if options.pass_requires_acct {
                     stream.write_all(b"332 Account required\r\n").unwrap();
                 } else {
@@ -6005,6 +6027,17 @@ fn help_unknown_category_lists_categories() {
 }
 
 #[test]
+fn help_lists_ftp_alternative_to_user_option() {
+    let mut command = Command::cargo_bin("curl").unwrap();
+    let output = command.args(["-q", "--help"]).output().unwrap();
+
+    assert!(output.status.success());
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    assert!(stdout.contains("--ftp-alternative-to-user <command>"));
+    assert!(stdout.contains("String to replace USER [name]"));
+}
+
+#[test]
 fn manual_option_reports_disabled_for_corpus_detection() {
     let mut command = Command::cargo_bin("curl").unwrap();
     command.args(["-q", "-M"]);
@@ -6113,6 +6146,98 @@ fn ftp_account_directory_listing_matches_acct_corpus() {
         b"USER anonymous\r\nPASS ftp@example.com\r\nACCT data for acct\r\nPWD\r\nCWD 294\r\nEPSV\r\nTYPE A\r\nLIST\r\nQUIT\r\n"
     );
     assert_eq!(record.data_connections, 1);
+}
+
+#[test]
+fn ftp_alternative_to_user_retries_after_user_failure() {
+    let mut options = ftp_options(b"alternate user listing");
+    options.user_denied_once = true;
+    let (url, rx) = spawn_ftp_server("/280/", options);
+
+    let mut command = Command::cargo_bin("curl").unwrap();
+    command.args([
+        "-q",
+        "-sS",
+        "--ftp-alternative-to-user",
+        "USER replacement",
+        &url,
+    ]);
+    command.assert().success().stdout("alternate user listing");
+
+    let record = rx.recv().unwrap();
+    assert_eq!(
+        record.commands,
+        b"USER anonymous\r\nUSER replacement\r\nPASS ftp@example.com\r\nPWD\r\nCWD 280\r\nEPSV\r\nTYPE A\r\nLIST\r\nQUIT\r\n"
+    );
+    assert_eq!(record.data_connections, 1);
+}
+
+#[test]
+fn ftp_alternative_to_user_retries_after_pass_failure() {
+    let mut options = ftp_options(b"alternate pass listing");
+    options.pass_denied_once = true;
+    let (url, rx) = spawn_ftp_server("/280/", options);
+
+    let mut command = Command::cargo_bin("curl").unwrap();
+    command.args([
+        "-q",
+        "-sS",
+        "--ftp-alternative-to-user",
+        "USER replacement",
+        &url,
+    ]);
+    command.assert().success().stdout("alternate pass listing");
+
+    let record = rx.recv().unwrap();
+    assert_eq!(
+        record.commands,
+        b"USER anonymous\r\nPASS ftp@example.com\r\nUSER replacement\r\nPASS ftp@example.com\r\nPWD\r\nCWD 280\r\nEPSV\r\nTYPE A\r\nLIST\r\nQUIT\r\n"
+    );
+    assert_eq!(record.data_connections, 1);
+}
+
+#[test]
+fn ftp_login_accepts_non_230_positive_completion_reply() {
+    let mut options = ftp_options(b"non-230 listing");
+    options.user_reply = Some(b"202 Already logged in\r\n");
+    let (url, rx) = spawn_ftp_server("/positive/", options);
+
+    let mut command = Command::cargo_bin("curl").unwrap();
+    command.args([
+        "-q",
+        "-sS",
+        "--ftp-alternative-to-user",
+        "USER replacement",
+        &url,
+    ]);
+    command.assert().success().stdout("non-230 listing");
+
+    let record = rx.recv().unwrap();
+    assert_eq!(
+        record.commands,
+        b"USER anonymous\r\nPWD\r\nCWD positive\r\nEPSV\r\nTYPE A\r\nLIST\r\nQUIT\r\n"
+    );
+    assert_eq!(record.data_connections, 1);
+}
+
+#[test]
+fn ftp_alternative_to_user_rejects_decoded_control_bytes() {
+    let mut command = Command::cargo_bin("curl").unwrap();
+    command.args([
+        "-q",
+        "-sS",
+        "--ftp-alternative-to-user",
+        "USER replacement\r\nDELE injected",
+        "ftp://example.invalid/file",
+    ]);
+    command
+        .assert()
+        .failure()
+        .code(3)
+        .stdout("")
+        .stderr(predicates::str::contains(
+            "FTP alternative user command contains a decoded control byte",
+        ));
 }
 
 #[test]
@@ -13694,10 +13819,11 @@ fn libcurl_writes_ftp_passive_options() {
 }
 
 #[test]
-fn libcurl_writes_ftp_account_and_pret_options() {
+fn libcurl_writes_ftp_account_alternative_user_and_pret_options() {
     let temp = tempdir().unwrap();
     let source = temp.path().join("ftp-auth-client.c");
     let mut options = ftp_options(b"acct pret");
+    options.user_denied_once = true;
     options.pass_requires_acct = true;
     let (url, rx) = spawn_ftp_server("/file.txt", options);
 
@@ -13709,6 +13835,8 @@ fn libcurl_writes_ftp_account_and_pret_options() {
         source.to_str().unwrap(),
         "--ftp-account",
         "one count",
+        "--ftp-alternative-to-user",
+        "USER replacement",
         "--ftp-pret",
         &url,
     ]);
@@ -13716,10 +13844,11 @@ fn libcurl_writes_ftp_account_and_pret_options() {
 
     assert_eq!(
         rx.recv().unwrap().commands,
-        b"USER anonymous\r\nPASS ftp@example.com\r\nACCT one count\r\nPWD\r\nPRET RETR file.txt\r\nEPSV\r\nTYPE I\r\nSIZE file.txt\r\nRETR file.txt\r\nQUIT\r\n"
+        b"USER anonymous\r\nUSER replacement\r\nPASS ftp@example.com\r\nACCT one count\r\nPWD\r\nPRET RETR file.txt\r\nEPSV\r\nTYPE I\r\nSIZE file.txt\r\nRETR file.txt\r\nQUIT\r\n"
     );
     let text = std::fs::read_to_string(source).unwrap();
     assert!(text.contains("CURLOPT_FTP_ACCOUNT, \"one count\""));
+    assert!(text.contains("CURLOPT_FTP_ALTERNATIVE_TO_USER, \"USER replacement\""));
     assert!(text.contains("CURLOPT_FTP_USE_PRET, 1L"));
 }
 
