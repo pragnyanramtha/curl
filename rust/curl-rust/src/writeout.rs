@@ -1,4 +1,4 @@
-use std::time::Duration;
+use std::{collections::HashSet, time::Duration};
 
 use reqwest::header::HeaderMap;
 
@@ -418,12 +418,26 @@ fn url_part(url: &str, part: UrlPart) -> Option<String> {
 
 fn header_json(headers: &HeaderMap) -> String {
     let mut entries = Vec::new();
-    for (name, value) in headers {
-        let value = String::from_utf8_lossy(value.as_bytes());
+    let mut seen = HashSet::new();
+
+    for name in headers.keys() {
+        if !seen.insert(name.clone()) {
+            continue;
+        }
+
+        let values = headers
+            .get_all(name)
+            .iter()
+            .map(|value| {
+                let value = String::from_utf8_lossy(value.as_bytes());
+                format!("\"{}\"", escape_json(&value))
+            })
+            .collect::<Vec<_>>()
+            .join(",");
         entries.push(format!(
-            "\"{}\":[\"{}\"]",
-            escape_json(name.as_str()),
-            escape_json(&value)
+            "\"{}\":[{}]",
+            escape_json(&name.as_str().to_ascii_lowercase()),
+            values
         ));
     }
     format!("{{{}}}", entries.join(","))
@@ -513,5 +527,32 @@ mod tests {
             render("one%{stderr}two%{stdout}three", &metrics),
             "onetwothree"
         );
+    }
+
+    #[test]
+    fn header_json_groups_repeated_headers() {
+        let mut metrics = Metrics::empty("https://example.com/", "GET");
+        metrics.headers.append(
+            reqwest::header::SET_COOKIE,
+            "first=1; path=/".parse().unwrap(),
+        );
+        metrics.headers.append(
+            reqwest::header::SET_COOKIE,
+            "second=2; path=/".parse().unwrap(),
+        );
+        metrics
+            .headers
+            .insert(reqwest::header::CONTENT_TYPE, "text/plain".parse().unwrap());
+        metrics.headers.insert(
+            reqwest::header::HeaderName::from_static("x-escaped"),
+            "quote \" slash \\".parse().unwrap(),
+        );
+
+        let rendered = render("%{header_json}", &metrics);
+
+        assert_eq!(rendered.matches("\"set-cookie\":").count(), 1);
+        assert!(rendered.contains("\"set-cookie\":[\"first=1; path=/\",\"second=2; path=/\"]"));
+        assert!(rendered.contains("\"content-type\":[\"text/plain\"]"));
+        assert!(rendered.contains("\"x-escaped\":[\"quote \\\" slash \\\\\"]"));
     }
 }
