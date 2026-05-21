@@ -439,6 +439,9 @@ fn write_request(out: &mut String, render: &RenderTransfer<'_>, url: &str) -> Re
     if transfer.proxytunnel {
         emit_long_setopt(out, "CURLOPT_HTTPPROXYTUNNEL", 1);
     }
+    if transfer.suppress_connect_headers {
+        emit_long_setopt(out, "CURLOPT_SUPPRESS_CONNECT_HEADERS", 1);
+    }
     if let Some(proxy_user) = &transfer.proxy_user {
         emit_string_setopt(out, "CURLOPT_PROXYUSERPWD", proxy_user);
     }
@@ -936,6 +939,7 @@ mod tests {
             "--proxy-header",
             "Proxy-Connection: close",
             "--proxytunnel",
+            "--suppress-connect-headers",
             "--noproxy",
             "localhost",
             "-A",
@@ -958,6 +962,7 @@ mod tests {
         assert!(source.contains("CURLOPT_USERPWD, \"alice:secret\""));
         assert!(source.contains("CURLOPT_PROXY, \"http://proxy.example:8080\""));
         assert!(source.contains("CURLOPT_HTTPPROXYTUNNEL, 1L"));
+        assert!(source.contains("CURLOPT_SUPPRESS_CONNECT_HEADERS, 1L"));
         assert!(source.contains("CURLOPT_NOPROXY, \"localhost\""));
         assert!(source.contains("CURLOPT_USERAGENT, \"MyUA\""));
     }

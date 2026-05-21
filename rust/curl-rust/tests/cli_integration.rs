@@ -411,18 +411,45 @@ fn spawn_sequence_server_bytes(responses: Vec<Vec<u8>>) -> (String, Receiver<Req
 }
 
 fn spawn_tunnel_proxy(response: &'static [u8]) -> (String, Receiver<RequestRecord>) {
+    spawn_tunnel_proxy_sequence(vec![response])
+}
+
+fn spawn_tunnel_proxy_with_connect_response(
+    connect_response: &'static [u8],
+    response: &'static [u8],
+) -> (String, Receiver<RequestRecord>) {
+    spawn_tunnel_proxy_sequence_with_connect(vec![(connect_response, response)])
+}
+
+fn spawn_tunnel_proxy_sequence(responses: Vec<&'static [u8]>) -> (String, Receiver<RequestRecord>) {
+    spawn_tunnel_proxy_sequence_with_connect(
+        responses
+            .into_iter()
+            .map(|response| {
+                (
+                    &b"HTTP/1.1 200 Connection Established\r\n\r\n"[..],
+                    response,
+                )
+            })
+            .collect(),
+    )
+}
+
+fn spawn_tunnel_proxy_sequence_with_connect(
+    responses: Vec<(&'static [u8], &'static [u8])>,
+) -> (String, Receiver<RequestRecord>) {
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let addr = listener.local_addr().unwrap();
     let (tx, rx) = mpsc::channel();
 
     thread::spawn(move || {
-        let (mut stream, _) = listener.accept().unwrap();
-        tx.send(read_request(&mut stream)).unwrap();
-        stream
-            .write_all(b"HTTP/1.1 200 Connection Established\r\n\r\n")
-            .unwrap();
-        tx.send(read_request(&mut stream)).unwrap();
-        stream.write_all(response).unwrap();
+        for (connect_response, response) in responses {
+            let (mut stream, _) = listener.accept().unwrap();
+            tx.send(read_request(&mut stream)).unwrap();
+            stream.write_all(connect_response).unwrap();
+            tx.send(read_request(&mut stream)).unwrap();
+            stream.write_all(response).unwrap();
+        }
     });
 
     (format!("http://{addr}"), rx)
@@ -11377,6 +11404,185 @@ fn proxytunnel_connects_then_sends_origin_form_request() {
     assert_eq!(header(&origin, "host"), Some("example.test"));
     assert_eq!(header(&origin, "x-origin"), Some("yes"));
     assert_eq!(header(&origin, "x-proxy-only"), None);
+}
+
+#[test]
+fn proxytunnel_location_follows_redirect_and_strips_sensitive_headers() {
+    let (proxy_url, rx) = spawn_tunnel_proxy_sequence(vec![
+        b"HTTP/1.1 302 Found\r\nLocation: http://second.example/next?x=1\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+        b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok",
+    ]);
+
+    let mut command = Command::cargo_bin("curl").unwrap();
+    command.args([
+        "-q",
+        "-sS",
+        "-L",
+        "--proxytunnel",
+        "-x",
+        &proxy_url,
+        "--proxy-header",
+        "X-Proxy-Only: yes",
+        "-H",
+        "Authorization: Bearer secret",
+        "-H",
+        "Cookie: a=b",
+        "http://first.example/path",
+    ]);
+    command.assert().success().stdout("ok");
+
+    let first_connect = rx.recv().unwrap();
+    assert_eq!(
+        first_connect.start_line,
+        "CONNECT first.example:80 HTTP/1.1"
+    );
+    assert_eq!(header(&first_connect, "host"), Some("first.example:80"));
+    assert_eq!(header(&first_connect, "x-proxy-only"), Some("yes"));
+    assert_eq!(header(&first_connect, "authorization"), None);
+    assert_eq!(header(&first_connect, "cookie"), None);
+
+    let first_origin = rx.recv().unwrap();
+    assert_eq!(first_origin.start_line, "GET /path HTTP/1.1");
+    assert_eq!(header(&first_origin, "host"), Some("first.example"));
+    assert_eq!(
+        header(&first_origin, "authorization"),
+        Some("Bearer secret")
+    );
+    assert_eq!(header(&first_origin, "cookie"), Some("a=b"));
+    assert_eq!(header(&first_origin, "x-proxy-only"), None);
+
+    let second_connect = rx.recv().unwrap();
+    assert_eq!(
+        second_connect.start_line,
+        "CONNECT second.example:80 HTTP/1.1"
+    );
+    assert_eq!(header(&second_connect, "host"), Some("second.example:80"));
+    assert_eq!(header(&second_connect, "x-proxy-only"), Some("yes"));
+    assert_eq!(header(&second_connect, "authorization"), None);
+    assert_eq!(header(&second_connect, "cookie"), None);
+
+    let second_origin = rx.recv().unwrap();
+    assert_eq!(second_origin.start_line, "GET /next?x=1 HTTP/1.1");
+    assert_eq!(header(&second_origin, "host"), Some("second.example"));
+    assert_eq!(header(&second_origin, "authorization"), None);
+    assert_eq!(header(&second_origin, "cookie"), None);
+    assert_eq!(header(&second_origin, "x-proxy-only"), None);
+}
+
+#[test]
+fn proxytunnel_location_trusted_keeps_sensitive_headers_on_redirect() {
+    let (proxy_url, rx) = spawn_tunnel_proxy_sequence(vec![
+        b"HTTP/1.1 302 Found\r\nLocation: http://second.example/next\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+        b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok",
+    ]);
+
+    let mut command = Command::cargo_bin("curl").unwrap();
+    command.args([
+        "-q",
+        "-sS",
+        "--location-trusted",
+        "--proxytunnel",
+        "-x",
+        &proxy_url,
+        "-H",
+        "Authorization: Bearer secret",
+        "-H",
+        "Cookie: a=b",
+        "http://first.example/path",
+    ]);
+    command.assert().success().stdout("ok");
+
+    let _first_connect = rx.recv().unwrap();
+    let first_origin = rx.recv().unwrap();
+    let _second_connect = rx.recv().unwrap();
+    let second_origin = rx.recv().unwrap();
+
+    assert_eq!(
+        header(&first_origin, "authorization"),
+        Some("Bearer secret")
+    );
+    assert_eq!(header(&first_origin, "cookie"), Some("a=b"));
+    assert_eq!(
+        header(&second_origin, "authorization"),
+        Some("Bearer secret")
+    );
+    assert_eq!(header(&second_origin, "cookie"), Some("a=b"));
+}
+
+#[test]
+fn proxytunnel_include_outputs_connect_headers_by_default() {
+    let (proxy_url, rx) = spawn_tunnel_proxy_with_connect_response(
+        b"HTTP/1.1 200 Connection Established\r\nProxy-Agent: tunnel\r\n\r\n",
+        b"HTTP/1.1 200 OK\r\nX-Origin: yes\r\nContent-Length: 2\r\n\r\nok",
+    );
+
+    let mut command = Command::cargo_bin("curl").unwrap();
+    let assert = command
+        .args([
+            "-q",
+            "-sS",
+            "-i",
+            "--proxytunnel",
+            "-x",
+            &proxy_url,
+            "http://example.test/resource",
+        ])
+        .assert()
+        .success();
+    let stdout = String::from_utf8(assert.get_output().stdout.clone()).unwrap();
+
+    assert!(stdout.starts_with(
+        "HTTP/1.1 200 Connection Established\r\nProxy-Agent: tunnel\r\n\r\nHTTP/1.1 200 OK\r\n"
+    ));
+    assert!(stdout.contains("X-Origin: yes\r\n"));
+    assert!(stdout.ends_with("\r\nok"));
+
+    let connect = rx.recv().unwrap();
+    assert_eq!(connect.start_line, "CONNECT example.test:80 HTTP/1.1");
+    let origin = rx.recv().unwrap();
+    assert_eq!(origin.start_line, "GET /resource HTTP/1.1");
+}
+
+#[test]
+fn suppress_connect_headers_excludes_connect_headers_from_include_and_dump() {
+    let temp = tempdir().unwrap();
+    let dump = temp.path().join("headers");
+    let (proxy_url, rx) = spawn_tunnel_proxy_with_connect_response(
+        b"HTTP/1.1 200 Connection Established\r\nProxy-Agent: tunnel\r\n\r\n",
+        b"HTTP/1.1 200 OK\r\nX-Origin: yes\r\nContent-Length: 2\r\n\r\nok",
+    );
+
+    let mut command = Command::cargo_bin("curl").unwrap();
+    let assert = command
+        .args([
+            "-q",
+            "-sS",
+            "--suppress-connect-headers",
+            "-i",
+            "-D",
+            dump.to_str().unwrap(),
+            "--proxytunnel",
+            "-x",
+            &proxy_url,
+            "http://example.test/resource",
+        ])
+        .assert()
+        .success();
+    let stdout = String::from_utf8(assert.get_output().stdout.clone()).unwrap();
+    let dumped = std::fs::read_to_string(&dump).unwrap();
+
+    assert!(stdout.starts_with("HTTP/1.1 200 OK\r\n"));
+    assert!(!stdout.contains("Connection Established"));
+    assert!(!stdout.contains("Proxy-Agent: tunnel"));
+    assert!(stdout.ends_with("\r\nok"));
+    assert!(dumped.starts_with("HTTP/1.1 200 OK\r\n"));
+    assert!(!dumped.contains("Connection Established"));
+    assert!(!dumped.contains("Proxy-Agent: tunnel"));
+
+    let connect = rx.recv().unwrap();
+    assert_eq!(connect.start_line, "CONNECT example.test:80 HTTP/1.1");
+    let origin = rx.recv().unwrap();
+    assert_eq!(origin.start_line, "GET /resource HTTP/1.1");
 }
 
 #[test]

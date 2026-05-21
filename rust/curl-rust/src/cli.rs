@@ -111,6 +111,7 @@ pub struct TransferConfig {
     pub proxy_user: Option<String>,
     pub proxy_auth: ProxyAuthMethods,
     pub proxytunnel: bool,
+    pub suppress_connect_headers: bool,
     pub noproxy: Option<String>,
     pub insecure: bool,
     pub cacert: Option<PathBuf>,
@@ -591,6 +592,7 @@ impl Default for TransferConfig {
             proxy_user: None,
             proxy_auth: ProxyAuthMethods::default(),
             proxytunnel: false,
+            suppress_connect_headers: false,
             noproxy: None,
             insecure: false,
             cacert: None,
@@ -1084,6 +1086,7 @@ impl Parser {
             "proxy-negotiate" => self.current().proxy_auth.set_negotiate(true),
             "proxy-ntlm" => self.current().proxy_auth.set_ntlm(true),
             "proxytunnel" => self.current().proxytunnel = true,
+            "suppress-connect-headers" => self.current().suppress_connect_headers = true,
             "noproxy" => {
                 let value = self.value_for(name, inline_value)?;
                 self.current().noproxy = Some(value);
@@ -1263,6 +1266,7 @@ impl Parser {
             "proxy-negotiate" => self.current().proxy_auth.set_negotiate(false),
             "proxy-ntlm" => self.current().proxy_auth.set_ntlm(false),
             "proxytunnel" => self.current().proxytunnel = false,
+            "suppress-connect-headers" => self.current().suppress_connect_headers = false,
             "insecure" => self.current().insecure = false,
             "junk-session-cookies" => self.current().junk_session_cookies = false,
             "mail-rcpt-allowfails" => self.current().mail_rcpt_allowfails = false,
@@ -1965,6 +1969,7 @@ impl TransferConfig {
             || self.proxy_user.is_some()
             || !self.proxy_auth.is_empty()
             || self.proxytunnel
+            || self.suppress_connect_headers
             || self.noproxy.is_some()
             || self.insecure
             || self.cacert.is_some()
@@ -3100,6 +3105,7 @@ fn print_common_help() {
                --oauth2-bearer <token> OAuth 2 Bearer token\n\
            -U, --proxy-user <user:pass> Proxy user and password\n\
            -p, --proxytunnel          HTTP proxy tunnel using CONNECT\n\
+               --suppress-connect-headers Suppress proxy CONNECT headers\n\
                --proxy-header <header> Pass custom proxy header\n\
                --proxy-basic           Use Basic proxy authentication\n\
                --proxy-digest          Use Digest proxy authentication\n\
@@ -4793,6 +4799,7 @@ mod tests {
             "-U",
             "proxy-user:secret",
             "-p",
+            "--suppress-connect-headers",
             "--noproxy",
             "example.com",
             "https://example.com",
@@ -4816,6 +4823,7 @@ mod tests {
         assert_eq!(transfer.proxy.as_deref(), Some("http://proxy.example:8080"));
         assert_eq!(transfer.proxy_user.as_deref(), Some("proxy-user:secret"));
         assert!(transfer.proxytunnel);
+        assert!(transfer.suppress_connect_headers);
         assert_eq!(transfer.noproxy.as_deref(), Some("example.com"));
     }
 
@@ -5132,9 +5140,11 @@ mod tests {
             "--proxy-anyauth",
             "--proxy-basic",
             "--proxytunnel",
+            "--suppress-connect-headers",
             "--no-proxy-anyauth",
             "--no-proxy-basic",
             "--no-proxytunnel",
+            "--no-suppress-connect-headers",
             "https://example.com",
         ])
         .unwrap();
@@ -5145,6 +5155,7 @@ mod tests {
         assert!(!transfer.proxy_auth.anyauth());
         assert!(!transfer.proxy_auth.basic());
         assert!(!transfer.proxytunnel);
+        assert!(!transfer.suppress_connect_headers);
     }
 
     #[test]

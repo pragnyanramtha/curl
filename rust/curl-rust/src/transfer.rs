@@ -8936,8 +8936,7 @@ async fn run_http_transfer(
                 let next_path_as_is_url = next.path_as_is_url;
                 let status = attempt.status.expect("checked redirect status");
                 if let Some(path) = &transfer.dump_header {
-                    let header_bytes =
-                        output::render_headers(attempt.version, status, &attempt.headers);
+                    let header_bytes = http_attempt_header_bytes(&attempt);
                     output::append_dump_headers(path, &header_bytes, transfer.create_dirs)?;
                 }
 
@@ -9145,8 +9144,7 @@ async fn run_http_transfer(
                 let next_path_as_is_url = next.path_as_is_url;
                 let status = attempt.status.expect("checked redirect status");
                 if let Some(path) = &transfer.dump_header {
-                    let header_bytes =
-                        output::render_headers(attempt.version, status, &attempt.headers);
+                    let header_bytes = http_attempt_header_bytes(&attempt);
                     output::append_dump_headers(path, &header_bytes, transfer.create_dirs)?;
                 }
 
@@ -9212,6 +9210,154 @@ async fn run_http_transfer(
             final_attempt.redirects = redirect_attempts;
             metrics.url_effective = final_attempt.final_url.to_string();
             metrics.response_code = final_attempt.status.map(|status| status.as_u16());
+            metrics.referer = custom_referer.clone().or_else(|| current_referer.clone());
+            metrics.content_type = final_attempt
+                .headers
+                .get(CONTENT_TYPE)
+                .and_then(|value| value.to_str().ok())
+                .map(ToString::to_string);
+            metrics.redirect_url = redirect_location_string(&final_attempt.headers)?;
+            metrics.headers = final_attempt.headers.clone();
+            check_http_content_length_max_filesize(
+                transfer,
+                &final_attempt.headers,
+                current_method == Method::HEAD,
+            )?;
+            metrics.size_download = final_attempt.body.len() as u64;
+            return Ok(final_attempt);
+        }
+    }
+
+    if let Some(proxy) = explicit_proxy.as_ref()
+        && transfer.proxytunnel
+        && transfer.follow_location
+        && url.scheme() == "http"
+    {
+        if !raw_http_proxy_redirect_supported(transfer, &url, has_multipart) {
+            return Err(CurlError::Unsupported(
+                "--proxytunnel redirects for plain http:// URLs are only implemented for simple raw HTTP proxy transfers in the Rust sidecar"
+                    .to_string(),
+            ));
+        }
+
+        let custom_method = transfer.method.is_some();
+        let post_redirect_body =
+            !transfer.get && (!transfer.data.is_empty() || !transfer.forms.is_empty());
+        let mut current_method = method.clone();
+        let mut send_request_body = true;
+        let mut current_path_as_is_url = path_as_is_url.clone();
+        let mut redirect_attempts = Vec::new();
+
+        loop {
+            metrics.method = current_method.as_str().to_string();
+            let request_body = send_request_body
+                .then_some(prepared_body.as_ref())
+                .flatten();
+            let upload = if send_request_body {
+                upload_body.as_deref()
+            } else {
+                None
+            };
+            let sensitive_headers_allowed =
+                transfer.location_trusted || same_redirect_origin(&initial_url, &url);
+            let custom_host_allowed = same_redirect_origin(&initial_url, &url);
+            let attempt = run_raw_http_proxy_tunnel_transfer(RawHttpProxyContext {
+                transfer,
+                url: &url,
+                path_as_is_url: current_path_as_is_url.as_deref(),
+                method: &current_method,
+                prepared_body: request_body,
+                upload_body: upload,
+                resume_from,
+                referer: custom_referer.as_deref().or(current_referer.as_deref()),
+                proxy,
+                sensitive_headers_allowed,
+                custom_host_allowed,
+            })
+            .await?;
+
+            if attempt.status.is_some_and(is_followed_redirect)
+                && let Some(next) =
+                    redirect_location(&attempt.final_url, &attempt.headers, transfer.path_as_is)?
+            {
+                let next_url = next.url;
+                let next_path_as_is_url = next.path_as_is_url;
+                let status = attempt.status.expect("checked redirect status");
+                if let Some(path) = &transfer.dump_header {
+                    let header_bytes = http_attempt_header_bytes(&attempt);
+                    output::append_dump_headers(path, &header_bytes, transfer.create_dirs)?;
+                }
+
+                if redirects >= transfer.max_redirs {
+                    metrics.url_effective = attempt.final_url.to_string();
+                    metrics.response_code = Some(status.as_u16());
+                    metrics.http_connect = attempt.http_connect_code;
+                    metrics.proxy_used = attempt.proxy_used;
+                    metrics.referer = custom_referer.clone().or_else(|| current_referer.clone());
+                    metrics.redirect_url = Some(next_url.to_string());
+                    metrics.headers = attempt.headers;
+                    return Err(CurlError::TooManyRedirects {
+                        max: transfer.max_redirs,
+                    });
+                }
+
+                if !redirect_protocol_allowed(transfer, &next_url) {
+                    metrics.url_effective = attempt.final_url.to_string();
+                    metrics.response_code = Some(status.as_u16());
+                    metrics.http_connect = attempt.http_connect_code;
+                    metrics.proxy_used = attempt.proxy_used;
+                    metrics.referer = custom_referer.clone().or_else(|| current_referer.clone());
+                    metrics.redirect_url = Some(next_url.to_string());
+                    metrics.headers = attempt.headers;
+                    return Err(CurlError::UnsupportedProtocol(
+                        next_url.scheme().to_string(),
+                    ));
+                }
+
+                if next_url.scheme() != "http" {
+                    metrics.url_effective = attempt.final_url.to_string();
+                    metrics.response_code = Some(status.as_u16());
+                    metrics.http_connect = attempt.http_connect_code;
+                    metrics.proxy_used = attempt.proxy_used;
+                    metrics.referer = custom_referer.clone().or_else(|| current_referer.clone());
+                    metrics.redirect_url = Some(next_url.to_string());
+                    metrics.headers = attempt.headers;
+                    return Err(raw_http_non_plain_redirect_error(
+                        &next_url,
+                        "raw HTTP proxy tunnel redirects outside plain http:// are not implemented in the Rust sidecar",
+                        true,
+                    ));
+                }
+
+                if transfer.auto_referer && custom_referer.is_none() {
+                    current_referer = Some(auto_referer_value(&attempt.final_url));
+                }
+                let followup = redirect_followup(
+                    transfer,
+                    status,
+                    &current_method,
+                    custom_method,
+                    post_redirect_body,
+                );
+                if let Some(next_method) = followup.method {
+                    current_method = next_method;
+                }
+                if followup.drop_body {
+                    send_request_body = false;
+                }
+                url = next_url;
+                current_path_as_is_url = next_path_as_is_url;
+                redirects += 1;
+                redirect_attempts.push(attempt);
+                continue;
+            }
+
+            let mut final_attempt = attempt;
+            final_attempt.redirects = redirect_attempts;
+            metrics.url_effective = final_attempt.final_url.to_string();
+            metrics.response_code = final_attempt.status.map(|status| status.as_u16());
+            metrics.http_connect = final_attempt.http_connect_code;
+            metrics.proxy_used = final_attempt.proxy_used;
             metrics.referer = custom_referer.clone().or_else(|| current_referer.clone());
             metrics.content_type = final_attempt
                 .headers
@@ -9883,6 +10029,8 @@ async fn run_raw_http_proxy_tunnel_transfer(
         },
     )
     .await?;
+    let connect_header_bytes = (!context.transfer.suppress_connect_headers)
+        .then(|| http_attempt_header_bytes(&connect_attempt));
     let connect_status = connect_attempt.status.ok_or(CurlError::WeirdServerReply)?;
     if !connect_status.is_success() {
         return Err(CurlError::HttpStatus {
@@ -9915,6 +10063,10 @@ async fn run_raw_http_proxy_tunnel_transfer(
     let request = raw_http_direct_request(&direct_context)?;
     let mut attempt = raw_http_send_direct_request(&mut stream, &request, &direct_context).await?;
     record_raw_http_attempt_metrics(&mut attempt, &stream, true, request.len());
+    if let Some(mut header_bytes) = connect_header_bytes {
+        header_bytes.extend_from_slice(&http_attempt_header_bytes(&attempt));
+        attempt.header_bytes = Some(header_bytes);
+    }
     attempt.http_connect_code = Some(connect_status.as_u16());
     attempt.proxy_used = true;
     decode_http_attempt_body(context.transfer, &mut attempt)?;
