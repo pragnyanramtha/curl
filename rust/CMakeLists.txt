@@ -45,6 +45,8 @@ endif()
 set(_curl_rust_corpus_tests
   1
   2
+  3
+  4
   6
   12
   13

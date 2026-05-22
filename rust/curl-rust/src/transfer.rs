@@ -13525,7 +13525,9 @@ fn same_redirect_origin(initial: &Url, current: &Url) -> bool {
 fn parse_headers(headers: &[String]) -> Result<Vec<(HeaderName, Option<HeaderValue>)>> {
     let mut parsed = Vec::new();
     for header in headers {
-        parsed.push(parse_header(header)?);
+        if let Some(header) = parse_header(header)? {
+            parsed.push(header);
+        }
     }
     Ok(parsed)
 }
@@ -13545,7 +13547,9 @@ fn raw_headers_contain(headers: &[RawHeader], name: &str) -> bool {
 fn parse_raw_headers(headers: &[String]) -> Result<Vec<RawHeader>> {
     let mut parsed = Vec::new();
     for header in headers {
-        parsed.push(parse_raw_header(header)?);
+        if let Some(header) = parse_raw_header(header)? {
+            parsed.push(header);
+        }
     }
     Ok(parsed)
 }
@@ -13562,21 +13566,19 @@ fn explicit_header_value(headers: &[String], name: &str) -> Result<Option<String
         }))
 }
 
-fn parse_raw_header(header: &str) -> Result<RawHeader> {
+fn parse_raw_header(header: &str) -> Result<Option<RawHeader>> {
     if let Some(name) = header.strip_suffix(';')
         && !name.contains(':')
     {
         let wire_name = name.trim().to_string();
-        return Ok(RawHeader {
+        return Ok(Some(RawHeader {
             name: parse_header_name(name)?,
             wire_name,
             value: Some(HeaderValue::from_static("")),
-        });
+        }));
     }
     let Some((name, value)) = header.split_once(':') else {
-        return Err(CurlError::Usage(format!(
-            "header {header:?} is missing ':'"
-        )));
+        return Ok(None);
     };
     let wire_name = name.trim().to_string();
     let name = parse_header_name(name)?;
@@ -13587,32 +13589,33 @@ fn parse_raw_header(header: &str) -> Result<RawHeader> {
             CurlError::Usage(format!("bad header value for {}: {error}", name.as_str()))
         })?)
     };
-    Ok(RawHeader {
+    Ok(Some(RawHeader {
         name,
         wire_name,
         value,
-    })
+    }))
 }
 
-fn parse_header(header: &str) -> Result<(HeaderName, Option<HeaderValue>)> {
+fn parse_header(header: &str) -> Result<Option<(HeaderName, Option<HeaderValue>)>> {
     if let Some(name) = header.strip_suffix(';')
         && !name.contains(':')
     {
-        return Ok((parse_header_name(name)?, Some(HeaderValue::from_static(""))));
+        return Ok(Some((
+            parse_header_name(name)?,
+            Some(HeaderValue::from_static("")),
+        )));
     }
     let Some((name, value)) = header.split_once(':') else {
-        return Err(CurlError::Usage(format!(
-            "header {header:?} is missing ':'"
-        )));
+        return Ok(None);
     };
     let name = parse_header_name(name)?;
     if value.trim().is_empty() {
-        return Ok((name, None));
+        return Ok(Some((name, None)));
     }
     let value = HeaderValue::from_str(value.trim_start()).map_err(|error| {
         CurlError::Usage(format!("bad header value for {}: {error}", name.as_str()))
     })?;
-    Ok((name, Some(value)))
+    Ok(Some((name, Some(value))))
 }
 
 fn parse_header_name(name: &str) -> Result<HeaderName> {
@@ -14403,6 +14406,42 @@ mod tests {
         let defaults =
             origin_ca_env_defaults_from(&transfer, |_| Some(PathBuf::from("bundle.pem")));
         assert!(defaults.cacert.is_none());
+    }
+
+    #[test]
+    fn header_parser_matches_curl_semicolon_and_missing_colon_rules() {
+        let headers = vec![
+            "extra-header: here".to_string(),
+            "Accept: replaced".to_string(),
+            "X-Custom-Header;".to_string(),
+            "X-Test: foo; ".to_string(),
+            "X-Test:".to_string(),
+            "X-Test2: foo;".to_string(),
+            "X-Test3:  ".to_string(),
+            "X-Test4;  ".to_string(),
+            "X-Test5;ignored".to_string(),
+        ];
+
+        let parsed = parse_headers(&headers).unwrap();
+        assert_eq!(parsed.len(), 7);
+        assert_eq!(parsed[2].0.as_str(), "x-custom-header");
+        assert_eq!(parsed[2].1.as_ref().unwrap(), "");
+        assert_eq!(parsed[3].0.as_str(), "x-test");
+        assert_eq!(parsed[3].1.as_ref().unwrap(), "foo; ");
+        assert_eq!(parsed[4].0.as_str(), "x-test");
+        assert!(parsed[4].1.is_none());
+        assert_eq!(parsed[5].0.as_str(), "x-test2");
+        assert_eq!(parsed[5].1.as_ref().unwrap(), "foo;");
+        assert_eq!(parsed[6].0.as_str(), "x-test3");
+        assert!(parsed[6].1.is_none());
+
+        let raw = parse_raw_headers(&headers).unwrap();
+        assert_eq!(raw.len(), 7);
+        assert_eq!(raw[2].wire_name, "X-Custom-Header");
+        assert_eq!(raw[2].value.as_ref().unwrap(), "");
+        assert_eq!(raw[3].wire_name, "X-Test");
+        assert_eq!(raw[3].value.as_ref().unwrap(), "foo; ");
+        assert!(raw[4].value.is_none());
     }
 
     #[test]
