@@ -4725,6 +4725,39 @@ fn request_target_location_follows_redirect_with_same_target() {
 }
 
 #[test]
+fn simple_location_include_preserves_raw_redirect_headers() {
+    let (url, rx) = spawn_sequence_server(vec![
+        b"HTTP/1.1 301 This is a weirdo text message\r\nDate: Tue, 09 Nov 2010 14:49:00 GMT\r\nServer: test-server/fake\r\nLocation: data/110002.txt?coolsite=yes\r\nConnection: close\r\n\r\nThis server reply is skipped while following\n",
+        b"HTTP/1.1 200 Followed here fine\r\nDate: Tue, 09 Nov 2010 14:49:00 GMT\r\nServer: test-server/fake\r\nContent-Length: 51\r\n\r\nIf this is received, the location following worked\n",
+    ]);
+
+    let mut command = Command::cargo_bin("curl").unwrap();
+    command.args(["-q", "-sS", "-L", "-i", &url]);
+    command.assert().success().stdout(
+        "HTTP/1.1 301 This is a weirdo text message\r\n\
+         Date: Tue, 09 Nov 2010 14:49:00 GMT\r\n\
+         Server: test-server/fake\r\n\
+         Location: data/110002.txt?coolsite=yes\r\n\
+         Connection: close\r\n\
+         \r\n\
+         HTTP/1.1 200 Followed here fine\r\n\
+         Date: Tue, 09 Nov 2010 14:49:00 GMT\r\n\
+         Server: test-server/fake\r\n\
+         Content-Length: 51\r\n\
+         \r\n\
+         If this is received, the location following worked\n",
+    );
+
+    let first = rx.recv().unwrap();
+    let second = rx.recv().unwrap();
+    assert_eq!(first.start_line, "GET /resource HTTP/1.1");
+    assert_eq!(
+        second.start_line,
+        "GET /data/110002.txt?coolsite=yes HTTP/1.1"
+    );
+}
+
+#[test]
 fn request_target_location_allows_duplicate_location_repeat() {
     let (url, rx) = spawn_sequence_server(vec![
         b"HTTP/1.1 302 Found\r\nLocation: /next\r\nLocation: /next\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",

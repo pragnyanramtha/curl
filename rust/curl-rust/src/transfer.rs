@@ -9745,6 +9745,7 @@ async fn run_http_transfer(
             || initial_connect_to.is_some()
             || custom_host_header
             || raw_http_retry_redirect_wire_semantics(transfer)
+            || raw_http_simple_include_redirect_wire_semantics(transfer, &method)
             || raw_http_remote_header_redirect_wire_semantics(transfer, &method)
             || (transfer.include_headers && transfer.follow_obey_code)
             || (method != Method::HEAD && max_filesize_limit(transfer).is_some()))
@@ -10742,6 +10743,31 @@ fn raw_http_retry_redirect_wire_semantics(transfer: &TransferConfig) -> bool {
         && transfer.resolve.is_empty()
         && transfer.proxy.is_none()
         && transfer.http_version == HttpVersionPreference::Any
+}
+
+fn raw_http_simple_include_redirect_wire_semantics(
+    transfer: &TransferConfig,
+    method: &Method,
+) -> bool {
+    *method == Method::GET
+        && transfer.follow_location
+        && transfer.include_headers
+        && !transfer.verbose
+        && transfer.headers.is_empty()
+        && transfer.resolve.is_empty()
+        && transfer.proxy.is_none()
+        && transfer.http_version == HttpVersionPreference::Any
+        && transfer.data.is_empty()
+        && transfer.forms.is_empty()
+        && transfer.upload_file.is_none()
+        && transfer.user.is_none()
+        && transfer.oauth2_bearer.is_none()
+        && transfer.aws_sigv4.is_none()
+        && transfer.cookie.is_none()
+        && transfer.referer.is_none()
+        && transfer.range.is_none()
+        && transfer.time_cond.is_none()
+        && transfer.etag_compare.is_none()
 }
 
 fn raw_http_remote_header_redirect_wire_semantics(
