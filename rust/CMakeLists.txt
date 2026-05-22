@@ -259,6 +259,9 @@ set(_curl_rust_corpus_tests
   664
   665
   681
+  682
+  683
+  684
   690
   691
   692
@@ -513,6 +516,7 @@ set(_curl_rust_corpus_tests
   1983
   1984
   2004
+  2005
   2007
   2008
   2044

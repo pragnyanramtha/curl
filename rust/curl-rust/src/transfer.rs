@@ -10405,9 +10405,10 @@ async fn run_http_transfer(
         request = apply_auth(
             request,
             transfer,
+            &url,
             applied_headers.has_authorization,
             sensitive_headers_allowed,
-        );
+        )?;
 
         if let Some(form) = multipart {
             request = request.multipart(form);
@@ -11201,23 +11202,19 @@ fn raw_http_direct_request(context: &RawHttpDirectContext<'_>) -> Result<Vec<u8>
         &parsed_headers,
         context.custom_host_allowed,
     );
-    if context.sensitive_headers_allowed
-        && let Some(token) = &context.transfer.oauth2_bearer
-        && !has_header("authorization")
-    {
-        request.extend_from_slice(format!("Authorization: Bearer {token}\r\n").as_bytes());
-    } else if context.sensitive_headers_allowed
-        && let Some(user) = &context.transfer.user
-        && context.transfer.oauth2_bearer.is_none()
-        && !has_header("authorization")
-    {
-        request.extend_from_slice(
-            format!(
-                "Authorization: Basic {}\r\n",
-                base64_padded(user.as_bytes())
-            )
-            .as_bytes(),
-        );
+    if context.sensitive_headers_allowed && !has_header("authorization") {
+        if let Some(token) = &context.transfer.oauth2_bearer {
+            request.extend_from_slice(format!("Authorization: Bearer {token}\r\n").as_bytes());
+        } else if let Some(credentials) = effective_http_credentials(context.transfer, context.url)?
+        {
+            request.extend_from_slice(
+                format!(
+                    "Authorization: Basic {}\r\n",
+                    http_basic_authorization(&credentials)
+                )
+                .as_bytes(),
+            );
+        }
     }
     append_raw_http_range_header(
         &mut request,
@@ -11395,23 +11392,19 @@ fn raw_http_proxy_request(context: &RawHttpProxyContext<'_>) -> Result<Vec<u8>> 
     {
         request.extend_from_slice(format!("Proxy-Authorization: {authorization}\r\n").as_bytes());
     }
-    if context.sensitive_headers_allowed
-        && let Some(token) = &context.transfer.oauth2_bearer
-        && !has_header("authorization")
-    {
-        request.extend_from_slice(format!("Authorization: Bearer {token}\r\n").as_bytes());
-    } else if context.sensitive_headers_allowed
-        && let Some(user) = &context.transfer.user
-        && context.transfer.oauth2_bearer.is_none()
-        && !has_header("authorization")
-    {
-        request.extend_from_slice(
-            format!(
-                "Authorization: Basic {}\r\n",
-                base64_padded(user.as_bytes())
-            )
-            .as_bytes(),
-        );
+    if context.sensitive_headers_allowed && !has_header("authorization") {
+        if let Some(token) = &context.transfer.oauth2_bearer {
+            request.extend_from_slice(format!("Authorization: Bearer {token}\r\n").as_bytes());
+        } else if let Some(credentials) = effective_http_credentials(context.transfer, context.url)?
+        {
+            request.extend_from_slice(
+                format!(
+                    "Authorization: Basic {}\r\n",
+                    http_basic_authorization(&credentials)
+                )
+                .as_bytes(),
+            );
+        }
     }
     append_raw_http_range_header(
         &mut request,
@@ -13290,7 +13283,9 @@ fn reject_unsupported_http_auth(transfer: &TransferConfig) -> Result<()> {
             "--aws-sigv4 runtime signing is not implemented in the Rust sidecar".to_string(),
         ));
     }
-    if transfer.user.is_some() && transfer.http_auth.requires_unsupported_http_runtime() {
+    if http_auth_credentials_configured(transfer)
+        && transfer.http_auth.requires_unsupported_http_runtime()
+    {
         return Err(CurlError::Unsupported(
             "selected HTTP authentication method is not implemented in the Rust sidecar"
                 .to_string(),
@@ -13305,6 +13300,13 @@ fn reject_unsupported_http_auth(transfer: &TransferConfig) -> Result<()> {
         ));
     }
     Ok(())
+}
+
+fn http_auth_credentials_configured(transfer: &TransferConfig) -> bool {
+    transfer.user.is_some()
+        || transfer.netrc
+        || transfer.netrc_optional
+        || transfer.netrc_file.is_some()
 }
 
 fn proxy_auth_credentials_configured(transfer: &TransferConfig) -> Result<bool> {
@@ -13631,23 +13633,360 @@ fn append_raw_header(request: &mut Vec<u8>, name: &str, value: &HeaderValue) {
 fn apply_auth(
     request: reqwest::RequestBuilder,
     transfer: &TransferConfig,
+    url: &Url,
     has_authorization: bool,
     sensitive_headers_allowed: bool,
-) -> reqwest::RequestBuilder {
+) -> Result<reqwest::RequestBuilder> {
     if !sensitive_headers_allowed {
-        return request;
+        return Ok(request);
+    }
+    if transfer.oauth2_bearer.is_some() || has_authorization {
+        return Ok(request);
     }
 
-    let Some(user) = &transfer.user else {
-        return request;
+    let Some(credentials) = effective_http_credentials(transfer, url)? else {
+        return Ok(request);
     };
 
-    if transfer.oauth2_bearer.is_some() || has_authorization {
-        return request;
+    Ok(request.basic_auth(credentials.login, Some(credentials.password)))
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct HttpCredentials {
+    login: String,
+    password: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct UrlHttpCredentials {
+    credentials: HttpCredentials,
+    has_password: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum NetrcMode {
+    Ignored,
+    Optional,
+    Required,
+}
+
+fn effective_http_credentials(
+    transfer: &TransferConfig,
+    url: &Url,
+) -> Result<Option<HttpCredentials>> {
+    if let Some(user) = &transfer.user {
+        let (login, password) = split_user_password(user);
+        return Ok(Some(HttpCredentials {
+            login: login.to_string(),
+            password: password.to_string(),
+        }));
     }
 
-    let (login, password) = split_user_password(user);
-    request.basic_auth(login.to_string(), Some(password.to_string()))
+    let url_credentials = url_http_credentials(url);
+    let mode = netrc_mode(transfer);
+    match mode {
+        NetrcMode::Ignored => Ok(url_credentials.map(|credentials| credentials.credentials)),
+        NetrcMode::Optional => {
+            if let Some(credentials) = &url_credentials
+                && credentials.has_password
+            {
+                return Ok(Some(credentials.credentials.clone()));
+            }
+            let Some(host) = url.host_str() else {
+                return Ok(url_credentials.map(|credentials| credentials.credentials));
+            };
+            let requested_login = url_credentials
+                .as_ref()
+                .map(|credentials| credentials.credentials.login.as_str());
+            match lookup_netrc_credentials(&netrc_path(transfer), host, requested_login) {
+                Ok(Some(credentials)) => Ok(Some(credentials)),
+                Ok(None) | Err(_) => Ok(url_credentials.map(|credentials| credentials.credentials)),
+            }
+        }
+        NetrcMode::Required => {
+            let host = url
+                .host_str()
+                .ok_or_else(|| CurlError::Url("URL is missing a host".to_string()))?;
+            let requested_login = url_credentials
+                .as_ref()
+                .map(|credentials| credentials.credentials.login.as_str());
+            let path = netrc_path(transfer);
+            lookup_netrc_credentials(&path, host, requested_login)?
+                .ok_or_else(|| {
+                    CurlError::ReadError(format!(
+                        "Couldn't find host {host} in netrc file {}",
+                        path.display()
+                    ))
+                })
+                .map(Some)
+        }
+    }
+}
+
+fn url_http_credentials(url: &Url) -> Option<UrlHttpCredentials> {
+    if url.username().is_empty() && url.password().is_none() {
+        return None;
+    }
+    let login = percent_decode(url.username().as_bytes())
+        .decode_utf8_lossy()
+        .into_owned();
+    let password = url
+        .password()
+        .map(|password| {
+            percent_decode(password.as_bytes())
+                .decode_utf8_lossy()
+                .into_owned()
+        })
+        .unwrap_or_default();
+    Some(UrlHttpCredentials {
+        credentials: HttpCredentials { login, password },
+        has_password: url.password().is_some(),
+    })
+}
+
+fn netrc_mode(transfer: &TransferConfig) -> NetrcMode {
+    if transfer.netrc_optional {
+        NetrcMode::Optional
+    } else if transfer.netrc || transfer.netrc_file.is_some() {
+        NetrcMode::Required
+    } else {
+        NetrcMode::Ignored
+    }
+}
+
+fn netrc_path(transfer: &TransferConfig) -> PathBuf {
+    if let Some(path) = &transfer.netrc_file {
+        return path.clone();
+    }
+    if let Some(path) = std::env::var_os("NETRC")
+        && !path.as_os_str().is_empty()
+    {
+        return PathBuf::from(path);
+    }
+    std::env::var_os("HOME")
+        .filter(|home| !home.as_os_str().is_empty())
+        .map(PathBuf::from)
+        .map(|home| home.join(".netrc"))
+        .unwrap_or_else(|| PathBuf::from(".netrc"))
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct NetrcEntry {
+    matcher: NetrcMatcher,
+    login: Option<String>,
+    password: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum NetrcMatcher {
+    Machine(String),
+    Default,
+}
+
+fn lookup_netrc_credentials(
+    path: &Path,
+    host: &str,
+    requested_login: Option<&str>,
+) -> Result<Option<HttpCredentials>> {
+    let content = std::fs::read_to_string(path).map_err(|error| {
+        CurlError::ReadError(format!(
+            "Failed to read netrc file {}: {error}",
+            path.display()
+        ))
+    })?;
+    let entries = parse_netrc_entries(&content);
+
+    for entry in entries
+        .iter()
+        .filter(|entry| matches_netrc_host(entry, host))
+    {
+        if let Some(credentials) = netrc_entry_credentials(entry, requested_login) {
+            return Ok(Some(credentials));
+        }
+    }
+    for entry in entries
+        .iter()
+        .filter(|entry| matches!(entry.matcher, NetrcMatcher::Default))
+    {
+        if let Some(credentials) = netrc_entry_credentials(entry, requested_login) {
+            return Ok(Some(credentials));
+        }
+    }
+    Ok(None)
+}
+
+fn matches_netrc_host(entry: &NetrcEntry, host: &str) -> bool {
+    match &entry.matcher {
+        NetrcMatcher::Machine(machine) => machine.eq_ignore_ascii_case(host),
+        NetrcMatcher::Default => false,
+    }
+}
+
+fn netrc_entry_credentials(
+    entry: &NetrcEntry,
+    requested_login: Option<&str>,
+) -> Option<HttpCredentials> {
+    match requested_login {
+        Some(requested) => match entry.login.as_deref() {
+            Some(login) if login == requested => Some(HttpCredentials {
+                login: login.to_string(),
+                password: entry.password.clone().unwrap_or_default(),
+            }),
+            Some(_) => None,
+            None => entry.password.as_ref().map(|password| HttpCredentials {
+                login: requested.to_string(),
+                password: password.clone(),
+            }),
+        },
+        None => {
+            if let Some(login) = &entry.login {
+                Some(HttpCredentials {
+                    login: login.clone(),
+                    password: entry.password.clone().unwrap_or_default(),
+                })
+            } else {
+                entry.password.as_ref().map(|password| HttpCredentials {
+                    login: String::new(),
+                    password: password.clone(),
+                })
+            }
+        }
+    }
+}
+
+fn parse_netrc_entries(content: &str) -> Vec<NetrcEntry> {
+    let tokens = parse_netrc_tokens(content);
+    let mut entries = Vec::new();
+    let mut current: Option<NetrcEntry> = None;
+    let mut index = 0;
+
+    while index < tokens.len() {
+        match tokens[index].as_str() {
+            "machine" => {
+                if let Some(entry) = current.take() {
+                    entries.push(entry);
+                }
+                index += 1;
+                let Some(machine) = tokens.get(index) else {
+                    break;
+                };
+                current = Some(NetrcEntry {
+                    matcher: NetrcMatcher::Machine(machine.clone()),
+                    login: None,
+                    password: None,
+                });
+            }
+            "default" => {
+                if let Some(entry) = current.take() {
+                    entries.push(entry);
+                }
+                current = Some(NetrcEntry {
+                    matcher: NetrcMatcher::Default,
+                    login: None,
+                    password: None,
+                });
+            }
+            "login" => {
+                index += 1;
+                if let (Some(entry), Some(login)) = (current.as_mut(), tokens.get(index)) {
+                    entry.login = Some(login.clone());
+                }
+            }
+            "password" => {
+                index += 1;
+                if let (Some(entry), Some(password)) = (current.as_mut(), tokens.get(index)) {
+                    entry.password = Some(password.clone());
+                }
+            }
+            "macdef" | "account" => {
+                index += 1;
+            }
+            _ => {}
+        }
+        index += 1;
+    }
+
+    if let Some(entry) = current {
+        entries.push(entry);
+    }
+    entries
+}
+
+fn parse_netrc_tokens(content: &str) -> Vec<String> {
+    let mut tokens = Vec::new();
+    let mut in_macdef = false;
+
+    for line in content.lines() {
+        let trimmed = line.trim_start();
+        if in_macdef {
+            if trimmed.is_empty() {
+                in_macdef = false;
+            }
+            continue;
+        }
+        if trimmed.is_empty() || trimmed.starts_with('#') {
+            continue;
+        }
+        let mut line_tokens = parse_netrc_line_tokens(trimmed);
+        if line_tokens.first().is_some_and(|token| token == "macdef") {
+            in_macdef = true;
+            continue;
+        }
+        tokens.append(&mut line_tokens);
+    }
+
+    tokens
+}
+
+fn parse_netrc_line_tokens(line: &str) -> Vec<String> {
+    let mut tokens = Vec::new();
+    let mut chars = line.chars().peekable();
+
+    while let Some(ch) = chars.peek().copied() {
+        if ch.is_whitespace() {
+            chars.next();
+            continue;
+        }
+        if ch == '"' {
+            chars.next();
+            let mut token = String::new();
+            while let Some(ch) = chars.next() {
+                match ch {
+                    '"' => break,
+                    '\\' => match chars.next() {
+                        Some('n') => token.push('\n'),
+                        Some('r') => token.push('\r'),
+                        Some('t') => token.push('\t'),
+                        Some(other) => token.push(other),
+                        None => break,
+                    },
+                    other => token.push(other),
+                }
+            }
+            tokens.push(token);
+            continue;
+        }
+
+        let mut token = String::new();
+        while let Some(ch) = chars.peek().copied() {
+            if ch.is_whitespace() {
+                break;
+            }
+            token.push(ch);
+            chars.next();
+        }
+        tokens.push(token);
+    }
+
+    tokens
+}
+
+fn http_basic_authorization(credentials: &HttpCredentials) -> String {
+    let mut value = Vec::with_capacity(credentials.login.len() + credentials.password.len() + 1);
+    value.extend_from_slice(credentials.login.as_bytes());
+    value.push(b':');
+    value.extend_from_slice(credentials.password.as_bytes());
+    base64_padded(&value)
 }
 
 fn split_user_password(value: &str) -> (&str, &str) {
@@ -14053,6 +14392,88 @@ mod tests {
         let defaults =
             origin_ca_env_defaults_from(&transfer, |_| Some(PathBuf::from("bundle.pem")));
         assert!(defaults.cacert.is_none());
+    }
+
+    #[test]
+    fn netrc_lookup_matches_login_and_password_only_entries() {
+        let temp = tempdir().unwrap();
+        let netrc = temp.path().join("netrc");
+        std::fs::write(
+            &netrc,
+            "machine example.com login user1 password passwd1\n\
+             machine example.com password host-password\n",
+        )
+        .unwrap();
+
+        let credentials = lookup_netrc_credentials(&netrc, "example.com", Some("user1"))
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            credentials,
+            HttpCredentials {
+                login: "user1".to_string(),
+                password: "passwd1".to_string()
+            }
+        );
+
+        let credentials = lookup_netrc_credentials(&netrc, "example.com", Some("urluser"))
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            credentials,
+            HttpCredentials {
+                login: "urluser".to_string(),
+                password: "host-password".to_string()
+            }
+        );
+    }
+
+    #[test]
+    fn netrc_effective_http_credentials_follow_curl_precedence() {
+        let temp = tempdir().unwrap();
+        let netrc = temp.path().join("netrc");
+        std::fs::write(
+            &netrc,
+            "machine example.com login netrc-user password netrc-pass\n\
+             machine blank.example password blank-pass\n",
+        )
+        .unwrap();
+
+        let transfer = TransferConfig {
+            netrc_file: Some(netrc.clone()),
+            ..TransferConfig::default()
+        };
+        let url = Url::parse("http://example.com/").unwrap();
+        assert_eq!(
+            effective_http_credentials(&transfer, &url).unwrap(),
+            Some(HttpCredentials {
+                login: "netrc-user".to_string(),
+                password: "netrc-pass".to_string()
+            })
+        );
+
+        let url = Url::parse("http://blank.example/").unwrap();
+        assert_eq!(
+            effective_http_credentials(&transfer, &url).unwrap(),
+            Some(HttpCredentials {
+                login: String::new(),
+                password: "blank-pass".to_string()
+            })
+        );
+
+        let transfer = TransferConfig {
+            user: Some("explicit:secret".to_string()),
+            netrc_file: Some(netrc),
+            ..TransferConfig::default()
+        };
+        let url = Url::parse("http://example.com/").unwrap();
+        assert_eq!(
+            effective_http_credentials(&transfer, &url).unwrap(),
+            Some(HttpCredentials {
+                login: "explicit".to_string(),
+                password: "secret".to_string()
+            })
+        );
     }
 
     #[test]

@@ -124,6 +124,9 @@ pub struct TransferConfig {
     pub fail: bool,
     pub fail_with_body: bool,
     pub user: Option<String>,
+    pub netrc: bool,
+    pub netrc_optional: bool,
+    pub netrc_file: Option<PathBuf>,
     pub http_auth: AuthMethods,
     pub oauth2_bearer: Option<String>,
     pub sasl_ir: bool,
@@ -625,6 +628,9 @@ impl Default for TransferConfig {
             fail: false,
             fail_with_body: false,
             user: None,
+            netrc: false,
+            netrc_optional: false,
+            netrc_file: None,
             http_auth: AuthMethods::default(),
             oauth2_bearer: None,
             sasl_ir: false,
@@ -1126,6 +1132,12 @@ impl Parser {
                 let value = self.value_for(name, inline_value)?;
                 self.current().user = Some(value);
             }
+            "netrc" => self.current().netrc = true,
+            "netrc-optional" => self.current().netrc_optional = true,
+            "netrc-file" => {
+                let value = self.value_for(name, inline_value)?;
+                self.current().netrc_file = Some(parse_existing_path(name, &value)?);
+            }
             "anyauth" => self.current().http_auth.set_any(),
             "basic" => self.current().http_auth.insert(AuthMethods::BASIC),
             "digest" => self.current().http_auth.insert(AuthMethods::DIGEST),
@@ -1391,6 +1403,8 @@ impl Parser {
                 self.current().fail = false;
                 self.current().fail_with_body = false;
             }
+            "netrc" => self.current().netrc = false,
+            "netrc-optional" => self.current().netrc_optional = false,
             "basic" => self.current().http_auth.remove(AuthMethods::BASIC),
             "digest" => self.current().http_auth.remove(AuthMethods::DIGEST),
             "negotiate" => self.current().http_auth.remove(AuthMethods::NEGOTIATE),
@@ -1562,6 +1576,7 @@ impl Parser {
                     self.current().user = Some(value);
                     break;
                 }
+                'n' => self.current().netrc = true,
                 'U' => {
                     let value = self.short_value('U', rest)?;
                     self.current().proxy_user = Some(value);
@@ -2112,6 +2127,9 @@ impl TransferConfig {
             || self.fail
             || self.fail_with_body
             || self.user.is_some()
+            || self.netrc
+            || self.netrc_optional
+            || self.netrc_file.is_some()
             || !self.http_auth.is_empty()
             || self.oauth2_bearer.is_some()
             || self.sasl_ir
@@ -2240,6 +2258,7 @@ fn option_takes_value(name: &str) -> bool {
             | "retry-delay"
             | "retry-max-time"
             | "user"
+            | "netrc-file"
             | "aws-sigv4"
             | "oauth2-bearer"
             | "sasl-authzid"
@@ -3267,6 +3286,9 @@ fn print_common_help() {
            -X, --request <method>      Specify request method\n\
                --request-target <path> Specify request target\n\
            -u, --user <user:pass>      Server user and password\n\
+           -n, --netrc                 Must read .netrc for user name and password\n\
+               --netrc-file <file>     Specify FILE for netrc\n\
+               --netrc-optional        Use .netrc credentials if available\n\
                --basic                 Use HTTP Basic Authentication\n\
                --digest                Use HTTP Digest Authentication\n\
                --negotiate             Use HTTP Negotiate Authentication\n\
@@ -5136,6 +5158,50 @@ mod tests {
         assert!(transfer.proxytunnel);
         assert!(transfer.suppress_connect_headers);
         assert_eq!(transfer.noproxy.as_deref(), Some("example.com"));
+    }
+
+    #[test]
+    fn parses_netrc_options() {
+        let temp = tempdir().unwrap();
+        let netrc_file = temp.path().join("netrc");
+        std::fs::write(
+            &netrc_file,
+            "machine example.com login user password secret\n",
+        )
+        .unwrap();
+
+        let config = parse_args([
+            "-q",
+            "--netrc",
+            "--netrc-optional",
+            "--netrc-file",
+            netrc_file.to_str().unwrap(),
+            "-n",
+            "https://example.com",
+        ])
+        .unwrap();
+
+        let transfer = &config.transfers[0];
+        assert!(transfer.netrc);
+        assert!(transfer.netrc_optional);
+        assert_eq!(transfer.netrc_file.as_deref(), Some(netrc_file.as_path()));
+    }
+
+    #[test]
+    fn no_prefixed_netrc_options_disable_previous_values() {
+        let config = parse_args([
+            "-q",
+            "--netrc",
+            "--netrc-optional",
+            "--no-netrc-optional",
+            "--no-netrc",
+            "https://example.com",
+        ])
+        .unwrap();
+
+        let transfer = &config.transfers[0];
+        assert!(!transfer.netrc);
+        assert!(!transfer.netrc_optional);
     }
 
     #[test]

@@ -421,6 +421,14 @@ fn write_request(out: &mut String, render: &RenderTransfer<'_>, url: &str) -> Re
     if let Some(user) = &transfer.user {
         emit_string_setopt(out, "CURLOPT_USERPWD", user);
     }
+    if transfer.netrc_optional {
+        emit_raw_setopt(out, "CURLOPT_NETRC", "CURL_NETRC_OPTIONAL");
+    } else if transfer.netrc || transfer.netrc_file.is_some() {
+        emit_raw_setopt(out, "CURLOPT_NETRC", "CURL_NETRC_REQUIRED");
+    }
+    if let Some(netrc_file) = &transfer.netrc_file {
+        emit_path_setopt(out, "CURLOPT_NETRC_FILE", netrc_file);
+    }
     if let Some(expr) = transfer.http_auth.to_curlauth_expr() {
         emit_raw_setopt(out, "CURLOPT_HTTPAUTH", &curlauth_setopt_value(&expr));
     }
@@ -993,6 +1001,27 @@ mod tests {
         assert!(source.contains("CURLOPT_SUPPRESS_CONNECT_HEADERS, 1L"));
         assert!(source.contains("CURLOPT_NOPROXY, \"localhost\""));
         assert!(source.contains("CURLOPT_USERAGENT, \"MyUA\""));
+    }
+
+    #[test]
+    fn renders_netrc_options() {
+        let temp = tempdir().unwrap();
+        let netrc = temp.path().join("netrc");
+        std::fs::write(&netrc, "machine example.com login user password secret\n").unwrap();
+        let config = parse_args([
+            "-q",
+            "--netrc-optional",
+            "--netrc-file",
+            netrc.to_str().unwrap(),
+            "https://example.com",
+        ])
+        .unwrap();
+
+        let source = render_source(&config).unwrap();
+
+        assert!(source.contains("CURLOPT_NETRC, CURL_NETRC_OPTIONAL"));
+        assert!(source.contains("CURLOPT_NETRC_FILE"));
+        assert!(source.contains(netrc.to_str().unwrap()));
     }
 
     #[test]
