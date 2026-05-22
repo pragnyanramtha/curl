@@ -1159,14 +1159,12 @@ impl Parser {
             "proxy" => {
                 let value = self.value_for(name, inline_value)?;
                 let transfer = self.current();
-                transfer.proxy = Some(value);
-                transfer.proxy_version = ProxyVersionPreference::Http11;
+                set_proxy_value(transfer, value, ProxyVersionPreference::Http11);
             }
             "proxy1.0" => {
                 let value = self.value_for(name, inline_value)?;
                 let transfer = self.current();
-                transfer.proxy = Some(parse_nonempty_string(name, value)?);
-                transfer.proxy_version = ProxyVersionPreference::Http10;
+                set_proxy_value(transfer, value, ProxyVersionPreference::Http10);
             }
             "proxy-header" => {
                 let value = self.value_for(name, inline_value)?;
@@ -1572,8 +1570,7 @@ impl Parser {
                 'x' => {
                     let value = self.short_value('x', rest)?;
                     let transfer = self.current();
-                    transfer.proxy = Some(value);
-                    transfer.proxy_version = ProxyVersionPreference::Http11;
+                    set_proxy_value(transfer, value, ProxyVersionPreference::Http11);
                     break;
                 }
                 'p' => self.current().proxytunnel = true,
@@ -2678,6 +2675,16 @@ fn parse_range_value(name: &str, value: String) -> Result<String> {
         );
     }
     Ok(value)
+}
+
+fn set_proxy_value(transfer: &mut TransferConfig, value: String, version: ProxyVersionPreference) {
+    if value.is_empty() {
+        transfer.proxy = None;
+        transfer.proxy_version = ProxyVersionPreference::default();
+    } else {
+        transfer.proxy = Some(value);
+        transfer.proxy_version = version;
+    }
 }
 
 fn parse_ftp_file_method(value: &str) -> FtpFileMethod {
@@ -5178,6 +5185,35 @@ mod tests {
         .unwrap();
         let transfer = &config.transfers[0];
         assert_eq!(transfer.proxy.as_deref(), Some("new.example:8081"));
+        assert_eq!(transfer.proxy_version, ProxyVersionPreference::Http11);
+    }
+
+    #[test]
+    fn empty_proxy_value_disables_proxy() {
+        let config = parse_args([
+            "-q",
+            "--proxy1.0",
+            "old.example:8080",
+            "--proxy",
+            "",
+            "https://example.com",
+        ])
+        .unwrap();
+        let transfer = &config.transfers[0];
+        assert_eq!(transfer.proxy, None);
+        assert_eq!(transfer.proxy_version, ProxyVersionPreference::Http11);
+
+        let config = parse_args([
+            "-q",
+            "--proxy1.0",
+            "old.example:8080",
+            "-x",
+            "",
+            "https://example.com",
+        ])
+        .unwrap();
+        let transfer = &config.transfers[0];
+        assert_eq!(transfer.proxy, None);
         assert_eq!(transfer.proxy_version, ProxyVersionPreference::Http11);
     }
 

@@ -124,11 +124,18 @@ pub fn render_segments(format: &str, metrics: &Metrics) -> Vec<(OutputStream, St
                 if chars.peek() == Some(&'{') {
                     chars.next();
                     let mut name = String::new();
+                    let mut closed = false;
                     for next in chars.by_ref() {
                         if next == '}' {
+                            closed = true;
                             break;
                         }
                         name.push(next);
+                    }
+                    if !closed {
+                        output.push_str("%{");
+                        output.push_str(&name);
+                        continue;
                     }
                     match name.as_str() {
                         "stdout" => switch_stream(
@@ -527,6 +534,14 @@ mod tests {
             render("one%{stderr}two%{stdout}three", &metrics),
             "onetwothree"
         );
+    }
+
+    #[test]
+    fn render_preserves_unclosed_variable_literal() {
+        let metrics = Metrics::empty("file:///missing", "GET");
+
+        assert_eq!(render("%{", &metrics), "%{");
+        assert_eq!(render("prefix %{http_code", &metrics), "prefix %{http_code");
     }
 
     #[test]
