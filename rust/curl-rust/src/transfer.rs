@@ -25,6 +25,7 @@ use tokio_rustls::rustls::{
     pki_types::{CertificateDer, ServerName, UnixTime, pem::PemObject},
 };
 
+use reqwest::cookie::CookieStore;
 use reqwest::header::{
     ACCEPT, ACCEPT_ENCODING, ACCEPT_RANGES, AUTHORIZATION, CONNECTION, CONTENT_ENCODING,
     CONTENT_LENGTH, CONTENT_RANGE, CONTENT_TYPE, COOKIE, ETAG, HeaderMap, HeaderName, HeaderValue,
@@ -124,6 +125,7 @@ struct RawHttpProxyContext<'a> {
 
 struct RawHttpDirectContext<'a> {
     transfer: &'a TransferConfig,
+    cookie_jar: Option<&'a Arc<CookieJar>>,
     url: &'a Url,
     host_override: Option<&'a str>,
     path_as_is_url: Option<&'a str>,
@@ -141,6 +143,12 @@ struct RawHttpDirectContext<'a> {
 #[derive(Default)]
 struct TransferSession {
     raw_http: RawHttpConnectionPool,
+}
+
+#[derive(Clone, Copy)]
+struct HttpRuntime<'a> {
+    client: &'a Client,
+    cookie_jar: Option<&'a Arc<CookieJar>>,
 }
 
 #[derive(Default)]
@@ -1141,7 +1149,7 @@ async fn run_expanded_url(
         }
         run_http_with_retries(
             transfer,
-            client,
+            HttpRuntime { client, cookie_jar },
             &expanded,
             method,
             &mut metrics,
@@ -1158,7 +1166,7 @@ async fn run_expanded_url(
         }
         run_http_with_retries(
             transfer,
-            client,
+            HttpRuntime { client, cookie_jar },
             &expanded,
             method,
             &mut metrics,
@@ -9607,7 +9615,7 @@ fn parse_http_url_with_numeric_host(
 
 async fn run_http_transfer(
     transfer: &TransferConfig,
-    client: &Client,
+    runtime: HttpRuntime<'_>,
     expanded: &glob::ExpandedUrl,
     method: Method,
     metrics: &mut writeout::Metrics,
@@ -9653,6 +9661,13 @@ async fn run_http_transfer(
         http_upload_size(transfer, prepared_body.as_ref(), upload_body.as_deref());
     let parsed_url = parse_http_url(&expanded.url)?;
     let mut url = parsed_url.url;
+    if let Some(cookie_jar) = runtime.cookie_jar {
+        cookie_jar.load_response_inputs_for_url(
+            &transfer.cookie_files,
+            transfer.junk_session_cookies,
+            &url,
+        )?;
+    }
     let mut current_host_override = parsed_url.host_override;
     let path_as_is_url = transfer.path_as_is.then(|| expanded.url.clone());
     let before_upload_append_path = url.path().to_string();
@@ -9759,6 +9774,7 @@ async fn run_http_transfer(
             let attempt = run_raw_http_direct_transfer(
                 RawHttpDirectContext {
                     transfer,
+                    cookie_jar: runtime.cookie_jar,
                     url: &url,
                     host_override: current_host_override.as_deref(),
                     path_as_is_url: current_path_as_is_url.as_deref(),
@@ -9907,6 +9923,7 @@ async fn run_http_transfer(
         let attempt = run_raw_http_direct_transfer(
             RawHttpDirectContext {
                 transfer,
+                cookie_jar: runtime.cookie_jar,
                 url: &url,
                 host_override: current_host_override.as_deref(),
                 path_as_is_url: path_as_is_url.as_deref(),
@@ -10296,8 +10313,10 @@ async fn run_http_transfer(
         return Ok(attempt);
     }
 
+    let raw_cookie_engine_wire_semantics = raw_http_cookie_engine_wire_semantics(transfer, &method);
     if explicit_proxy.is_none()
-        && raw_http_direct_supported(transfer, &url, has_multipart)
+        && (raw_http_direct_supported(transfer, &url, has_multipart)
+            || (!has_multipart && raw_cookie_engine_wire_semantics))
         && (transfer.request_target.is_some()
             || path_as_is_requires_raw
             || transfer.raw
@@ -10305,6 +10324,7 @@ async fn run_http_transfer(
             || transfer.compressed
             || transfer.tr_encoding
             || raw_custom_header_wire_semantics
+            || raw_cookie_engine_wire_semantics
             || raw_http_output_slot_wire_semantics(transfer)
             || raw_http_retry_wire_semantics(transfer, &method)
             || raw_http_simple_get_wire_semantics(transfer, &method)
@@ -10317,6 +10337,7 @@ async fn run_http_transfer(
         let attempt = run_raw_http_direct_transfer(
             RawHttpDirectContext {
                 transfer,
+                cookie_jar: runtime.cookie_jar,
                 url: &url,
                 host_override: current_host_override.as_deref(),
                 path_as_is_url: path_as_is_url.as_deref(),
@@ -10389,7 +10410,7 @@ async fn run_http_transfer(
         } else {
             None
         };
-        let mut request = client.request(current_method.clone(), url.clone());
+        let mut request = runtime.client.request(current_method.clone(), url.clone());
         request = apply_version(request, transfer, &url);
         let sensitive_headers_allowed =
             transfer.location_trusted || same_redirect_origin(&initial_url, &url);
@@ -10689,6 +10710,30 @@ fn raw_http_simple_get_wire_semantics(transfer: &TransferConfig, method: &Method
         && transfer.time_cond.is_none()
 }
 
+fn raw_http_cookie_engine_wire_semantics(transfer: &TransferConfig, method: &Method) -> bool {
+    *method == Method::GET
+        && cookie_engine_active(transfer)
+        && transfer.cookie_jar.is_none()
+        && !transfer.follow_location
+        && !transfer.verbose
+        && transfer.headers.is_empty()
+        && transfer.resolve.is_empty()
+        && transfer.proxy.is_none()
+        && transfer.http_version == HttpVersionPreference::Any
+        && transfer.data.is_empty()
+        && transfer.forms.is_empty()
+        && transfer.upload_file.is_none()
+        && transfer.user.is_none()
+        && transfer.oauth2_bearer.is_none()
+        && transfer.aws_sigv4.is_none()
+        && transfer.referer.is_none()
+        && transfer.range.is_none()
+        && transfer.time_cond.is_none()
+        && transfer.etag_compare.is_none()
+        && transfer.cookie_files.iter().all(|input| !input.is_empty())
+        && (transfer.dump_header.is_some() || !transfer.cookie_files.is_empty())
+}
+
 fn raw_http_retry_redirect_wire_semantics(transfer: &TransferConfig) -> bool {
     transfer.retry > 0
         && transfer.follow_location
@@ -10955,6 +11000,7 @@ async fn run_raw_http_proxy_tunnel_transfer(
     let (connect_host, connect_port) = raw_http_tunnel_endpoint(&context)?;
     let direct_context = RawHttpDirectContext {
         transfer: context.transfer,
+        cookie_jar: None,
         url: context.url,
         host_override: context.host_override,
         path_as_is_url: context.path_as_is_url,
@@ -11240,11 +11286,14 @@ fn raw_http_direct_request(context: &RawHttpDirectContext<'_>) -> Result<Vec<u8>
     if context.transfer.compressed && !has_header("accept-encoding") {
         request.extend_from_slice(b"Accept-Encoding: deflate, gzip, br\r\n");
     }
-    if context.sensitive_headers_allowed
-        && let Some(cookie) = &context.transfer.cookie
-        && !has_header("cookie")
-    {
-        request.extend_from_slice(format!("Cookie: {cookie}\r\n").as_bytes());
+    if context.sensitive_headers_allowed && !has_header("cookie") {
+        if let Some(cookie) = context.cookie_jar.and_then(|jar| jar.cookies(context.url)) {
+            request.extend_from_slice(b"Cookie: ");
+            request.extend_from_slice(cookie.as_bytes());
+            request.extend_from_slice(b"\r\n");
+        } else if let Some(cookie) = &context.transfer.cookie {
+            request.extend_from_slice(format!("Cookie: {cookie}\r\n").as_bytes());
+        }
     }
     if let Some(path) = &context.transfer.etag_compare
         && !has_header("if-none-match")
@@ -12512,7 +12561,7 @@ fn curl_compat_version() -> &'static str {
 
 async fn run_http_with_retries(
     transfer: &TransferConfig,
-    client: &Client,
+    runtime: HttpRuntime<'_>,
     expanded: &glob::ExpandedUrl,
     method: Method,
     metrics: &mut writeout::Metrics,
@@ -12523,8 +12572,14 @@ async fn run_http_with_retries(
     loop {
         reset_attempt_metrics(metrics);
 
-        let attempt =
-            run_http_transfer(transfer, client, expanded, method.clone(), metrics, session);
+        let attempt = run_http_transfer(
+            transfer,
+            runtime,
+            expanded,
+            method.clone(),
+            metrics,
+            session,
+        );
         let attempt = if let Some(timeout) = remaining_timeout(transfer.max_time, retry_started) {
             tokio::time::timeout(timeout, attempt)
                 .await

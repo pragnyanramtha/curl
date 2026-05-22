@@ -48,6 +48,8 @@ set(_curl_rust_corpus_tests
   3
   4
   6
+  7
+  8
   12
   13
   14

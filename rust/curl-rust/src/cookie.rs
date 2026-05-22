@@ -1,4 +1,6 @@
+use std::cmp::Reverse;
 use std::io::{self, Read, Write};
+use std::net::IpAddr;
 use std::path::Path;
 use std::sync::RwLock;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -81,6 +83,18 @@ impl CookieJar {
         Ok(())
     }
 
+    pub fn load_response_inputs_for_url(
+        &self,
+        inputs: &[String],
+        skip_session_cookies: bool,
+        url: &Url,
+    ) -> Result<()> {
+        for input in inputs {
+            self.load_response_input_for_url(input, skip_session_cookies, url)?;
+        }
+        Ok(())
+    }
+
     fn load_from_input(&self, input: &str, skip_session_cookies: bool) -> Result<()> {
         if input.is_empty() {
             return Ok(());
@@ -99,6 +113,32 @@ impl CookieJar {
         };
 
         self.load_from_text(&text, skip_session_cookies);
+        Ok(())
+    }
+
+    fn load_response_input_for_url(
+        &self,
+        input: &str,
+        skip_session_cookies: bool,
+        url: &Url,
+    ) -> Result<()> {
+        if input.is_empty() {
+            return Ok(());
+        }
+
+        let text = if input == "-" {
+            let mut text = String::new();
+            io::stdin().read_to_string(&mut text)?;
+            text
+        } else {
+            let path = Path::new(input);
+            if !path.is_file() {
+                return Ok(());
+            }
+            std::fs::read_to_string(path)?
+        };
+
+        self.load_response_text_for_url(&text, skip_session_cookies, url);
         Ok(())
     }
 
@@ -141,8 +181,34 @@ impl CookieJar {
             if skip_session_cookies && cookie.expires == 0 {
                 continue;
             }
-            cookies.retain(|existing| !existing.same_key(&cookie));
-            cookies.push(cookie);
+            store_cookie(&mut cookies, cookie);
+        }
+    }
+
+    fn load_response_text_for_url(&self, text: &str, skip_session_cookies: bool, url: &Url) {
+        let now = unix_now();
+        let mut cookies = self.cookies.write().expect("cookie jar lock");
+        for line in text.lines() {
+            let line = line.trim_end_matches('\r').trim_start();
+            if line.trim_end().is_empty() || line.starts_with('#') {
+                continue;
+            }
+            if let Some(cookie) = parse_netscape_cookie_line(line, false, now) {
+                if !skip_session_cookies || cookie.expires != 0 {
+                    store_cookie(&mut cookies, cookie);
+                }
+                continue;
+            }
+            let Some(value) = line
+                .split_once(':')
+                .and_then(|(name, value)| name.eq_ignore_ascii_case("set-cookie").then_some(value))
+            else {
+                continue;
+            };
+            let Some(update) = parse_set_cookie_file_for_url(value.trim(), url, now) else {
+                continue;
+            };
+            apply_cookie_update(&mut cookies, update, skip_session_cookies);
         }
     }
 
@@ -182,6 +248,31 @@ fn parse_cookie_file_line(line: &str, now: u64) -> Option<StoredCookie> {
     parse_set_cookie_file(value.trim(), now)
 }
 
+fn store_cookie(cookies: &mut Vec<StoredCookie>, cookie: StoredCookie) {
+    cookies.retain(|existing| !existing.same_key(&cookie));
+    cookies.push(cookie);
+}
+
+fn apply_cookie_update(
+    cookies: &mut Vec<StoredCookie>,
+    update: CookieUpdate,
+    skip_session_cookies: bool,
+) {
+    match update {
+        CookieUpdate::Set(cookie) => {
+            if skip_session_cookies && cookie.expires == 0 {
+                return;
+            }
+            store_cookie(cookies, cookie);
+        }
+        CookieUpdate::Delete { domain, path, name } => {
+            cookies.retain(|existing| {
+                existing.domain != domain || existing.path != path || existing.name != name
+            });
+        }
+    }
+}
+
 fn parse_netscape_cookie_line(line: &str, http_only: bool, now: u64) -> Option<StoredCookie> {
     let mut fields = line.split('\t');
     let domain = fields.next()?.trim().to_ascii_lowercase();
@@ -214,7 +305,7 @@ fn parse_netscape_cookie_line(line: &str, http_only: bool, now: u64) -> Option<S
 fn parse_set_cookie_file(value: &str, now: u64) -> Option<StoredCookie> {
     let mut parts = value.split(';').map(str::trim);
     let (name, cookie_value) = parts.next()?.split_once('=')?;
-    let name = name.trim();
+    let name = trim_cookie_space(name);
     if name.is_empty() {
         return None;
     }
@@ -279,9 +370,92 @@ fn parse_set_cookie_file(value: &str, now: u64) -> Option<StoredCookie> {
         secure,
         expires,
         name: name.to_string(),
-        value: cookie_value.trim().to_string(),
+        value: trim_cookie_space(cookie_value).to_string(),
         http_only,
     })
+}
+
+fn parse_set_cookie_file_for_url(value: &str, url: &Url, now: u64) -> Option<CookieUpdate> {
+    let mut parts = value.split(';').map(str::trim);
+    let (name, cookie_value) = parts.next()?.split_once('=')?;
+    let name = trim_cookie_space(name);
+    if name.is_empty() {
+        return None;
+    }
+
+    let host = url.host_str()?.to_ascii_lowercase();
+    let mut domain = host.clone();
+    let mut include_subdomains = false;
+    let mut path = "/".to_string();
+    let mut secure = false;
+    let mut expires = 0;
+    let mut http_only = false;
+    let mut delete = false;
+
+    for part in parts {
+        let (attribute, raw_value) = part.split_once('=').unwrap_or((part, ""));
+        match attribute.trim().to_ascii_lowercase().as_str() {
+            "domain" => {
+                let value = raw_value
+                    .trim()
+                    .trim_start_matches('.')
+                    .to_ascii_lowercase();
+                if !value.is_empty() {
+                    if !domain_matches_source(&host, &value) {
+                        return None;
+                    }
+                    domain = format!(".{value}");
+                    include_subdomains = true;
+                }
+            }
+            "path" => {
+                let value = raw_value.trim().trim_matches('"');
+                if value.starts_with('/') {
+                    path = value.to_string();
+                }
+            }
+            "max-age" => {
+                if let Ok(value) = raw_value.trim().parse::<i64>() {
+                    if value <= 0 {
+                        delete = true;
+                    } else {
+                        expires = now.saturating_add(value as u64);
+                    }
+                }
+            }
+            "expires" => {
+                if let Some(timestamp) = parse_expires(raw_value.trim()) {
+                    if timestamp <= now {
+                        delete = true;
+                    } else {
+                        expires = timestamp;
+                    }
+                }
+            }
+            "secure" => secure = true,
+            "httponly" => http_only = true,
+            _ => {}
+        }
+    }
+
+    if delete {
+        Some(CookieUpdate::Delete {
+            domain,
+            path,
+            name: name.to_string(),
+        })
+    } else {
+        Some(CookieUpdate::Set(StoredCookie {
+            domain,
+            include_subdomains,
+            path,
+            secure,
+            expires,
+            name: name.to_string(),
+            value: trim_cookie_space(cookie_value).to_string(),
+            http_only,
+        }))
+    }
 }
 
 fn parse_cookie_bool(value: &str) -> Option<bool> {
@@ -304,10 +478,7 @@ impl CookieStore for CookieJar {
                 continue;
             };
             match update {
-                CookieUpdate::Set(cookie) => {
-                    cookies.retain(|existing| !existing.same_key(&cookie));
-                    cookies.push(cookie);
-                }
+                CookieUpdate::Set(cookie) => store_cookie(&mut cookies, cookie),
                 CookieUpdate::Delete { domain, path, name } => {
                     cookies.retain(|existing| {
                         existing.domain != domain || existing.path != path || existing.name != name
@@ -322,9 +493,21 @@ impl CookieStore for CookieJar {
         let mut cookies = self.cookies.write().expect("cookie jar lock");
         cookies.retain(|cookie| cookie.expires == 0 || cookie.expires > now);
 
-        let mut header = cookies
+        let mut matching_cookies = cookies
             .iter()
             .filter(|cookie| cookie.matches(url))
+            .filter(|cookie| cookie.header_safe())
+            .collect::<Vec<_>>();
+        matching_cookies.sort_by_key(|cookie| {
+            (
+                Reverse(cookie.path.len()),
+                Reverse(cookie.domain.len()),
+                Reverse(cookie.name.len()),
+            )
+        });
+
+        let mut header = matching_cookies
+            .iter()
             .map(|cookie| format!("{}={}", cookie.name, cookie.value))
             .collect::<Vec<_>>()
             .join("; ");
@@ -390,12 +573,19 @@ impl StoredCookie {
             return false;
         };
         let domain = self.domain.trim_start_matches('.').to_ascii_lowercase();
-        let domain_matches = if self.include_subdomains {
+        let host_is_ip = host.parse::<IpAddr>().is_ok();
+        let domain_matches = if host_is_ip {
+            host == domain
+        } else if self.include_subdomains {
             host == domain || host.ends_with(&format!(".{domain}"))
         } else {
             host == domain
         };
         domain_matches && path_matches(url.path(), &self.path)
+    }
+
+    fn header_safe(&self) -> bool {
+        cookie_header_field_safe(&self.name) && cookie_header_field_safe(&self.value)
     }
 
     fn netscape_line(&self) -> String {
@@ -419,7 +609,7 @@ impl StoredCookie {
 fn parse_set_cookie(value: &str, url: &Url, now: u64) -> Option<CookieUpdate> {
     let mut parts = value.split(';').map(str::trim);
     let (name, cookie_value) = parts.next()?.split_once('=')?;
-    let name = name.trim();
+    let name = trim_cookie_space(name);
     if name.is_empty() {
         return None;
     }
@@ -493,7 +683,7 @@ fn parse_set_cookie(value: &str, url: &Url, now: u64) -> Option<CookieUpdate> {
             secure,
             expires,
             name: name.to_string(),
-            value: cookie_value.trim().to_string(),
+            value: trim_cookie_space(cookie_value).to_string(),
             http_only,
         }))
     }
@@ -518,7 +708,11 @@ fn path_matches(request_path: &str, cookie_path: &str) -> bool {
 }
 
 fn domain_matches_source(host: &str, domain: &str) -> bool {
-    host == domain || host.ends_with(&format!(".{domain}"))
+    if host.parse::<IpAddr>().is_ok() {
+        host == domain
+    } else {
+        host == domain || host.ends_with(&format!(".{domain}"))
+    }
 }
 
 fn parse_expires(value: &str) -> Option<u64> {
@@ -545,6 +739,14 @@ fn sanitize_field(value: &str) -> String {
         .chars()
         .filter(|ch| !matches!(ch, '\t' | '\r' | '\n'))
         .collect()
+}
+
+fn cookie_header_field_safe(value: &str) -> bool {
+    !value.bytes().any(|byte| byte <= 0x1f || byte == 0x7f)
+}
+
+fn trim_cookie_space(value: &str) -> &str {
+    value.trim_matches(|ch| matches!(ch, ' ' | '\t'))
 }
 
 #[cfg(test)]
@@ -656,6 +858,35 @@ mod tests {
              # https://curl.se/docs/http-cookies.html\n\
              # This file was generated by libcurl! Edit at your own risk.\n\n\
              #HttpOnly_.example.com\tTRUE\t/path\tFALSE\t0\tsid\tabc\n"
+        );
+    }
+
+    #[test]
+    fn loads_header_cookie_file_with_request_url_context() {
+        let jar = CookieJar::default();
+        let url = Url::parse("http://127.0.0.1/we/want/8").unwrap();
+        jar.load_response_text_for_url(
+            "HTTP/1.1 200 OK\n\
+             Set-Cookie: foobar=name; domain=127.0.0.1; path=/;\n\
+             Set-Cookie: mismatch=this; domain=127.0.0.1; path=\"/silly/\";\n\
+             Set-Cookie: partmatch=present; domain=.0.0.1; path=/w;\n\
+             Set-Cookie: cookie=yes; path=/we;\n\
+             Set-Cookie: cookie=perhaps; path=/we/want;\n\
+             Set-Cookie: name with space=is weird but; path=/we/want;\n\
+             Set-Cookie: trailingspace    = removed; path=/we/want;\n\
+             Set-Cookie: nocookie=yes; path=/WE;\n\
+             Set-Cookie: blexp=yesyes; domain=127.0.0.1; domain=127.0.0.1; expiry=totally bad;\n\
+             Set-Cookie: partialip=nono; domain=.0.0.1;\n\
+             Set-Cookie: cookie1=\x01-junk\n\
+             Set-Cookie: cookie9=junk--\t\n\
+             Set-Cookie: cookie31=\x7f-junk\n",
+            false,
+            &url,
+        );
+
+        assert_eq!(
+            jar.cookies(&url).unwrap().to_str().unwrap(),
+            "name with space=is weird but; trailingspace=removed; cookie=perhaps; cookie=yes; foobar=name; blexp=yesyes; cookie9=junk--"
         );
     }
 
