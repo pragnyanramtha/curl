@@ -101,6 +101,7 @@ pub struct TransferConfig {
     pub remote_name_all: bool,
     pub remote_header_name: bool,
     pub remote_time: bool,
+    pub xattr: bool,
     pub skip_existing: bool,
     pub file_clobber_mode: FileClobberMode,
     pub remove_on_error: bool,
@@ -605,6 +606,7 @@ impl Default for TransferConfig {
             remote_name_all: false,
             remote_header_name: false,
             remote_time: false,
+            xattr: false,
             skip_existing: false,
             file_clobber_mode: FileClobberMode::Default,
             remove_on_error: false,
@@ -1047,6 +1049,7 @@ impl Parser {
             "remote-name" => self.set_output_remote_name(),
             "remote-header-name" => self.current().remote_header_name = true,
             "remote-time" => self.current().remote_time = true,
+            "xattr" => self.current().xattr = true,
             "skip-existing" => self.current().skip_existing = true,
             "clobber" => self.current().file_clobber_mode = FileClobberMode::Always,
             "remove-on-error" => {
@@ -1353,6 +1356,7 @@ impl Parser {
             "remote-name-all" => self.current().remote_name_all = false,
             "remote-header-name" => self.current().remote_header_name = false,
             "remote-time" => self.current().remote_time = false,
+            "xattr" => self.current().xattr = false,
             "manual" => self.config.show_manual = false,
             "skip-existing" => self.current().skip_existing = false,
             "clobber" => {
@@ -2106,6 +2110,7 @@ impl TransferConfig {
             || self.remote_name_all
             || self.remote_header_name
             || self.remote_time
+            || self.xattr
             || self.skip_existing
             || self.file_clobber_mode != FileClobberMode::Default
             || self.remove_on_error
@@ -3270,6 +3275,7 @@ fn print_common_help() {
            -O, --remote-name           Write output to remote filename\n\
                --remote-name-all       Use remote filename for all URLs\n\
            -R, --remote-time           Set local file time to remote time\n\
+               --xattr                 Store metadata in extended file attributes\n\
                --skip-existing         Skip output paths that already exist\n\
                --no-clobber            Do not overwrite files\n\
                --remove-on-error       Remove output file on transfer error\n\
@@ -3342,7 +3348,7 @@ pub fn print_version() {
     println!(
         "Protocols: DICT FILE FTP GOPHER GOPHERS HTTP HTTPS IMAP IPFS IPNS LDAP MQTT POP3 RTSP SCP SFTP SMB SMTP TELNET TFTP WS"
     );
-    println!("Features: AsynchDNS IPv6 Largefile SSL libz threadsafe");
+    println!("Features: AsynchDNS Debug IPv6 Largefile SSL libz threadsafe xattr");
 }
 
 fn curl_compat_version() -> &'static str {
@@ -3728,6 +3734,19 @@ mod tests {
         ])
         .unwrap();
         assert!(!config.transfers[0].remote_time);
+    }
+
+    #[test]
+    fn parses_xattr_option() {
+        let config = parse_args([
+            "-q",
+            "--xattr",
+            "--no-xattr",
+            "--xattr",
+            "https://example.com",
+        ])
+        .unwrap();
+        assert!(config.transfers[0].xattr);
     }
 
     #[test]

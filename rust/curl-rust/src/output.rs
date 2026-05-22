@@ -9,7 +9,8 @@ use std::ffi::CString;
 use std::os::unix::ffi::OsStrExt;
 
 use reqwest::header::{
-    ACCEPT_RANGES, CONTENT_DISPOSITION, CONTENT_LENGTH, HeaderMap, HeaderValue, LAST_MODIFIED,
+    ACCEPT_RANGES, CONTENT_DISPOSITION, CONTENT_LENGTH, CONTENT_TYPE, HeaderMap, HeaderValue,
+    LAST_MODIFIED,
 };
 use reqwest::{StatusCode, Version};
 use url::Url;
@@ -130,6 +131,103 @@ pub fn apply_remote_time(transfer: &TransferConfig, headers: &HeaderMap, path: O
             unix_timestamp(remote_time)
         );
     }
+}
+
+pub fn apply_xattr(
+    transfer: &TransferConfig,
+    origin_url: &str,
+    headers: &HeaderMap,
+    path: Option<&Path>,
+) {
+    if !transfer.xattr {
+        return;
+    }
+    let Some(path) = path else {
+        return;
+    };
+
+    if let Err(error) = write_xattrs(path, origin_url, headers)
+        && !transfer.silent
+    {
+        eprintln!(
+            "Warning: Error setting extended attributes on '{}': {error}",
+            path.display()
+        );
+    }
+}
+
+fn write_xattrs(path: &Path, origin_url: &str, headers: &HeaderMap) -> io::Result<()> {
+    let attrs = xattr_entries(origin_url, headers)?;
+    if std::env::var_os("CURL_FAKE_XATTR").is_some() {
+        for (name, value) in attrs {
+            println!("{name} => {value}");
+        }
+        return Ok(());
+    }
+
+    set_file_xattrs(path, &attrs)
+}
+
+fn xattr_entries(origin_url: &str, headers: &HeaderMap) -> io::Result<Vec<(&'static str, String)>> {
+    let mut attrs = vec![("user.creator", "curl".to_string())];
+    if let Some(content_type) = headers
+        .get(CONTENT_TYPE)
+        .and_then(|value| value.to_str().ok())
+    {
+        attrs.push(("user.mime_type", content_type.to_string()));
+    }
+    attrs.push(("user.xdg.origin.url", strip_url_credentials(origin_url)?));
+    Ok(attrs)
+}
+
+fn strip_url_credentials(origin_url: &str) -> io::Result<String> {
+    let mut url = Url::parse(origin_url)
+        .map_err(|error| io::Error::new(io::ErrorKind::InvalidInput, error))?;
+    if url.set_username("").is_err() || url.set_password(None).is_err() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "could not strip URL credentials",
+        ));
+    }
+    Ok(url.to_string())
+}
+
+#[cfg(any(target_os = "linux", target_os = "android"))]
+fn set_file_xattrs(path: &Path, attrs: &[(&'static str, String)]) -> io::Result<()> {
+    use std::os::fd::AsRawFd;
+
+    let file = OpenOptions::new().read(true).open(path)?;
+    for (name, value) in attrs {
+        set_file_xattr(file.as_raw_fd(), name, value)?;
+    }
+    Ok(())
+}
+
+#[cfg(any(target_os = "linux", target_os = "android"))]
+fn set_file_xattr(fd: std::os::fd::RawFd, name: &str, value: &str) -> io::Result<()> {
+    let name =
+        CString::new(name).map_err(|error| io::Error::new(io::ErrorKind::InvalidInput, error))?;
+    let value =
+        CString::new(value).map_err(|error| io::Error::new(io::ErrorKind::InvalidInput, error))?;
+    let rc = unsafe {
+        libc::fsetxattr(
+            fd,
+            name.as_ptr(),
+            value.as_ptr().cast(),
+            value.as_bytes().len(),
+            0,
+        )
+    };
+    if rc == 0 {
+        Ok(())
+    } else {
+        Err(io::Error::last_os_error())
+    }
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "android")))]
+fn set_file_xattrs(_path: &Path, _attrs: &[(&'static str, String)]) -> io::Result<()> {
+    Ok(())
 }
 
 fn remote_file_time(headers: &HeaderMap) -> Option<SystemTime> {
@@ -694,5 +792,22 @@ mod tests {
         let url = Url::parse("http://example.com/path/to/here/").unwrap();
 
         assert_eq!(remote_url_filename(&url).unwrap(), "here");
+    }
+
+    #[test]
+    fn xattr_entries_strip_origin_url_credentials() {
+        let mut headers = HeaderMap::new();
+        headers.insert(CONTENT_TYPE, HeaderValue::from_static("fake/data"));
+
+        let attrs = xattr_entries("http://user:secret@example.com/path", &headers).unwrap();
+
+        assert_eq!(
+            attrs,
+            vec![
+                ("user.creator", "curl".to_string()),
+                ("user.mime_type", "fake/data".to_string()),
+                ("user.xdg.origin.url", "http://example.com/path".to_string()),
+            ]
+        );
     }
 }

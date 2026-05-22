@@ -12632,7 +12632,9 @@ fn finish_http_transfer(
         });
     }
 
-    output::apply_remote_time(transfer, &attempt.headers, write.output_path.as_deref());
+    let output_path = write.output_path.as_deref();
+    output::apply_remote_time(transfer, &attempt.headers, output_path);
+    output::apply_xattr(transfer, &expanded.url, &attempt.headers, output_path);
     Ok(())
 }
 
