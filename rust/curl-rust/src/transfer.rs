@@ -13796,7 +13796,7 @@ fn lookup_netrc_credentials(
             path.display()
         ))
     })?;
-    let entries = parse_netrc_entries(&content);
+    let entries = parse_netrc_entries(&content)?;
 
     for entry in entries
         .iter()
@@ -13856,8 +13856,8 @@ fn netrc_entry_credentials(
     }
 }
 
-fn parse_netrc_entries(content: &str) -> Vec<NetrcEntry> {
-    let tokens = parse_netrc_tokens(content);
+fn parse_netrc_entries(content: &str) -> Result<Vec<NetrcEntry>> {
+    let tokens = parse_netrc_tokens(content)?;
     let mut entries = Vec::new();
     let mut current: Option<NetrcEntry> = None;
     let mut index = 0;
@@ -13911,10 +13911,10 @@ fn parse_netrc_entries(content: &str) -> Vec<NetrcEntry> {
     if let Some(entry) = current {
         entries.push(entry);
     }
-    entries
+    Ok(entries)
 }
 
-fn parse_netrc_tokens(content: &str) -> Vec<String> {
+fn parse_netrc_tokens(content: &str) -> Result<Vec<String>> {
     let mut tokens = Vec::new();
     let mut in_macdef = false;
 
@@ -13929,7 +13929,7 @@ fn parse_netrc_tokens(content: &str) -> Vec<String> {
         if trimmed.is_empty() || trimmed.starts_with('#') {
             continue;
         }
-        let mut line_tokens = parse_netrc_line_tokens(trimmed);
+        let mut line_tokens = parse_netrc_line_tokens(trimmed)?;
         if line_tokens.first().is_some_and(|token| token == "macdef") {
             in_macdef = true;
             continue;
@@ -13937,10 +13937,10 @@ fn parse_netrc_tokens(content: &str) -> Vec<String> {
         tokens.append(&mut line_tokens);
     }
 
-    tokens
+    Ok(tokens)
 }
 
-fn parse_netrc_line_tokens(line: &str) -> Vec<String> {
+fn parse_netrc_line_tokens(line: &str) -> Result<Vec<String>> {
     let mut tokens = Vec::new();
     let mut chars = line.chars().peekable();
 
@@ -13952,9 +13952,13 @@ fn parse_netrc_line_tokens(line: &str) -> Vec<String> {
         if ch == '"' {
             chars.next();
             let mut token = String::new();
+            let mut closed = false;
             while let Some(ch) = chars.next() {
                 match ch {
-                    '"' => break,
+                    '"' => {
+                        closed = true;
+                        break;
+                    }
                     '\\' => match chars.next() {
                         Some('n') => token.push('\n'),
                         Some('r') => token.push('\r'),
@@ -13964,6 +13968,11 @@ fn parse_netrc_line_tokens(line: &str) -> Vec<String> {
                     },
                     other => token.push(other),
                 }
+            }
+            if !closed {
+                return Err(CurlError::ReadError(
+                    "Bad netrc file: unterminated quoted string".to_string(),
+                ));
             }
             tokens.push(token);
             continue;
@@ -13980,7 +13989,7 @@ fn parse_netrc_line_tokens(line: &str) -> Vec<String> {
         tokens.push(token);
     }
 
-    tokens
+    Ok(tokens)
 }
 
 fn http_basic_authorization(credentials: &HttpCredentials) -> String {
@@ -14428,6 +14437,29 @@ mod tests {
                 password: "host-password".to_string()
             }
         );
+    }
+
+    #[test]
+    fn netrc_parser_handles_quoted_escapes_and_rejects_unclosed_quote() {
+        let entries = parse_netrc_entries(
+            "machine example.com login user1 password \"with spaces and \\\"\\n\\r\\t\\a\"\n",
+        )
+        .unwrap();
+
+        assert_eq!(
+            entries,
+            vec![NetrcEntry {
+                matcher: NetrcMatcher::Machine("example.com".to_string()),
+                login: Some("user1".to_string()),
+                password: Some("with spaces and \"\n\r\ta".to_string()),
+            }]
+        );
+
+        let error = parse_netrc_entries(
+            "machine example.com login user1 password \"with spaces and \\\"\\n\\r\\t\\a\n",
+        )
+        .unwrap_err();
+        assert!(matches!(error, CurlError::ReadError(_)));
     }
 
     #[test]

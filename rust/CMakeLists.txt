@@ -258,6 +258,8 @@ set(_curl_rust_corpus_tests
   656
   664
   665
+  679
+  680
   681
   682
   683
