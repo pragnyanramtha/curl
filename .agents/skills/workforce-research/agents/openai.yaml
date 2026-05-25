@@ -1,0 +1,8 @@
+interface:
+  display_name: "Workforce Research"
+  short_description: "Research with sources and confidence"
+  brand_color: "#7C3AED"
+  default_prompt: "Use $workforce-research to produce a sourced brief before we act."
+policy:
+  allow_implicit_invocation: true
+

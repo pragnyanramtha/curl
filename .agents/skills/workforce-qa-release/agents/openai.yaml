@@ -1,0 +1,8 @@
+interface:
+  display_name: "QA Release"
+  short_description: "Validate behavior and release risk"
+  brand_color: "#EA580C"
+  default_prompt: "Use $workforce-qa-release to check acceptance, release readiness, and rollback risk."
+policy:
+  allow_implicit_invocation: true
+

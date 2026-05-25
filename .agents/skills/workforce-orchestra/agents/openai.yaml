@@ -1,0 +1,8 @@
+interface:
+  display_name: "Workforce Orchestra"
+  short_description: "Coordinate company-style AI teams"
+  brand_color: "#2563EB"
+  default_prompt: "Use $workforce-orchestra to coordinate this work across the right AI departments."
+policy:
+  allow_implicit_invocation: true
+

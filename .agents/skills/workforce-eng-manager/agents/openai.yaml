@@ -1,0 +1,7 @@
+interface:
+  display_name: "Engineering Manager"
+  short_description: "Plan fixes and execution lanes"
+  brand_color: "#0F766E"
+  default_prompt: "Use $workforce-eng-manager to plan this implementation or bug fix and assign engineering lanes."
+policy:
+  allow_implicit_invocation: true

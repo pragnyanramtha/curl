@@ -1,0 +1,8 @@
+interface:
+  display_name: "Code Review Board"
+  short_description: "Review code with specialist lenses"
+  brand_color: "#DC2626"
+  default_prompt: "Use $workforce-code-review to review this diff for real defects and missing tests."
+policy:
+  allow_implicit_invocation: true
+

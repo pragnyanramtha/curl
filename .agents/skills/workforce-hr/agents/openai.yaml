@@ -1,0 +1,8 @@
+interface:
+  display_name: "Workforce HR"
+  short_description: "Escalate and staff uncertain work"
+  brand_color: "#059669"
+  default_prompt: "Use $workforce-hr to route this low-confidence task and find the right skill or agent pattern."
+policy:
+  allow_implicit_invocation: true
+

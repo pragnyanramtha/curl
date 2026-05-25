@@ -40,7 +40,7 @@ use crate::cli::{
     TransferConfig, parse_curl_time_condition_date,
 };
 use crate::cookie::CookieJar;
-use crate::data::{self, PreparedBody};
+use crate::data::{self, PreparedBody, PreparedMultipart};
 use crate::error::{CurlError, Result, ResultExt};
 use crate::{glob, ipfs, output, trace, writeout};
 
@@ -115,6 +115,7 @@ struct RawHttpProxyContext<'a> {
     tunnel_connect_to: Option<&'a ConnectToTarget>,
     method: &'a Method,
     prepared_body: Option<&'a PreparedBody>,
+    multipart_body: Option<&'a PreparedMultipart>,
     upload_body: Option<&'a [u8]>,
     resume_from: u64,
     referer: Option<&'a str>,
@@ -133,6 +134,7 @@ struct RawHttpDirectContext<'a> {
     connect_port: u16,
     method: &'a Method,
     prepared_body: Option<&'a PreparedBody>,
+    multipart_body: Option<&'a PreparedMultipart>,
     upload_body: Option<&'a [u8]>,
     resume_from: u64,
     referer: Option<&'a str>,
@@ -9657,8 +9659,17 @@ async fn run_http_transfer(
             "--get cannot be combined with --upload-file".to_string(),
         ));
     }
-    metrics.size_upload =
-        http_upload_size(transfer, prepared_body.as_ref(), upload_body.as_deref());
+    let prepared_multipart = if has_multipart {
+        data::prepare_multipart_body(&transfer.forms)?
+    } else {
+        None
+    };
+    metrics.size_upload = http_upload_size(
+        transfer,
+        prepared_body.as_ref(),
+        upload_body.as_deref(),
+        prepared_multipart.as_ref(),
+    );
     let parsed_url = parse_http_url(&expanded.url)?;
     let mut url = parsed_url.url;
     if let Some(cookie_jar) = runtime.cookie_jar {
@@ -9763,6 +9774,9 @@ async fn run_http_transfer(
             let request_body = send_request_body
                 .then_some(prepared_body.as_ref())
                 .flatten();
+            let request_multipart = send_request_body
+                .then_some(prepared_multipart.as_ref())
+                .flatten();
             let upload = if send_request_body {
                 upload_body.as_deref()
             } else {
@@ -9783,6 +9797,7 @@ async fn run_http_transfer(
                     connect_port,
                     method: &current_method,
                     prepared_body: request_body,
+                    multipart_body: request_multipart,
                     upload_body: upload,
                     resume_from,
                     referer: custom_referer.as_deref().or(current_referer.as_deref()),
@@ -9932,6 +9947,7 @@ async fn run_http_transfer(
                 connect_port: connect_to.port,
                 method: &method,
                 prepared_body: prepared_body.as_ref(),
+                multipart_body: prepared_multipart.as_ref(),
                 upload_body: upload_body.as_deref(),
                 resume_from,
                 referer: custom_referer.as_deref().or(current_referer.as_deref()),
@@ -9975,6 +9991,9 @@ async fn run_http_transfer(
             let request_body = send_request_body
                 .then_some(prepared_body.as_ref())
                 .flatten();
+            let request_multipart = send_request_body
+                .then_some(prepared_multipart.as_ref())
+                .flatten();
             let upload = if send_request_body {
                 upload_body.as_deref()
             } else {
@@ -9991,6 +10010,7 @@ async fn run_http_transfer(
                 tunnel_connect_to: None,
                 method: &current_method,
                 prepared_body: request_body,
+                multipart_body: request_multipart,
                 upload_body: upload,
                 resume_from,
                 referer: custom_referer.as_deref().or(current_referer.as_deref()),
@@ -10118,6 +10138,9 @@ async fn run_http_transfer(
             let request_body = send_request_body
                 .then_some(prepared_body.as_ref())
                 .flatten();
+            let request_multipart = send_request_body
+                .then_some(prepared_multipart.as_ref())
+                .flatten();
             let upload = if send_request_body {
                 upload_body.as_deref()
             } else {
@@ -10135,6 +10158,7 @@ async fn run_http_transfer(
                 tunnel_connect_to: tunnel_connect_to.as_ref(),
                 method: &current_method,
                 prepared_body: request_body,
+                multipart_body: request_multipart,
                 upload_body: upload,
                 resume_from,
                 referer: custom_referer.as_deref().or(current_referer.as_deref()),
@@ -10263,6 +10287,7 @@ async fn run_http_transfer(
             tunnel_connect_to: initial_connect_to.as_ref(),
             method: &method,
             prepared_body: prepared_body.as_ref(),
+            multipart_body: prepared_multipart.as_ref(),
             upload_body: upload_body.as_deref(),
             resume_from,
             referer: custom_referer.as_deref().or(current_referer.as_deref()),
@@ -10295,6 +10320,7 @@ async fn run_http_transfer(
             tunnel_connect_to: None,
             method: &method,
             prepared_body: prepared_body.as_ref(),
+            multipart_body: prepared_multipart.as_ref(),
             upload_body: upload_body.as_deref(),
             resume_from,
             referer: custom_referer.as_deref().or(current_referer.as_deref()),
@@ -10315,8 +10341,10 @@ async fn run_http_transfer(
     }
 
     let raw_cookie_engine_wire_semantics = raw_http_cookie_engine_wire_semantics(transfer, &method);
+    let raw_multipart_wire_semantics = raw_http_simple_multipart_wire_semantics(transfer, &method);
     if explicit_proxy.is_none()
         && (raw_http_direct_supported(transfer, &url, has_multipart)
+            || raw_multipart_wire_semantics
             || (!has_multipart && raw_cookie_engine_wire_semantics))
         && (transfer.request_target.is_some()
             || path_as_is_requires_raw
@@ -10326,6 +10354,7 @@ async fn run_http_transfer(
             || transfer.tr_encoding
             || raw_custom_header_wire_semantics
             || raw_cookie_engine_wire_semantics
+            || raw_multipart_wire_semantics
             || raw_http_output_slot_wire_semantics(transfer)
             || raw_http_retry_wire_semantics(transfer, &method)
             || raw_http_simple_get_wire_semantics(transfer, &method)
@@ -10348,6 +10377,7 @@ async fn run_http_transfer(
                 connect_port: url.port_or_known_default().unwrap_or(80),
                 method: &method,
                 prepared_body: prepared_body.as_ref(),
+                multipart_body: prepared_multipart.as_ref(),
                 upload_body: upload_body.as_deref(),
                 resume_from,
                 referer: custom_referer.as_deref().or(current_referer.as_deref()),
@@ -10711,6 +10741,28 @@ fn raw_http_simple_get_wire_semantics(transfer: &TransferConfig, method: &Method
         && transfer.time_cond.is_none()
 }
 
+fn raw_http_simple_multipart_wire_semantics(transfer: &TransferConfig, method: &Method) -> bool {
+    *method == Method::POST
+        && !transfer.forms.is_empty()
+        && !transfer.follow_location
+        && !transfer.auto_referer
+        && !transfer.verbose
+        && transfer.resolve.is_empty()
+        && transfer.proxy.is_none()
+        && transfer.http_version == HttpVersionPreference::Any
+        && transfer.data.is_empty()
+        && transfer.upload_file.is_none()
+        && transfer.user.is_none()
+        && transfer.oauth2_bearer.is_none()
+        && transfer.aws_sigv4.is_none()
+        && transfer.cookie.is_none()
+        && transfer.referer.is_none()
+        && transfer.range.is_none()
+        && transfer.time_cond.is_none()
+        && transfer.etag_compare.is_none()
+        && !cookie_engine_active(transfer)
+}
+
 fn raw_http_cookie_engine_wire_semantics(transfer: &TransferConfig, method: &Method) -> bool {
     *method == Method::GET
         && cookie_engine_active(transfer)
@@ -11034,6 +11086,7 @@ async fn run_raw_http_proxy_tunnel_transfer(
         connect_port,
         method: context.method,
         prepared_body: context.prepared_body,
+        multipart_body: context.multipart_body,
         upload_body: context.upload_body,
         resume_from: context.resume_from,
         referer: context.referer,
@@ -11252,7 +11305,12 @@ fn raw_http_direct_request(context: &RawHttpDirectContext<'_>) -> Result<Vec<u8>
             .any(|header| header.name.as_str().eq_ignore_ascii_case(name))
     };
     let add_transfer_encoding = context.transfer.tr_encoding && !has_header("te");
-    let body = raw_http_body(context.transfer, context.prepared_body, context.upload_body);
+    let body = raw_http_body(
+        context.transfer,
+        context.prepared_body,
+        context.multipart_body,
+        context.upload_body,
+    );
     let target =
         context
             .transfer
@@ -11348,8 +11406,9 @@ fn raw_http_direct_request(context: &RawHttpDirectContext<'_>) -> Result<Vec<u8>
     {
         request.extend_from_slice(format!("Content-Length: {}\r\n", body.len()).as_bytes());
     }
-    if body.is_some()
-        && let Some(content_type) = context.prepared_body.map(prepared_body_content_type)
+    if let Some(content_type) =
+        raw_http_body_content_type(context.prepared_body, context.multipart_body)
+        && body.is_some()
         && !has_header("content-type")
     {
         request.extend_from_slice(format!("Content-Type: {content_type}\r\n").as_bytes());
@@ -11440,7 +11499,12 @@ fn raw_http_proxy_request(context: &RawHttpProxyContext<'_>) -> Result<Vec<u8>> 
             || raw_headers_contain(&parsed_proxy_headers, name)
     };
     let add_transfer_encoding = context.transfer.tr_encoding && !has_header("te");
-    let body = raw_http_body(context.transfer, context.prepared_body, context.upload_body);
+    let body = raw_http_body(
+        context.transfer,
+        context.prepared_body,
+        context.multipart_body,
+        context.upload_body,
+    );
     let target =
         context
             .transfer
@@ -11538,8 +11602,9 @@ fn raw_http_proxy_request(context: &RawHttpProxyContext<'_>) -> Result<Vec<u8>> 
     {
         request.extend_from_slice(format!("Content-Length: {}\r\n", body.len()).as_bytes());
     }
-    if body.is_some()
-        && let Some(content_type) = context.prepared_body.map(prepared_body_content_type)
+    if let Some(content_type) =
+        raw_http_body_content_type(context.prepared_body, context.multipart_body)
+        && body.is_some()
         && !has_header("content-type")
     {
         request.extend_from_slice(format!("Content-Type: {content_type}\r\n").as_bytes());
@@ -11599,14 +11664,28 @@ fn append_raw_http_range_header(
 fn raw_http_body<'a>(
     transfer: &TransferConfig,
     prepared_body: Option<&'a PreparedBody>,
+    multipart_body: Option<&'a PreparedMultipart>,
     upload_body: Option<&'a [u8]>,
 ) -> Option<&'a [u8]> {
     if let Some(body) = upload_body {
         Some(body)
+    } else if let Some(body) = multipart_body {
+        Some(body.bytes.as_slice())
     } else if transfer.get {
         None
     } else {
         prepared_body.map(|body| body.bytes.as_slice())
+    }
+}
+
+fn raw_http_body_content_type<'a>(
+    prepared_body: Option<&'a PreparedBody>,
+    multipart_body: Option<&'a PreparedMultipart>,
+) -> Option<&'a str> {
+    if let Some(body) = multipart_body {
+        Some(body.content_type.as_str())
+    } else {
+        prepared_body.map(prepared_body_content_type)
     }
 }
 
@@ -12419,11 +12498,14 @@ fn http_upload_size(
     transfer: &TransferConfig,
     prepared_body: Option<&PreparedBody>,
     upload_body: Option<&[u8]>,
+    multipart_body: Option<&PreparedMultipart>,
 ) -> u64 {
     if transfer.get {
         0
     } else if let Some(body) = upload_body {
         body.len() as u64
+    } else if let Some(body) = multipart_body {
+        body.bytes.len() as u64
     } else if let Some(body) = prepared_body {
         body.bytes.len() as u64
     } else {
